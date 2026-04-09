@@ -490,6 +490,7 @@ dynamo_packages = [
     "torch_tensorrt.dynamo.runtime",
     "torch_tensorrt.dynamo.tools",
     "torch_tensorrt.runtime",
+    "torch_tensorrt.executorch",
 ]
 
 fx_package_dir = {
@@ -524,6 +525,7 @@ dynamo_package_dir = {
     "torch_tensorrt.dynamo.runtime": "py/torch_tensorrt/dynamo/runtime",
     "torch_tensorrt.dynamo.tools": "py/torch_tensorrt/dynamo/tools",
     "torch_tensorrt.runtime": "py/torch_tensorrt/runtime",
+    "torch_tensorrt.executorch": "py/torch_tensorrt/executorch",
 }
 
 package_dir = dynamo_package_dir
@@ -856,4 +858,5 @@ setup(
     include_package_data=False,
     package_data=package_data,
     exclude_package_data=exclude_package_data,
+    extras_require={"executorch": ["executorch>=1.2.0"]},
 )

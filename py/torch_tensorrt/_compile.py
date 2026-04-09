@@ -630,6 +630,108 @@ def load(
         )
 
 
+def _save_as_executorch(
+    gm: torch.fx.GraphModule,
+    file_path: str,
+    arg_inputs: Tuple[Any, ...] = (),
+    kwarg_inputs: Optional[Dict[str, Any]] = None,
+    dynamic_shapes: Optional[Any] = None,
+    partitioners: Optional[List["Partitioner"]] = None,
+) -> None:
+    """Save a TRT-compiled GraphModule in ExecuTorch format (.pte).
+
+    Transforms the compiled module, delegates TRT engines to ExecuTorch, and
+    serializes the result to *file_path*.
+
+    Arguments:
+        gm (torch.fx.GraphModule): Compiled Torch-TensorRT module produced by
+            ``torch_tensorrt.dynamo.compile``.
+        file_path (str): Destination path for the ``.pte`` file.
+        arg_inputs (Tuple[Any, ...]): Positional example inputs for re-export.
+        kwarg_inputs (Optional[Dict[str, Any]]): Keyword example inputs for
+            re-export.
+        dynamic_shapes (Optional[Any]): Dynamic shape specifications forwarded
+            to ``torch.export``.
+        partitioners (Optional[List["Partitioner"]]): Extra ExecuTorch partitioners.  A
+            ``TensorRTPartitioner`` is always included automatically.
+    """
+    if not file_path:
+        raise ValueError("file_path cannot be empty for executorch export")
+
+    logger.info("Saving model in ExecuTorch format to %s", file_path)
+    if not arg_inputs and not kwarg_inputs:
+        raise ValueError(
+            "inputs are required for executorch export. "
+            "Pass inputs= to torch_tensorrt.save()."
+        )
+    try:
+        from executorch.exir import to_edge_transform_and_lower
+    except ImportError as e:
+        raise ImportError(
+            "ExecuTorch is required for executorch export but could not be imported. "
+            "Install or reinstall it with: pip install executorch"
+        ) from e
+
+    from torch_tensorrt.dynamo._exporter import transform
+    from torch_tensorrt.executorch import get_edge_compile_config
+    from torch_tensorrt.executorch._converter import (
+        convert_engines,
+        export_trt_module,
+    )
+    from torch_tensorrt.executorch._partitioner import TensorRTPartitioner
+
+    # NOTE: This pipeline mirrors executorch/__init__.py:to_trt(). Keep in sync.
+    gm = transform(gm)
+    convert_engines(gm)
+
+    # ExecuTorch's emitter requires CPU tensors for non-delegated ops.
+    # TRT engine blobs are already CPU ByteTensors from convert_engines().
+    gm = gm.cpu()
+    arg_inputs = tuple(
+        t.cpu() if isinstance(t, torch.Tensor) else t for t in arg_inputs
+    )
+    if kwarg_inputs:
+        kwarg_inputs = {
+            k: v.cpu() if isinstance(v, torch.Tensor) else v
+            for k, v in kwarg_inputs.items()
+        }
+
+    trt_ep = export_trt_module(
+        gm,
+        arg_inputs=arg_inputs,
+        kwarg_inputs=kwarg_inputs or {},
+        dynamic_shapes=dynamic_shapes,
+    )
+
+    # Decompose any remaining attention ops that survived as fallback ops.
+    # These ops lack out-variants required by ExecuTorch's ToOutVarPass.
+    from torch_tensorrt.dynamo.lowering._decompositions import get_decompositions
+
+    attention_decomps = get_decompositions(decompose_attention=True)
+    trt_ep = trt_ep.run_decompositions(attention_decomps)
+
+    if partitioners is not None and not isinstance(partitioners, (list, tuple)):
+        raise TypeError(
+            f"partitioners must be a list, got {type(partitioners).__name__}"
+        )
+
+    if partitioners and any(isinstance(p, TensorRTPartitioner) for p in partitioners):
+        all_partitioners = list(partitioners)
+    else:
+        all_partitioners = [TensorRTPartitioner()]
+        if partitioners:
+            all_partitioners.extend(partitioners)
+
+    edge = to_edge_transform_and_lower(
+        trt_ep,
+        compile_config=get_edge_compile_config(),
+        partitioner=all_partitioners,
+    )
+    pte = edge.to_executorch()
+    with open(file_path, "wb") as f:
+        pte.write_to_file(f)
+
+
 def save(
     module: Any,
     file_path: str = "",
@@ -643,6 +745,7 @@ def save(
     use_legacy_exporter: Optional[bool] = None,
     pickle_protocol: int = 2,
     dynamic_shapes: Optional[Dict[str, Any]] = None,
+    partitioners: Optional[List[Any]] = None,
     **kwargs: Any,
 ) -> None:
     """
@@ -653,7 +756,9 @@ def save(
         inputs (Union[torch.Tensor, torch_tensorrt.Input]): Torch input tensors or Input specifications
         arg_inputs (Tuple[Union[torch.Tensor, torch_tensorrt.Input], ...]): Same as inputs. Alias for better understanding with kwarg_inputs.
         kwarg_inputs (dict[str, Union[torch.Tensor, torch_tensorrt.Input]]): Optional, kwarg inputs to the module forward function.
-        output_format (str): Format to save the model. Options include exported_program | torchscript | aot_inductor.
+        output_format (str): Format to save the model. Options include exported_program | torchscript | aot_inductor | executorch.
+            The executorch format exports a .pte file with TRT-delegated engines for ExecuTorch runtime.
+            Requires ExecuTorch to be installed and a torch.fx.GraphModule input (not ExportedProgram).
         retrace (bool): When the module type is a fx.GraphModule, this option re-exports the graph using torch.export.export(strict=False) to save it.
 
                 For TRT-compiled modules with dynamic shapes, both retrace=True and retrace=False are supported:
@@ -722,11 +827,18 @@ def save(
 
                 - If both dynamic_shapes and Input objects are provided, the explicit dynamic_shapes
                   parameter takes precedence.
+
+        partitioners (Optional[list]): Custom ExecuTorch partitioners for edge lowering.
+            Only used when output_format="executorch". A TensorRTPartitioner is always
+            included automatically. Additional partitioners can be provided via this
+            parameter. If a TensorRTPartitioner instance is included in the list, it
+            will be used as-is (preserving any custom compile_specs); otherwise one is
+            prepended automatically.
     """
     if isinstance(module, CudaGraphsTorchTensorRTModule):
         module = module.compiled_module
     module_type = _parse_module_type(module)
-    accepted_formats = {"exported_program", "torchscript", "aot_inductor"}
+    accepted_formats = {"exported_program", "torchscript", "aot_inductor", "executorch"}
     if arg_inputs is not None and not all(
         isinstance(input, (torch.Tensor, Input)) for input in arg_inputs
     ):
@@ -847,8 +959,15 @@ def save(
 
     if output_format not in accepted_formats:
         raise ValueError(
-            f"Provided output_format {output_format} is not supported. Supported options are exported_program | torchscript"
+            f"Provided output_format {output_format} is not supported. Supported options are {' | '.join(sorted(accepted_formats))}"
         )
+
+    if partitioners and output_format != "executorch":
+        logger.warning(
+            "partitioners= is only used with output_format='executorch' and will be ignored "
+            f"for output_format='{output_format}'."
+        )
+
     if output_format == "aot_inductor" and platform.system() != "Linux":
         raise ValueError(
             f"The AOT Inductor format is only supported on Linux, {platform.system()} is not a supported platform for this format"
@@ -878,6 +997,11 @@ def save(
                 **kwargs,
             )
     elif module_type == _ModuleType.ep:
+        if output_format == "executorch":
+            raise ValueError(
+                "ExportedProgram cannot be saved directly as executorch format. "
+                "Pass the GraphModule from torch_tensorrt.dynamo.compile() instead."
+            )
         if output_format == "torchscript":
             raise ValueError(
                 "Provided model is a torch.export.ExportedProgram but the output_format specified is torchscript. Please verify the output_format"
@@ -912,6 +1036,16 @@ def save(
                 )
     elif module_type == _ModuleType.fx:
         # The module type is torch.fx.GraphModule
+        if output_format == "executorch":
+            _save_as_executorch(
+                module,
+                file_path,
+                arg_inputs=arg_tensors,
+                kwarg_inputs=kwarg_tensors,
+                dynamic_shapes=dynamic_shapes,
+                partitioners=partitioners,
+            )
+            return
         if output_format == "torchscript":
             module_ts = torch.jit.trace(
                 module, arg_inputs, example_kwarg_inputs=kwarg_inputs
