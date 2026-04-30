@@ -1,5 +1,4 @@
 #pragma once
-#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -192,13 +191,15 @@ struct TRTEngine : torch::CustomClassHolder {
   at::cuda::CUDAStream caller_stream = c10::cuda::getDefaultCUDAStream();
   // Externally-managed engine stream; consulted on every execute() call when
   // non-null. See set_external_stream() docs for lifetime requirements.
-  // Mutated under `mu` from set/clear_external_stream(); read with relaxed
-  // atomic load() inside execute_engine() (also under `mu`).
-  std::atomic<cudaStream_t> external_stream{nullptr};
+  // Always accessed under `mu` (mutated by set/clear_external_stream(); read
+  // by execute_engine() and get_external_stream()). Runtime-only state — NOT
+  // serialized; reset to nullptr on deserialize.
+  cudaStream_t external_stream = nullptr;
   // Tracks whether engine_stream was last seeded from external_stream, so
   // clear_external_stream() can be detected and engine_stream re-acquired
   // from the pool on the next execute() call (avoids holding a stale wrapper
-  // around a CUstream the caller may have destroyed).
+  // around a CUstream the caller may have destroyed). Always accessed under
+  // `mu`.
   bool engine_stream_is_external = false;
   std::vector<at::Tensor> input_buffers = {};
   std::vector<at::Tensor> output_buffers = {};
@@ -230,7 +231,7 @@ struct TRTEngine : torch::CustomClassHolder {
   std::string enqueue_profile_path;
   std::string trt_engine_profile_path;
   std::string cuda_graph_debug_path;
-  std::mutex mu;
+  mutable std::mutex mu;
   std::unique_ptr<TRTEngineProfiler> trt_engine_profiler;
   ResourceAllocationStrategy resource_allocation_strategy = kStatic;
   void set_resource_allocation_strategy(ResourceAllocationStrategy new_strategy);

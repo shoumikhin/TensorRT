@@ -181,6 +181,12 @@ class PythonTorchTensorRTModule(Module):  # type: ignore[misc]
         # Context). Re-resolved on every forward() call so set/clear take
         # effect immediately. See torch_tensorrt.runtime.set_external_stream.
         self._external_stream: Optional[int] = None
+        # Tracks whether _engine_stream was last seeded from _external_stream,
+        # so clear_external_stream() can be detected and a fresh pool stream
+        # acquired on the next forward (avoids reusing a stale ExternalStream
+        # wrapper around a CUstream the caller may have destroyed). Mirrors
+        # TRTEngine::engine_stream_is_external on the C++ side.
+        self._engine_stream_is_external: bool = False
 
         # TODO: Make the below a Dictionary {shape: cudagraph}
         self.shape_key: Optional[str] = None
@@ -566,8 +572,11 @@ class PythonTorchTensorRTModule(Module):  # type: ignore[misc]
             ):
                 self._caller_stream = torch.cuda.current_stream()
                 # Re-resolve engine_stream every call so set/clear external
-                # stream take effect immediately. See torch_tensorrt.runtime.
-                # set_external_stream for the green-context use case.
+                # stream take effect immediately. The provenance flag ensures
+                # clear_external_stream() reverts to the pool even if the
+                # previous engine_stream wrapper is no longer the default
+                # stream. Mirrors TRTEngine::engine_stream_is_external in
+                # core/runtime/execute_engine.cpp.
                 if self._external_stream is not None:
                     if self.cudagraphs_enabled:
                         raise RuntimeError(
@@ -577,11 +586,14 @@ class PythonTorchTensorRTModule(Module):  # type: ignore[misc]
                     self._engine_stream = torch.cuda.ExternalStream(
                         self._external_stream
                     )
+                    self._engine_stream_is_external = True
                 elif (
-                    self._engine_stream == torch.cuda.default_stream()
+                    self._engine_stream_is_external
+                    or self._engine_stream == torch.cuda.default_stream()
                     or self._engine_stream is None
                 ):
                     self._engine_stream = torch.cuda.Stream()
+                    self._engine_stream_is_external = False
 
                 self._engine_stream.wait_stream(self._caller_stream)
 
@@ -672,8 +684,11 @@ class PythonTorchTensorRTModule(Module):  # type: ignore[misc]
             ):
                 self._caller_stream = torch.cuda.current_stream()
                 # Re-resolve engine_stream every call so set/clear external
-                # stream take effect immediately. See torch_tensorrt.runtime.
-                # set_external_stream for the green-context use case.
+                # stream take effect immediately. The provenance flag ensures
+                # clear_external_stream() reverts to the pool even if the
+                # previous engine_stream wrapper is no longer the default
+                # stream. Mirrors TRTEngine::engine_stream_is_external in
+                # core/runtime/execute_engine.cpp.
                 if self._external_stream is not None:
                     if self.cudagraphs_enabled:
                         raise RuntimeError(
@@ -683,11 +698,14 @@ class PythonTorchTensorRTModule(Module):  # type: ignore[misc]
                     self._engine_stream = torch.cuda.ExternalStream(
                         self._external_stream
                     )
+                    self._engine_stream_is_external = True
                 elif (
-                    self._engine_stream == torch.cuda.default_stream()
+                    self._engine_stream_is_external
+                    or self._engine_stream == torch.cuda.default_stream()
                     or self._engine_stream is None
                 ):
                     self._engine_stream = torch.cuda.Stream()
+                    self._engine_stream_is_external = False
 
                 self._engine_stream.wait_stream(self._caller_stream)
 

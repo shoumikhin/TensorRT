@@ -10,7 +10,9 @@ from torch_tensorrt.runtime._cudagraphs import (
 )
 from torch_tensorrt.runtime._external_stream import (
     clear_external_stream,
+    list_trt_submodules,
     set_external_stream,
+    set_external_streams,
 )
 from torch_tensorrt.runtime._multi_device_safe_mode import set_multi_device_safe_mode
 from torch_tensorrt.runtime._output_allocator import enable_output_allocator

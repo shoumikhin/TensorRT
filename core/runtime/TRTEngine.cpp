@@ -315,19 +315,32 @@ void TRTEngine::set_external_stream(int64_t stream_handle) {
   TORCHTRT_CHECK(
       stream_handle != 0,
       "External stream handle must be non-zero. Use clear_external_stream() to revert to the default stream pool.");
-  // Take `mu` so that the cudagraph-vs-external_stream guard in execute_engine
+  auto stream = reinterpret_cast<cudaStream_t>(stream_handle);
+  // Validate that the stream lives in this engine's device. The CUDA driver
+  // API exposes `cuStreamGetCtx` + `cuCtxGetDevice` which would catch a
+  // cross-device binding cleanly, but `cudaStreamGetFlags` is sufficient as a
+  // cheap "this is a real stream" sanity check; full device-affinity
+  // validation requires the driver API and is left to the caller (documented).
+  unsigned int flags = 0;
+  auto cuda_err = cudaStreamGetFlags(stream, &flags);
+  TORCHTRT_CHECK(
+      cuda_err == cudaSuccess,
+      "set_external_stream: cudaStreamGetFlags failed (" << cudaGetErrorString(cuda_err)
+                                                          << "). The stream handle is not a valid CUstream.");
+  // Take `mu` so the cudagraph-vs-external_stream guard in execute_engine
   // sees a consistent snapshot for the duration of one execute() call.
   std::lock_guard<std::mutex> lock(mu);
-  external_stream.store(reinterpret_cast<cudaStream_t>(stream_handle));
+  external_stream = stream;
 }
 
 void TRTEngine::clear_external_stream() {
   std::lock_guard<std::mutex> lock(mu);
-  external_stream.store(nullptr);
+  external_stream = nullptr;
 }
 
 int64_t TRTEngine::get_external_stream() const {
-  return reinterpret_cast<int64_t>(external_stream.load());
+  std::lock_guard<std::mutex> lock(mu);
+  return reinterpret_cast<int64_t>(external_stream);
 }
 
 void TRTEngine::set_profile_format(std::string format) {

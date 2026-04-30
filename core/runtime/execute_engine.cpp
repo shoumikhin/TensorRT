@@ -303,7 +303,7 @@ std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intr
     // between calls without re-creating the engine. The provenance flag
     // ensures clear_external_stream() reverts to the pool even if the previous
     // engine_stream wrapper is no longer the default stream.
-    if (auto external = compiled_engine->external_stream.load()) {
+    if (auto external = compiled_engine->external_stream) {
       compiled_engine->engine_stream = c10::cuda::getStreamFromExternal(external, current_device_id);
       compiled_engine->engine_stream_is_external = true;
     } else if (
@@ -423,7 +423,7 @@ std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intr
     // between calls without re-creating the engine. The provenance flag
     // ensures clear_external_stream() reverts to the pool even if the previous
     // engine_stream wrapper is no longer the default stream.
-    if (auto external = compiled_engine->external_stream.load()) {
+    if (auto external = compiled_engine->external_stream) {
       compiled_engine->engine_stream = c10::cuda::getStreamFromExternal(external, current_device_id);
       compiled_engine->engine_stream_is_external = true;
     } else if (
@@ -519,7 +519,7 @@ std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intr
   // green context torn down) is undefined. Reject the combination explicitly
   // rather than producing silent UAFs at replay time.
   TORCHTRT_CHECK(
-      !(cudagraphs_enabled && compiled_engine->external_stream.load() != nullptr),
+      !(cudagraphs_enabled && compiled_engine->external_stream != nullptr),
       "CUDA Graphs are not supported when an external stream is set on the engine. "
       "Disable cudagraphs (set_cudagraphs_mode(False)) or call clear_external_stream() before enabling cudagraphs.");
 
