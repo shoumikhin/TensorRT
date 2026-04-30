@@ -326,7 +326,7 @@ void TRTEngine::set_external_stream(int64_t stream_handle) {
   TORCHTRT_CHECK(
       cuda_err == cudaSuccess,
       "set_external_stream: cudaStreamGetFlags failed (" << cudaGetErrorString(cuda_err)
-                                                          << "). The stream handle is not a valid CUstream.");
+                                                         << "). The stream handle is not a valid CUstream.");
   // Take `mu` so the cudagraph-vs-external_stream guard in execute_engine
   // sees a consistent snapshot for the duration of one execute() call.
   std::lock_guard<std::mutex> lock(mu);

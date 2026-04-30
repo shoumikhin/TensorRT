@@ -82,7 +82,9 @@ class TestExternalStreamCpp(TestCase):
         self._module_under_test = _compile_sample(device, self.use_python_runtime)
         stream = torch.cuda.Stream(device=device)
 
-        with torch_tensorrt.runtime.set_external_stream(self._module_under_test, stream):
+        with torch_tensorrt.runtime.set_external_stream(
+            self._module_under_test, stream
+        ):
             rt_mods = _collect_rt_modules(self._module_under_test)
             self.assertGreater(len(rt_mods), 0)
             for _, rt_mod in rt_mods:
@@ -105,7 +107,9 @@ class TestExternalStreamCpp(TestCase):
         default_output = self._module_under_test(new_input).detach().cpu()
 
         stream = torch.cuda.Stream(device=device)
-        with torch_tensorrt.runtime.set_external_stream(self._module_under_test, stream):
+        with torch_tensorrt.runtime.set_external_stream(
+            self._module_under_test, stream
+        ):
             external_output = self._module_under_test(new_input)
         torch.cuda.synchronize(device)
         external_output = external_output.detach().cpu()
@@ -198,7 +202,9 @@ class TestExternalStreamCpp(TestCase):
         new_input = torch.randn((1, 3, 5), dtype=torch.float32, device=device)
 
         torch_tensorrt.runtime.set_external_stream(self._module_under_test, stream)
-        with torch_tensorrt.runtime.enable_cudagraphs(self._module_under_test) as cg_mod:
+        with torch_tensorrt.runtime.enable_cudagraphs(
+            self._module_under_test
+        ) as cg_mod:
             with self.assertRaisesRegex(
                 Exception, "CUDA Graphs are not supported when an external stream"
             ):
