@@ -297,12 +297,9 @@ std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intr
     }
 
     compiled_engine->caller_stream = c10::cuda::getCurrentCUDAStream(current_device_id);
-    // Re-resolve engine_stream every call so that set_external_stream() /
-    // clear_external_stream() take effect immediately and the caller can swap
-    // the underlying CUDA stream (e.g., bind to a different CUDA Green Context)
-    // between calls without re-creating the engine. The provenance flag
-    // ensures clear_external_stream() reverts to the pool even if the previous
-    // engine_stream wrapper is no longer the default stream.
+    // Re-resolve every call so set/clear take effect without recreating the engine.
+    // The provenance flag forces a pool re-acquire when external is cleared, even
+    // if engine_stream is no longer the default (would otherwise hold a stale wrapper).
     if (auto external = compiled_engine->external_stream) {
       compiled_engine->engine_stream = c10::cuda::getStreamFromExternal(external, current_device_id);
       compiled_engine->engine_stream_is_external = true;
@@ -417,12 +414,9 @@ std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intr
     }
 
     compiled_engine->caller_stream = c10::cuda::getCurrentCUDAStream(current_device_id);
-    // Re-resolve engine_stream every call so that set_external_stream() /
-    // clear_external_stream() take effect immediately and the caller can swap
-    // the underlying CUDA stream (e.g., bind to a different CUDA Green Context)
-    // between calls without re-creating the engine. The provenance flag
-    // ensures clear_external_stream() reverts to the pool even if the previous
-    // engine_stream wrapper is no longer the default stream.
+    // Re-resolve every call so set/clear take effect without recreating the engine.
+    // The provenance flag forces a pool re-acquire when external is cleared, even
+    // if engine_stream is no longer the default (would otherwise hold a stale wrapper).
     if (auto external = compiled_engine->external_stream) {
       compiled_engine->engine_stream = c10::cuda::getStreamFromExternal(external, current_device_id);
       compiled_engine->engine_stream_is_external = true;
@@ -514,14 +508,12 @@ std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intr
   }
   bool cudagraphs_enabled = (CUDAGRAPHS_MODE == SUBGRAPH_CUDAGRAPHS);
 
-  // CUDA Graph capture records the engine_stream identity into the captured
-  // graph; replaying after the external stream is destroyed (or its parent
-  // green context torn down) is undefined. Reject the combination explicitly
-  // rather than producing silent UAFs at replay time.
+  // Captured graphs record the engine_stream identity; replay after the
+  // caller-owned stream is destroyed is UB.
   TORCHTRT_CHECK(
       !(cudagraphs_enabled && compiled_engine->external_stream != nullptr),
       "CUDA Graphs are not supported when an external stream is set on the engine. "
-      "Disable cudagraphs (set_cudagraphs_mode(False)) or call clear_external_stream() before enabling cudagraphs.");
+      "Disable cudagraphs or call clear_external_stream() first.");
 
   if (MULTI_DEVICE_SAFE_MODE) {
     std::unique_ptr<torch::autograd::profiler::RecordProfile> device_profiler_guard;

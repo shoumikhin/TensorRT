@@ -336,7 +336,7 @@ class TorchTensorRTModule(torch.nn.Module):  # type: ignore[misc]
         self.engine.clear_external_stream()
 
     def get_external_stream(self) -> int:
-        return int(self.engine.get_external_stream())
+        return self.engine.get_external_stream()
 
     def forward(self, *inputs: Any) -> torch.Tensor | Tuple[torch.Tensor, ...]:
         """Implementation of the forward pass for a TensorRT engine

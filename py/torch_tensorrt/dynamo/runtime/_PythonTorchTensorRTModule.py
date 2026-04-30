@@ -177,15 +177,8 @@ class PythonTorchTensorRTModule(Module):  # type: ignore[misc]
         self.cudagraph: Optional[torch.cuda.CUDAGraph] = None
         self._caller_stream: Optional[torch.cuda.Stream] = None
         self._engine_stream: Optional[torch.cuda.Stream] = None
-        # Optional externally-managed CUDA stream (e.g., bound to a CUDA Green
-        # Context). Re-resolved on every forward() call so set/clear take
-        # effect immediately. See torch_tensorrt.runtime.set_external_stream.
+        # Mirrors TRTEngine::external_stream + engine_stream_is_external on the C++ side.
         self._external_stream: Optional[int] = None
-        # Tracks whether _engine_stream was last seeded from _external_stream,
-        # so clear_external_stream() can be detected and a fresh pool stream
-        # acquired on the next forward (avoids reusing a stale ExternalStream
-        # wrapper around a CUstream the caller may have destroyed). Mirrors
-        # TRTEngine::engine_stream_is_external on the C++ side.
         self._engine_stream_is_external: bool = False
 
         # TODO: Make the below a Dictionary {shape: cudagraph}
@@ -468,7 +461,8 @@ class PythonTorchTensorRTModule(Module):  # type: ignore[misc]
     def set_external_stream(self, stream_handle: int) -> None:
         if stream_handle == 0:
             raise ValueError(
-                "External stream handle must be non-zero. Use clear_external_stream() to revert to the default stream pool."
+                "External stream handle must be non-zero. "
+                "Use clear_external_stream() to revert to the default stream pool."
             )
         self._external_stream = int(stream_handle)
 
@@ -476,7 +470,7 @@ class PythonTorchTensorRTModule(Module):  # type: ignore[misc]
         self._external_stream = None
 
     def get_external_stream(self) -> int:
-        return self._external_stream if self._external_stream is not None else 0
+        return self._external_stream or 0
 
     def set_use_output_allocator(self, enable: bool) -> None:
         self.use_output_allocator_outputs = enable
@@ -571,17 +565,13 @@ class PythonTorchTensorRTModule(Module):  # type: ignore[misc]
                 else nullcontext()
             ):
                 self._caller_stream = torch.cuda.current_stream()
-                # Re-resolve engine_stream every call so set/clear external
-                # stream take effect immediately. The provenance flag ensures
-                # clear_external_stream() reverts to the pool even if the
-                # previous engine_stream wrapper is no longer the default
-                # stream. Mirrors TRTEngine::engine_stream_is_external in
-                # core/runtime/execute_engine.cpp.
+                # Re-resolve every call; provenance flag forces pool re-acquire after
+                # clear (engine_stream wrapper would otherwise stay stale).
                 if self._external_stream is not None:
                     if self.cudagraphs_enabled:
                         raise RuntimeError(
                             "CUDA Graphs are not supported when an external stream is set on the engine. "
-                            "Disable cudagraphs (set_cudagraphs_mode(False)) or call clear_external_stream() before enabling cudagraphs."
+                            "Disable cudagraphs or call clear_external_stream() first."
                         )
                     self._engine_stream = torch.cuda.ExternalStream(
                         self._external_stream
@@ -683,17 +673,13 @@ class PythonTorchTensorRTModule(Module):  # type: ignore[misc]
                 else nullcontext()
             ):
                 self._caller_stream = torch.cuda.current_stream()
-                # Re-resolve engine_stream every call so set/clear external
-                # stream take effect immediately. The provenance flag ensures
-                # clear_external_stream() reverts to the pool even if the
-                # previous engine_stream wrapper is no longer the default
-                # stream. Mirrors TRTEngine::engine_stream_is_external in
-                # core/runtime/execute_engine.cpp.
+                # Re-resolve every call; provenance flag forces pool re-acquire after
+                # clear (engine_stream wrapper would otherwise stay stale).
                 if self._external_stream is not None:
                     if self.cudagraphs_enabled:
                         raise RuntimeError(
                             "CUDA Graphs are not supported when an external stream is set on the engine. "
-                            "Disable cudagraphs (set_cudagraphs_mode(False)) or call clear_external_stream() before enabling cudagraphs."
+                            "Disable cudagraphs or call clear_external_stream() first."
                         )
                     self._engine_stream = torch.cuda.ExternalStream(
                         self._external_stream

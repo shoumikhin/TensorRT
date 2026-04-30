@@ -170,10 +170,9 @@ struct TRTEngine : torch::CustomClassHolder {
   void set_pre_allocated_outputs(bool enable);
   void set_output_tensors_as_unowned(bool enable);
   bool are_output_tensors_unowned();
-  // External CUDA stream binding (e.g., for CUDA Green Contexts; cuda 12.4+).
-  // The caller owns the stream's lifetime and MUST call clear_external_stream()
-  // before destroying the underlying stream. CUDA Graphs cannot be combined
-  // with an external stream and will throw at execute time.
+  // External CUDA stream binding (e.g., for CUDA Green Contexts, cuda 12.4+).
+  // Caller owns the stream lifetime and must clear before destroying it.
+  // Mutually exclusive with CUDA Graphs (throws at execute time).
   void set_external_stream(int64_t stream_handle);
   void clear_external_stream();
   int64_t get_external_stream() const;
@@ -189,17 +188,8 @@ struct TRTEngine : torch::CustomClassHolder {
   at::cuda::CUDAGraph cudagraph = {};
   at::cuda::CUDAStream engine_stream = c10::cuda::getDefaultCUDAStream();
   at::cuda::CUDAStream caller_stream = c10::cuda::getDefaultCUDAStream();
-  // Externally-managed engine stream; consulted on every execute() call when
-  // non-null. See set_external_stream() docs for lifetime requirements.
-  // Always accessed under `mu` (mutated by set/clear_external_stream(); read
-  // by execute_engine() and get_external_stream()). Runtime-only state — NOT
-  // serialized; reset to nullptr on deserialize.
+  // Runtime-only state, never serialized. Both fields accessed under `mu`.
   cudaStream_t external_stream = nullptr;
-  // Tracks whether engine_stream was last seeded from external_stream, so
-  // clear_external_stream() can be detected and engine_stream re-acquired
-  // from the pool on the next execute() call (avoids holding a stale wrapper
-  // around a CUstream the caller may have destroyed). Always accessed under
-  // `mu`.
   bool engine_stream_is_external = false;
   std::vector<at::Tensor> input_buffers = {};
   std::vector<at::Tensor> output_buffers = {};
