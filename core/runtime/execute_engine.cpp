@@ -6,6 +6,7 @@
 #include "torch/torch.h"
 
 #include "core/runtime/TRTEngineProfiler.h"
+#include "core/runtime/external_streams.h"
 #include "core/runtime/runtime.h"
 #include "core/util/prelude.h"
 
@@ -298,8 +299,15 @@ std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intr
 
     compiled_engine->caller_stream = c10::cuda::getCurrentCUDAStream(current_device_id);
     if (compiled_engine->engine_stream == c10::cuda::getDefaultCUDAStream(current_device_id)) {
-      // Create a new stream if the engine stream is the default stream
-      compiled_engine->engine_stream = c10::cuda::getStreamFromPool(false, current_device_id);
+      // Prefer an externally-registered stream (e.g., one bound to a CUDA Green
+      // Context for SM partitioning) over the default torch stream pool.
+      if (auto external = get_external_stream(current_device_id)) {
+        compiled_engine->engine_stream =
+            c10::cuda::getStreamFromExternal(*external, current_device_id);
+      } else {
+        // Create a new stream if the engine stream is the default stream
+        compiled_engine->engine_stream = c10::cuda::getStreamFromPool(false, current_device_id);
+      }
     }
 
     { // Engine Execution (execute on engine stream)
@@ -407,8 +415,15 @@ std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intr
 
     compiled_engine->caller_stream = c10::cuda::getCurrentCUDAStream(current_device_id);
     if (compiled_engine->engine_stream == c10::cuda::getDefaultCUDAStream(current_device_id)) {
-      // Create a new stream if the engine stream is the default stream
-      compiled_engine->engine_stream = c10::cuda::getStreamFromPool(false, current_device_id);
+      // Prefer an externally-registered stream (e.g., one bound to a CUDA Green
+      // Context for SM partitioning) over the default torch stream pool.
+      if (auto external = get_external_stream(current_device_id)) {
+        compiled_engine->engine_stream =
+            c10::cuda::getStreamFromExternal(*external, current_device_id);
+      } else {
+        // Create a new stream if the engine stream is the default stream
+        compiled_engine->engine_stream = c10::cuda::getStreamFromPool(false, current_device_id);
+      }
     }
 
     { // Engine Execution (execute on engine stream)
