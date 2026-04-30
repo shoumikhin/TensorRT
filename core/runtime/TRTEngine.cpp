@@ -315,10 +315,14 @@ void TRTEngine::set_external_stream(int64_t stream_handle) {
   TORCHTRT_CHECK(
       stream_handle != 0,
       "External stream handle must be non-zero. Use clear_external_stream() to revert to the default stream pool.");
+  // Take `mu` so that the cudagraph-vs-external_stream guard in execute_engine
+  // sees a consistent snapshot for the duration of one execute() call.
+  std::lock_guard<std::mutex> lock(mu);
   external_stream.store(reinterpret_cast<cudaStream_t>(stream_handle));
 }
 
 void TRTEngine::clear_external_stream() {
+  std::lock_guard<std::mutex> lock(mu);
   external_stream.store(nullptr);
 }
 

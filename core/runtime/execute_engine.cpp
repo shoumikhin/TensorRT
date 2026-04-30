@@ -300,12 +300,17 @@ std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intr
     // Re-resolve engine_stream every call so that set_external_stream() /
     // clear_external_stream() take effect immediately and the caller can swap
     // the underlying CUDA stream (e.g., bind to a different CUDA Green Context)
-    // between calls without re-creating the engine.
+    // between calls without re-creating the engine. The provenance flag
+    // ensures clear_external_stream() reverts to the pool even if the previous
+    // engine_stream wrapper is no longer the default stream.
     if (auto external = compiled_engine->external_stream.load()) {
       compiled_engine->engine_stream = c10::cuda::getStreamFromExternal(external, current_device_id);
-    } else if (compiled_engine->engine_stream == c10::cuda::getDefaultCUDAStream(current_device_id)) {
-      // Create a new stream if the engine stream is the default stream
+      compiled_engine->engine_stream_is_external = true;
+    } else if (
+        compiled_engine->engine_stream_is_external ||
+        compiled_engine->engine_stream == c10::cuda::getDefaultCUDAStream(current_device_id)) {
       compiled_engine->engine_stream = c10::cuda::getStreamFromPool(false, current_device_id);
+      compiled_engine->engine_stream_is_external = false;
     }
 
     { // Engine Execution (execute on engine stream)
@@ -415,12 +420,17 @@ std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intr
     // Re-resolve engine_stream every call so that set_external_stream() /
     // clear_external_stream() take effect immediately and the caller can swap
     // the underlying CUDA stream (e.g., bind to a different CUDA Green Context)
-    // between calls without re-creating the engine.
+    // between calls without re-creating the engine. The provenance flag
+    // ensures clear_external_stream() reverts to the pool even if the previous
+    // engine_stream wrapper is no longer the default stream.
     if (auto external = compiled_engine->external_stream.load()) {
       compiled_engine->engine_stream = c10::cuda::getStreamFromExternal(external, current_device_id);
-    } else if (compiled_engine->engine_stream == c10::cuda::getDefaultCUDAStream(current_device_id)) {
-      // Create a new stream if the engine stream is the default stream
+      compiled_engine->engine_stream_is_external = true;
+    } else if (
+        compiled_engine->engine_stream_is_external ||
+        compiled_engine->engine_stream == c10::cuda::getDefaultCUDAStream(current_device_id)) {
       compiled_engine->engine_stream = c10::cuda::getStreamFromPool(false, current_device_id);
+      compiled_engine->engine_stream_is_external = false;
     }
 
     { // Engine Execution (execute on engine stream)

@@ -192,7 +192,14 @@ struct TRTEngine : torch::CustomClassHolder {
   at::cuda::CUDAStream caller_stream = c10::cuda::getDefaultCUDAStream();
   // Externally-managed engine stream; consulted on every execute() call when
   // non-null. See set_external_stream() docs for lifetime requirements.
+  // Mutated under `mu` from set/clear_external_stream(); read with relaxed
+  // atomic load() inside execute_engine() (also under `mu`).
   std::atomic<cudaStream_t> external_stream{nullptr};
+  // Tracks whether engine_stream was last seeded from external_stream, so
+  // clear_external_stream() can be detected and engine_stream re-acquired
+  // from the pool on the next execute() call (avoids holding a stale wrapper
+  // around a CUstream the caller may have destroyed).
+  bool engine_stream_is_external = false;
   std::vector<at::Tensor> input_buffers = {};
   std::vector<at::Tensor> output_buffers = {};
   std::string shape_key = "None";

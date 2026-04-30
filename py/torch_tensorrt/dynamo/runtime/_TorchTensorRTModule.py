@@ -329,6 +329,15 @@ class TorchTensorRTModule(torch.nn.Module):  # type: ignore[misc]
     def set_use_output_allocator(self, enable: bool) -> None:
         self.engine.use_output_allocator_outputs = enable
 
+    def set_external_stream(self, stream_handle: int) -> None:
+        self.engine.set_external_stream(stream_handle)
+
+    def clear_external_stream(self) -> None:
+        self.engine.clear_external_stream()
+
+    def get_external_stream(self) -> int:
+        return int(self.engine.get_external_stream())
+
     def forward(self, *inputs: Any) -> torch.Tensor | Tuple[torch.Tensor, ...]:
         """Implementation of the forward pass for a TensorRT engine
 

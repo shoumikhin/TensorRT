@@ -177,6 +177,10 @@ class PythonTorchTensorRTModule(Module):  # type: ignore[misc]
         self.cudagraph: Optional[torch.cuda.CUDAGraph] = None
         self._caller_stream: Optional[torch.cuda.Stream] = None
         self._engine_stream: Optional[torch.cuda.Stream] = None
+        # Optional externally-managed CUDA stream (e.g., bound to a CUDA Green
+        # Context). Re-resolved on every forward() call so set/clear take
+        # effect immediately. See torch_tensorrt.runtime.set_external_stream.
+        self._external_stream: Optional[int] = None
 
         # TODO: Make the below a Dictionary {shape: cudagraph}
         self.shape_key: Optional[str] = None
@@ -455,6 +459,19 @@ class PythonTorchTensorRTModule(Module):  # type: ignore[misc]
     def set_pre_allocated_outputs(self, enable: bool) -> None:
         self.use_pre_allocated_outputs = enable
 
+    def set_external_stream(self, stream_handle: int) -> None:
+        if stream_handle == 0:
+            raise ValueError(
+                "External stream handle must be non-zero. Use clear_external_stream() to revert to the default stream pool."
+            )
+        self._external_stream = int(stream_handle)
+
+    def clear_external_stream(self) -> None:
+        self._external_stream = None
+
+    def get_external_stream(self) -> int:
+        return self._external_stream if self._external_stream is not None else 0
+
     def set_use_output_allocator(self, enable: bool) -> None:
         self.use_output_allocator_outputs = enable
 
@@ -548,7 +565,19 @@ class PythonTorchTensorRTModule(Module):  # type: ignore[misc]
                 else nullcontext()
             ):
                 self._caller_stream = torch.cuda.current_stream()
-                if (
+                # Re-resolve engine_stream every call so set/clear external
+                # stream take effect immediately. See torch_tensorrt.runtime.
+                # set_external_stream for the green-context use case.
+                if self._external_stream is not None:
+                    if self.cudagraphs_enabled:
+                        raise RuntimeError(
+                            "CUDA Graphs are not supported when an external stream is set on the engine. "
+                            "Disable cudagraphs (set_cudagraphs_mode(False)) or call clear_external_stream() before enabling cudagraphs."
+                        )
+                    self._engine_stream = torch.cuda.ExternalStream(
+                        self._external_stream
+                    )
+                elif (
                     self._engine_stream == torch.cuda.default_stream()
                     or self._engine_stream is None
                 ):
@@ -642,7 +671,19 @@ class PythonTorchTensorRTModule(Module):  # type: ignore[misc]
                 else nullcontext()
             ):
                 self._caller_stream = torch.cuda.current_stream()
-                if (
+                # Re-resolve engine_stream every call so set/clear external
+                # stream take effect immediately. See torch_tensorrt.runtime.
+                # set_external_stream for the green-context use case.
+                if self._external_stream is not None:
+                    if self.cudagraphs_enabled:
+                        raise RuntimeError(
+                            "CUDA Graphs are not supported when an external stream is set on the engine. "
+                            "Disable cudagraphs (set_cudagraphs_mode(False)) or call clear_external_stream() before enabling cudagraphs."
+                        )
+                    self._engine_stream = torch.cuda.ExternalStream(
+                        self._external_stream
+                    )
+                elif (
                     self._engine_stream == torch.cuda.default_stream()
                     or self._engine_stream is None
                 ):
