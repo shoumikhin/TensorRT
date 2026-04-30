@@ -6,7 +6,6 @@
 #include "Python.h"
 #include "core/compiler.h"
 #include "core/conversion/conversion.h"
-#include "core/runtime/external_streams.h"
 #include "tensorrt_classes.h"
 #include "torch/csrc/jit/python/pybind_utils.h"
 #include "torch/custom_class.h"
@@ -172,27 +171,6 @@ PYBIND11_MODULE(_C, m) {
   m.def("_log", &logging::log, "Add a message to the logger");
   m.def("set_device", &torch_tensorrt::pyapi::set_device, "Set CUDA device id");
   m.def("_get_current_device", &torch_tensorrt::pyapi::get_current_device, "Get the current active CUDA device");
-
-  // External stream registry: install a CUDA stream (e.g., one created via
-  // cuGreenCtxStreamCreate for SM partitioning) that the runtime will use as
-  // the engine stream for enqueueV3 instead of pulling one from torch's
-  // internal stream pool. Caller owns the stream's lifetime.
-  m.def(
-      "_register_external_stream",
-      [](int64_t device_id, int64_t stream_handle) {
-        core::runtime::register_external_stream(
-            device_id, reinterpret_cast<cudaStream_t>(stream_handle));
-      },
-      "Register an externally-managed CUDA stream for the given device. "
-      "stream_handle must be a CUstream / cudaStream_t cast to int64_t.");
-  m.def(
-      "_unregister_external_stream",
-      [](int64_t device_id) { core::runtime::unregister_external_stream(device_id); },
-      "Unregister the externally-managed CUDA stream for the given device.");
-  m.def(
-      "_clear_external_streams",
-      []() { core::runtime::clear_external_streams(); },
-      "Clear all externally-managed CUDA streams.");
 
   py::enum_<core::util::logging::LogLevel>(m, "LogLevel", py::arithmetic())
       .value("INTERNAL_ERROR", core::util::logging::LogLevel::kINTERNAL_ERROR)

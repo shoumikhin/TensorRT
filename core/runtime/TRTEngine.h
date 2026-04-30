@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -170,6 +171,13 @@ struct TRTEngine : torch::CustomClassHolder {
   void set_pre_allocated_outputs(bool enable);
   void set_output_tensors_as_unowned(bool enable);
   bool are_output_tensors_unowned();
+  // External CUDA stream binding (e.g., for CUDA Green Contexts; cuda 12.4+).
+  // The caller owns the stream's lifetime and MUST call clear_external_stream()
+  // before destroying the underlying stream. CUDA Graphs cannot be combined
+  // with an external stream and will throw at execute time.
+  void set_external_stream(int64_t stream_handle);
+  void clear_external_stream();
+  int64_t get_external_stream() const;
   TorchTRTRuntimeStates runtime_states;
   friend std::ostream& operator<<(std::ostream& os, const TRTEngine& engine);
   static const char BINDING_DELIM = '%';
@@ -182,6 +190,9 @@ struct TRTEngine : torch::CustomClassHolder {
   at::cuda::CUDAGraph cudagraph = {};
   at::cuda::CUDAStream engine_stream = c10::cuda::getDefaultCUDAStream();
   at::cuda::CUDAStream caller_stream = c10::cuda::getDefaultCUDAStream();
+  // Externally-managed engine stream; consulted on every execute() call when
+  // non-null. See set_external_stream() docs for lifetime requirements.
+  std::atomic<cudaStream_t> external_stream{nullptr};
   std::vector<at::Tensor> input_buffers = {};
   std::vector<at::Tensor> output_buffers = {};
   std::string shape_key = "None";

@@ -6,7 +6,6 @@
 #include "torch/torch.h"
 
 #include "core/runtime/TRTEngineProfiler.h"
-#include "core/runtime/external_streams.h"
 #include "core/runtime/runtime.h"
 #include "core/util/prelude.h"
 
@@ -298,16 +297,15 @@ std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intr
     }
 
     compiled_engine->caller_stream = c10::cuda::getCurrentCUDAStream(current_device_id);
-    if (compiled_engine->engine_stream == c10::cuda::getDefaultCUDAStream(current_device_id)) {
-      // Prefer an externally-registered stream (e.g., one bound to a CUDA Green
-      // Context for SM partitioning) over the default torch stream pool.
-      if (auto external = get_external_stream(current_device_id)) {
-        compiled_engine->engine_stream =
-            c10::cuda::getStreamFromExternal(*external, current_device_id);
-      } else {
-        // Create a new stream if the engine stream is the default stream
-        compiled_engine->engine_stream = c10::cuda::getStreamFromPool(false, current_device_id);
-      }
+    // Re-resolve engine_stream every call so that set_external_stream() /
+    // clear_external_stream() take effect immediately and the caller can swap
+    // the underlying CUDA stream (e.g., bind to a different CUDA Green Context)
+    // between calls without re-creating the engine.
+    if (auto external = compiled_engine->external_stream.load()) {
+      compiled_engine->engine_stream = c10::cuda::getStreamFromExternal(external, current_device_id);
+    } else if (compiled_engine->engine_stream == c10::cuda::getDefaultCUDAStream(current_device_id)) {
+      // Create a new stream if the engine stream is the default stream
+      compiled_engine->engine_stream = c10::cuda::getStreamFromPool(false, current_device_id);
     }
 
     { // Engine Execution (execute on engine stream)
@@ -414,16 +412,15 @@ std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intr
     }
 
     compiled_engine->caller_stream = c10::cuda::getCurrentCUDAStream(current_device_id);
-    if (compiled_engine->engine_stream == c10::cuda::getDefaultCUDAStream(current_device_id)) {
-      // Prefer an externally-registered stream (e.g., one bound to a CUDA Green
-      // Context for SM partitioning) over the default torch stream pool.
-      if (auto external = get_external_stream(current_device_id)) {
-        compiled_engine->engine_stream =
-            c10::cuda::getStreamFromExternal(*external, current_device_id);
-      } else {
-        // Create a new stream if the engine stream is the default stream
-        compiled_engine->engine_stream = c10::cuda::getStreamFromPool(false, current_device_id);
-      }
+    // Re-resolve engine_stream every call so that set_external_stream() /
+    // clear_external_stream() take effect immediately and the caller can swap
+    // the underlying CUDA stream (e.g., bind to a different CUDA Green Context)
+    // between calls without re-creating the engine.
+    if (auto external = compiled_engine->external_stream.load()) {
+      compiled_engine->engine_stream = c10::cuda::getStreamFromExternal(external, current_device_id);
+    } else if (compiled_engine->engine_stream == c10::cuda::getDefaultCUDAStream(current_device_id)) {
+      // Create a new stream if the engine stream is the default stream
+      compiled_engine->engine_stream = c10::cuda::getStreamFromPool(false, current_device_id);
     }
 
     { // Engine Execution (execute on engine stream)
@@ -506,6 +503,15 @@ std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intr
     compiled_engine->cudagraph.enable_debug_mode();
   }
   bool cudagraphs_enabled = (CUDAGRAPHS_MODE == SUBGRAPH_CUDAGRAPHS);
+
+  // CUDA Graph capture records the engine_stream identity into the captured
+  // graph; replaying after the external stream is destroyed (or its parent
+  // green context torn down) is undefined. Reject the combination explicitly
+  // rather than producing silent UAFs at replay time.
+  TORCHTRT_CHECK(
+      !(cudagraphs_enabled && compiled_engine->external_stream.load() != nullptr),
+      "CUDA Graphs are not supported when an external stream is set on the engine. "
+      "Disable cudagraphs (set_cudagraphs_mode(False)) or call clear_external_stream() before enabling cudagraphs.");
 
   if (MULTI_DEVICE_SAFE_MODE) {
     std::unique_ptr<torch::autograd::profiler::RecordProfile> device_profiler_guard;

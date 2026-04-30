@@ -311,6 +311,21 @@ bool TRTEngine::are_output_tensors_unowned() {
   return this->output_tensors_are_unowned;
 }
 
+void TRTEngine::set_external_stream(int64_t stream_handle) {
+  TORCHTRT_CHECK(
+      stream_handle != 0,
+      "External stream handle must be non-zero. Use clear_external_stream() to revert to the default stream pool.");
+  external_stream.store(reinterpret_cast<cudaStream_t>(stream_handle));
+}
+
+void TRTEngine::clear_external_stream() {
+  external_stream.store(nullptr);
+}
+
+int64_t TRTEngine::get_external_stream() const {
+  return reinterpret_cast<int64_t>(external_stream.load());
+}
+
 void TRTEngine::set_profile_format(std::string format) {
   if (format == "trex") {
     this->trt_engine_profiler->set_profile_format(TraceFormat::kTREX);

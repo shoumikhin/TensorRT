@@ -67,7 +67,6 @@ cc_library(
         "TRTEngine.cpp",
         "TRTEngineProfiler.cpp",
         "execute_engine.cpp",
-        "external_streams.cpp",
         "register_jit_hooks.cpp",
         "runtime.cpp",
     ],
@@ -76,7 +75,6 @@ cc_library(
         "RTDevice.h",
         "TRTEngine.h",
         "TRTEngineProfiler.h",
-        "external_streams.h",
         "runtime.h",
     ],
     linkopts = [
