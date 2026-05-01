@@ -325,11 +325,16 @@ void TRTEngine::set_external_stream(int64_t stream_handle) {
   // consistent snapshot for the duration of one execute() call.
   std::lock_guard<std::mutex> lock(mu);
   external_stream = stream;
+  // A previously-captured graph records the prior engine_stream identity;
+  // replaying it on the new external stream would be UB.
+  cudagraph.reset();
 }
 
 void TRTEngine::clear_external_stream() {
   std::lock_guard<std::mutex> lock(mu);
   external_stream = nullptr;
+  // The next cudagraphs-enabled call must recapture against a pool stream.
+  cudagraph.reset();
 }
 
 int64_t TRTEngine::get_external_stream() const {

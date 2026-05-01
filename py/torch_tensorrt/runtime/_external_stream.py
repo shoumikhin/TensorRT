@@ -21,9 +21,15 @@ def _to_handle(stream: StreamLike) -> int:
 
 
 def _iter_rt_modules(module: Any) -> List[Tuple[str, RTModule]]:
+    if not hasattr(module, "named_modules"):
+        raise TypeError(f"expected nn.Module, got {type(module).__name__}")
+    # named_modules() recurses; needed because real-world compiled outputs
+    # (e.g. HF blocks above min_block_size) nest TRT submodules under wrapper
+    # GraphModules where named_children() would miss them. Returned names are
+    # dotted paths and unique.
     return [
         (name, m)
-        for name, m in getattr(module, "named_children", lambda: [])()
+        for name, m in module.named_modules()
         if "_run_on_acc" in name
         and isinstance(m, (PythonTorchTensorRTModule, TorchTensorRTModule))
     ]
@@ -53,7 +59,8 @@ def set_external_stream(
     ``stream`` is either a single ``StreamLike`` bound to every TRT engine, or a
     ``Dict[submodule_name, StreamLike]`` for per-engine binding (the canonical
     multi-engine SM-partitioning case via CUDA Green Contexts; cuda 12.4+).
-    Submodule names come from ``module.named_children()``.
+    Submodule names are dotted paths from ``module.named_modules()`` (recursive),
+    so deeply-nested TRT submodules are reachable.
 
     Returns a context manager that restores prior bindings on exit.
 

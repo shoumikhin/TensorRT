@@ -465,9 +465,14 @@ class PythonTorchTensorRTModule(Module):  # type: ignore[misc]
                 "Use clear_external_stream() to revert to the default stream pool."
             )
         self._external_stream = int(stream_handle)
+        # A previously-captured graph records the prior engine_stream identity;
+        # replaying it on the new external stream would be UB.
+        self._reset_captured_graph()
 
     def clear_external_stream(self) -> None:
         self._external_stream = None
+        # The next cudagraphs-enabled call must recapture against a pool stream.
+        self._reset_captured_graph()
 
     def get_external_stream(self) -> int:
         return self._external_stream or 0
