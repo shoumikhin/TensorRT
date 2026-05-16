@@ -54,6 +54,7 @@ find_package(Threads REQUIRED)
 
 set(_torchtrt_executorch_sources
     "${_torchtrt_executorch_backend_source}"
+    "${_torchtrt_source_root}/core/runtime/executorch/ETRTEngine.cpp"
     "${_torchtrt_source_root}/core/runtime/DeviceList.cpp"
     "${_torchtrt_source_root}/core/runtime/Platform.cpp"
     "${_torchtrt_source_root}/core/runtime/RTDevice.cpp"

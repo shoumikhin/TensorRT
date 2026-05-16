@@ -17,15 +17,10 @@
 #include <cuda_runtime.h>
 
 #include <executorch/runtime/backend/interface.h>
+#include <executorch/runtime/core/exec_aten/util/tensor_util.h>
 #include <executorch/runtime/platform/log.h>
 
-// RTDevice and Platform must be included before TRTEngine.h because TRTEngine.h
-// references them without including their headers directly (Bazel handles this
-// via transitive deps, but a standalone compile needs them explicit).
-#include "core/runtime/Platform.h"
-#include "core/runtime/RTDevice.h"
-#include "core/runtime/TRTEngine.h"
-#include "core/util/prelude.h"
+#include "core/runtime/executorch/ETRTEngine.h"
 
 namespace torch_tensorrt {
 namespace executorch_backend {
@@ -55,9 +50,9 @@ namespace {
 //     [uint32_t len (LE)] [uint8_t data[len]]
 //
 // The resulting vector<string> is passed directly to
-//   core::runtime::TRTEngine(std::vector<std::string> serialized_info)
-// which expects the 11-element list defined by SerializedInfoIndex in
-//   core/runtime/runtime.h
+//   executorch_backend::ETRTEngine(std::vector<std::string> serialized_info)
+// which expects the SERIALIZATION_LEN-element list defined by
+// SerializedInfoIndex in core/runtime/runtime.h.
 // ---------------------------------------------------------------------------
 std::vector<std::string> deserialize_engine_info(const void* data, size_t size) {
   const uint8_t* ptr = static_cast<const uint8_t*>(data);
@@ -116,7 +111,7 @@ bool TensorRTBackend::is_available() const {
 // ---------------------------------------------------------------------------
 // init
 //
-// Deserializes the processed blob into a TRTEngine and returns it as the
+// Deserializes the processed blob into an ETRTEngine and returns it as the
 // opaque DelegateHandle.  The engine is placement-new'd into memory
 // provided by the ExecuTorch MemoryAllocator so that ExecuTorch owns the
 // lifetime; destroy() calls the destructor explicitly.
@@ -147,11 +142,11 @@ Result<DelegateHandle*> TensorRTBackend::init(
   }
   ET_LOG(Info, "TensorRTBackend::init: deserialized %zu entries", serialized_info.size());
 
-  // Validate the vector length before handing to TRTEngine
+  // Validate the vector length before handing to ETRTEngine
   // (verify_serialization_fmt throws on mismatch)
   ET_LOG(Info, "TensorRTBackend::init: calling verify_serialization_fmt");
   try {
-    core::runtime::TRTEngine::verify_serialization_fmt(serialized_info);
+    ETRTEngine::verify_serialization_fmt(serialized_info);
   } catch (const std::exception& e) {
     ET_LOG(Error, "TensorRTBackend::init: verify_serialization_fmt threw: %s", e.what());
     return Error::InvalidArgument;
@@ -167,27 +162,27 @@ Result<DelegateHandle*> TensorRTBackend::init(
   }
   ET_LOG(Info, "TensorRTBackend::init: got allocator");
 
-  // Allocate raw storage for TRTEngine from ExecuTorch's arena
-  core::runtime::TRTEngine* engine = allocator->allocateInstance<core::runtime::TRTEngine>();
+  // Allocate raw storage for ETRTEngine from ExecuTorch's arena
+  ETRTEngine* engine = allocator->allocateInstance<ETRTEngine>();
   if (engine == nullptr) {
     ET_LOG(Error, "TensorRTBackend::init: allocateInstance failed");
     return Error::MemoryAllocationFailed;
   }
   ET_LOG(Info, "TensorRTBackend::init: allocated engine storage at %p", (void*)engine);
 
-  // Construct in-place; TRTEngine(std::vector<std::string>) deserializes the
+  // Construct in-place; ETRTEngine(std::vector<std::string>) deserializes the
   // engine bytes, builds the IRuntime/ICudaEngine/IExecutionContext, and
   // populates in_binding_names / out_binding_names / num_io.
-  ET_LOG(Info, "TensorRTBackend::init: constructing TRTEngine in-place");
+  ET_LOG(Info, "TensorRTBackend::init: constructing ETRTEngine in-place");
   try {
-    new (engine) core::runtime::TRTEngine(std::move(serialized_info));
+    new (engine) ETRTEngine(std::move(serialized_info));
   } catch (const std::exception& e) {
-    fprintf(stderr, "[TensorRTBackend::init] FAIL: TRTEngine constructor threw: %s\n", e.what());
-    ET_LOG(Error, "TensorRTBackend::init: TRTEngine constructor threw: %s", e.what());
+    fprintf(stderr, "[TensorRTBackend::init] FAIL: ETRTEngine constructor threw: %s\n", e.what());
+    ET_LOG(Error, "TensorRTBackend::init: ETRTEngine constructor threw: %s", e.what());
     return Error::InvalidArgument;
   } catch (...) {
-    fprintf(stderr, "[TensorRTBackend::init] FAIL: TRTEngine constructor threw unknown exception\n");
-    ET_LOG(Error, "TensorRTBackend::init: TRTEngine constructor threw unknown exception");
+    fprintf(stderr, "[TensorRTBackend::init] FAIL: ETRTEngine constructor threw unknown exception\n");
+    ET_LOG(Error, "TensorRTBackend::init: ETRTEngine constructor threw unknown exception");
     return Error::InvalidArgument;
   }
 
@@ -226,7 +221,7 @@ Error TensorRTBackend::execute(BackendExecutionContext& context, DelegateHandle*
     return Error::InvalidArgument;
   }
   ET_LOG(Info, "TensorRTBackend::execute: got delegate handle");
-  auto* engine = static_cast<core::runtime::TRTEngine*>(handle);
+  auto* engine = static_cast<ETRTEngine*>(handle);
 
   const size_t num_inputs = engine->num_io.first;
   const size_t num_outputs = engine->num_io.second;
@@ -243,7 +238,10 @@ Error TensorRTBackend::execute(BackendExecutionContext& context, DelegateHandle*
 
   nvinfer1::IExecutionContext* ctx = engine->exec_ctx.get();
 
-  cudaStream_t stream = c10::cuda::getCurrentCUDAStream(static_cast<c10::DeviceIndex>(engine->device_info.id));
+  // Ensure the right CUDA context is active, then use the backend-owned stream
+  // created in ETRTEngine's ctor. Avoids any libtorch / c10 dependency.
+  cudaSetDevice(engine->device_id);
+  cudaStream_t stream = engine->stream;
 
   // ExecuTorch's portable runtime pre-allocates output tensors as CPU buffers.
   // TRT requires CUDA device pointers for all bindings.  We use
@@ -357,7 +355,19 @@ Error TensorRTBackend::execute(BackendExecutionContext& context, DelegateHandle*
       for (int d = 0; d < actual_dims.nbDims; ++d) {
         new_sizes[d] = static_cast<exec_aten::SizesType>(actual_dims.d[d]);
       }
-      et_out.unsafeGetTensorImpl()->set_sizes_contiguous({new_sizes, static_cast<size_t>(actual_dims.nbDims)});
+      Error rs = ::executorch::runtime::resize_tensor(
+          et_out,
+          ::executorch::runtime::ArrayRef<exec_aten::SizesType>(
+              new_sizes, static_cast<size_t>(actual_dims.nbDims)));
+      if (rs != Error::Ok) {
+        ET_LOG(
+            Error,
+            "TensorRTBackend::execute: resize_tensor failed for output '%s' (err=%d)",
+            name.c_str(),
+            static_cast<int>(rs));
+        free_temp();
+        return rs;
+      }
     }
 
     void* dst_ptr = et_out.mutable_data_ptr();
@@ -410,12 +420,12 @@ Error TensorRTBackend::execute(BackendExecutionContext& context, DelegateHandle*
 // ---------------------------------------------------------------------------
 // destroy
 //
-// Explicitly destructs the TRTEngine.  The underlying memory was allocated
+// Explicitly destructs the ETRTEngine.  The underlying memory was allocated
 // by ExecuTorch's MemoryAllocator and will be reclaimed by the arena.
 // ---------------------------------------------------------------------------
 void TensorRTBackend::destroy(DelegateHandle* handle) const {
   if (handle != nullptr) {
-    static_cast<core::runtime::TRTEngine*>(handle)->~TRTEngine();
+    static_cast<ETRTEngine*>(handle)->~ETRTEngine();
   }
 }
 
