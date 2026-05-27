@@ -23,6 +23,6 @@ def partitioning_test(name, visibility = None):
             ":use_torch_whl": ["@torch_whl//:libtorch"],
             ":windows": ["@libtorch_win//:libtorch"],
             "//conditions:default": ["@libtorch"],
-        })
-        #timeout = "short",
+        }),
+        # timeout = "short",
     )

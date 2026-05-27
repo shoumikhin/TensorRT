@@ -6,9 +6,7 @@ collection_types = ["default", "jetpack", "rtx"]
 def _impl(ctx):
     _type = ctx.build_setting_value
     if _type not in collection_types:
-        fail(str(ctx.label) + " build setting allowed to take values {" +
-             ", ".join(collection_types) + "} but was set to unallowed value " +
-             _type)
+        fail(str(ctx.label) + " build setting allowed to take values {" + ", ".join(collection_types) + "} but was set to unallowed value " + _type)
 
     return DependencyCollectionInfo(type = _type)
 

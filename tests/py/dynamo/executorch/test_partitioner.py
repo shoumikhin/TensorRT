@@ -1,7 +1,9 @@
 from types import SimpleNamespace
 
-import executorch.exir  # noqa: F401
 import pytest
+
+executorch = pytest.importorskip("executorch.exir")
+
 from torch_tensorrt.executorch.partitioner import TensorRTPartitioner  # noqa: E402
 
 

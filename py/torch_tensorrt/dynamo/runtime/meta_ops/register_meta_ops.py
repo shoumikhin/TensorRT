@@ -156,7 +156,6 @@ def _apply_symbolic_shape_expressions(
     logger.debug(
         f"[torch.ops.tensorrt.execute_engine]: Meta kernel found the following output FakeTensors: {outputs}"
     )
-
     return outputs
 
 
@@ -313,7 +312,7 @@ def no_op_placeholder_for_execute_engine(
     abi_version: str,
     name: str,
     serialized_device_info: str,
-    serialized_engine: str,
+    serialized_engine: torch.Tensor,
     serialized_in_binding_names: str,
     serialized_out_binding_names: str,
     serialized_hardware_compatible: str,
@@ -334,7 +333,7 @@ def fake_no_op_placeholder_for_execute_engine(
     abi_version: str,
     name: str,
     serialized_device_info: str,
-    serialized_engine: str,
+    serialized_engine: torch.Tensor,
     serialized_in_binding_names: str,
     serialized_out_binding_names: str,
     serialized_hardware_compatible: str,

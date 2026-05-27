@@ -99,6 +99,7 @@ RELEASE = False
 CI_BUILD = False
 USE_TRT_RTX = False
 
+
 if "--use-rtx" in sys.argv:
     USE_TRT_RTX = True
     sys.argv.remove("--use-rtx")
@@ -347,7 +348,12 @@ def copy_libtorchtrt(multilinux=False, rt_only=False):
         os.system(
             "tar -xzf "
             + dir_path
-            + "/../bazel-bin/libtorchtrt.tar.gz --strip-components=1 -C "
+            + "/../bazel-bin/libtorchtrt.tar.gz "
+            + "--exclude='torch_tensorrt/src' "
+            + "--exclude='torch_tensorrt/src/*' "
+            + "--exclude='torch_tensorrt/examples' "
+            + "--exclude='torch_tensorrt/examples/*' "
+            + "--strip-components=1 -C "
             + dir_path
             + "/torch_tensorrt torch_tensorrt"
         )
@@ -436,8 +442,8 @@ class EditableWheelCommand(editable_wheel):
             editable_wheel.run(self)
         else:
             build_libtorchtrt_cxx11_abi(develop=True, rt_only=NO_TS)
-            gen_version_file()
             copy_libtorchtrt(rt_only=NO_TS)
+            gen_version_file()
             editable_wheel.run(self)
 
 
@@ -693,6 +699,7 @@ if not (PY_ONLY or NO_TS):
                     dir_path + "torch_tensorrt/csrc",
                     dir_path + "torch_tensorrt/include",
                     dir_path + "/../",
+                    dir_path + "/../cpp/include",
                     "/usr/local/cuda",
                 ]
                 + (
@@ -763,6 +770,7 @@ if not (PY_ONLY or NO_TS):
         {
             "torch_tensorrt": [
                 "include/torch_tensorrt/*.h",
+                "include/torch_tensorrt/executorch/*.h",
                 "include/torch_tensorrt/core/*.h",
                 "include/torch_tensorrt/core/conversion/*.h",
                 "include/torch_tensorrt/core/conversion/conversionctx/*.h",
@@ -792,6 +800,7 @@ elif NO_TS:
         {
             "torch_tensorrt": [
                 "include/torch_tensorrt/*.h",
+                "include/torch_tensorrt/executorch/*.h",
                 "include/torch_tensorrt/core/*.h",
                 "include/torch_tensorrt/core/runtime/*.h",
                 "lib/*",
@@ -834,8 +843,7 @@ def get_x86_64_requirements(base_requirements):
         return requirements
     else:
         requirements = requirements + [
-            "torch>=2.12.0,<2.13.0",
-            EXECUTORCH_REQUIREMENT,
+            "torch>=2.13.0.dev,<2.14.0",
         ]
         if USE_TRT_RTX:
             return requirements + [
@@ -843,6 +851,7 @@ def get_x86_64_requirements(base_requirements):
             ]
         else:
             requirements = requirements + [
+                "executorch>=1.2.0",
                 "tensorrt>=10.16.1,<10.17.0",
             ]
             cuda_version = torch.version.cuda

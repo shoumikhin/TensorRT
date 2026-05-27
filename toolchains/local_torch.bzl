@@ -62,9 +62,9 @@ def _local_torch_impl(ctx):
         python = _find_python(ctx)
         if not python:
             fail(
-                "Cannot locate a Python interpreter that has torch installed. " +
-                "Either activate the project venv, or set TORCH_PATH to the " +
-                "directory containing torch (e.g. /path/to/.venv/lib/pythonX.Y/site-packages/torch).",
+                "Cannot locate a Python interpreter that has torch installed. "
+                + "Either activate the project venv, or set TORCH_PATH to the "
+                + "directory containing torch (e.g. /path/to/.venv/lib/pythonX.Y/site-packages/torch).",
             )
         result = ctx.execute(
             [python, "-c", "import torch, os; print(os.path.dirname(torch.__file__))"],
@@ -82,9 +82,11 @@ def _local_torch_impl(ctx):
     c10_include = torch_path.get_child("include").get_child("c10")
     if not c10_include.exists:
         fail(
-            "torch at '" + torch_dir + "' is missing include/c10/ C++ headers. " +
-            "Install a full PyTorch wheel (pip install torch) that includes dev headers, " +
-            "or set TORCH_PATH to the correct directory.",
+            "torch at '"
+            + torch_dir
+            + "' is missing include/c10/ C++ headers. "
+            + "Install a full PyTorch wheel (pip install torch) that includes dev headers, "
+            + "or set TORCH_PATH to the correct directory.",
         )
 
     # Symlink the subdirectories the BUILD file references into the synthetic repo

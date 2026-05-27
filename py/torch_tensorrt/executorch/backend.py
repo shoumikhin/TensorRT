@@ -1,8 +1,9 @@
-# ExecuTorch TensorRT backend: serialize engine to same blob format as TRT runtime.
+# ExecuTorch TensorRT backend: serialize engines to a libtorch-free runtime blob.
 
-import base64
 from typing import Any, List, final
 
+import torch
+import torch.fx
 from executorch.exir.backend.backend_details import (
     BackendDetails,
     CompileSpec,
@@ -10,10 +11,22 @@ from executorch.exir.backend.backend_details import (
 )
 from torch.export.exported_program import ExportedProgram
 from torch_tensorrt.dynamo.runtime._TorchTensorRTModule import (
+    DEVICE_IDX,
     ENGINE_IDX,
+    HW_COMPATIBLE_IDX,
+    INPUT_BINDING_NAMES_IDX,
+    OUTPUT_BINDING_NAMES_IDX,
     REQUIRES_OUTPUT_ALLOCATOR_IDX,
+    SERIALIZED_METADATA_IDX,
+    TARGET_PLATFORM_IDX,
 )
-from torch_tensorrt.executorch.serialization import serialize_engine_info
+from torch_tensorrt.executorch.serialization import (
+    TensorRTBlobMetadata,
+    TensorRTIOBinding,
+    serialize_engine,
+)
+
+_BINDING_DELIM = "%"
 
 
 def _schema_name(target: Any) -> str:
@@ -62,7 +75,56 @@ def _get_engine_info_from_edge_program(edge_program: ExportedProgram) -> List[An
     name = _schema_name(node.target)
 
     if name == "tensorrt::no_op_placeholder_for_execute_engine":
-        return list(node.args[1:])
+        engine_info = list(node.args[1:])
+        # ENGINE_IDX slot is either a `get_attr` FX node (when this runs
+        # before constant-lifting) or a `placeholder` FX node (after
+        # ExecuTorch's lifter rewrote the get_attr into a graph input
+        # referencing the buffer). Resolve both shapes to the raw uint8
+        # tensor so the rest of the backend can stay engine-format
+        # agnostic.
+        engine_slot = engine_info[ENGINE_IDX]
+        if isinstance(engine_slot, torch.fx.Node):
+            engine_tensor = None
+            if engine_slot.op == "get_attr":
+                engine_tensor = getattr(gm, engine_slot.target, None)
+            elif engine_slot.op == "placeholder":
+                # The lifter mangles the placeholder name (e.g.
+                # "b__trt_engine_0" with a "b_" buffer prefix). The
+                # canonical attribute target lives in
+                # graph_signature.input_specs[i].target.
+                target = engine_slot.target
+                sig = getattr(edge_program, "graph_signature", None)
+                if sig is not None:
+                    for ispec in sig.input_specs:
+                        arg = getattr(ispec, "arg", None)
+                        if (
+                            arg is not None
+                            and getattr(arg, "name", None) == engine_slot.name
+                        ):
+                            target = ispec.target or target
+                            break
+                state_dict = getattr(edge_program, "state_dict", {}) or {}
+                constants = getattr(edge_program, "constants", {}) or {}
+                # Explicit None-check: `state_dict.get(target) or ...`
+                # would call `bool(tensor)`, which raises
+                # "Boolean value of Tensor with more than one element
+                # is ambiguous" for any multi-element engine tensor.
+                engine_tensor = state_dict.get(target)
+                if engine_tensor is None:
+                    engine_tensor = constants.get(target)
+            else:
+                raise RuntimeError(
+                    f"no_op_placeholder node '{node.name}': unexpected engine "
+                    f"slot op '{engine_slot.op}' (target={engine_slot.target})"
+                )
+            if engine_tensor is None:
+                raise RuntimeError(
+                    f"no_op_placeholder node '{node.name}': engine slot "
+                    f"'{engine_slot.target}' (op={engine_slot.op}) did not "
+                    f"resolve to a tensor in gm, state_dict, or constants"
+                )
+            engine_info[ENGINE_IDX] = engine_tensor
+        return engine_info
 
     engine_node = node.args[1]
     if engine_node.op == "get_attr":
@@ -93,9 +155,10 @@ def _get_engine_info_from_edge_program(edge_program: ExportedProgram) -> List[An
 
 
 def _validate_engine_info(engine_info: List[Any]) -> None:
-    if not engine_info:
+    if len(engine_info) <= ENGINE_IDX:
         raise RuntimeError(
-            "TensorRT ExecuTorch backend received empty engine serialization info."
+            "TensorRT ExecuTorch backend received incomplete engine "
+            "serialization info."
         )
     if (
         len(engine_info) > REQUIRES_OUTPUT_ALLOCATOR_IDX
@@ -107,14 +170,38 @@ def _validate_engine_info(engine_info: List[Any]) -> None:
         )
 
 
+def _split_binding_names(value: Any) -> List[str]:
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    return [name for name in str(value or "").split(_BINDING_DELIM) if name]
+
+
+def _parse_device_id(value: Any) -> int:
+    parts = str(value or "").split(_BINDING_DELIM)
+    try:
+        return int(parts[0])
+    except (IndexError, ValueError):
+        return 0
+
+
+def _get_str(engine_info: List[Any], index: int, default: str = "") -> str:
+    if index < 0 or index >= len(engine_info):
+        return default
+    value = engine_info[index]
+    if value is None:
+        return default
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
 @final
 class TensorRTBackend(BackendDetails):  # type: ignore[misc]
-    """Backend that serializes TensorRT engine to the same blob format as the TRT runtime.
+    """Backend that serializes TensorRT engines for the native ExecuTorch runtime.
 
     The partition contains a single execute_engine node; we extract the engine
-    and metadata and encode them as a vector of strings (same layout as
-    core/runtime/runtime.h SerializedInfoIndex) so the same blob works for
-    both ExecuTorch and non-ExecuTorch TRT runtime.
+    and metadata and encode them as a standalone TR01 blob. The C++ runtime
+    backend parses that blob directly without the legacy Torch-TensorRT C++ runtime.
     """
 
     @staticmethod
@@ -126,19 +213,35 @@ class TensorRTBackend(BackendDetails):  # type: ignore[misc]
         engine_info = list(engine_info)
         _validate_engine_info(engine_info)
         serialized_engine = engine_info[ENGINE_IDX]
-        if isinstance(serialized_engine, str):
-            try:
-                engine_info[ENGINE_IDX] = base64.b64decode(
-                    serialized_engine.encode("utf-8")
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    "TensorRT ExecuTorch backend failed to decode the serialized "
-                    "engine payload."
-                ) from exc
+        if isinstance(serialized_engine, torch.Tensor):
+            # Single copy out of the underlying storage. The prior
+            # `.numpy().tobytes()` path allocated a fresh bytes buffer
+            # on top of the numpy view, which for a >2 GB engine
+            # roughly doubled peak memory at this step. `.cpu()` and
+            # `.contiguous()` are no-ops when already host-side and
+            # contiguous (the common case for the uint8 buffer this
+            # backend produces).
+            engine_info[ENGINE_IDX] = bytes(
+                serialized_engine.cpu().contiguous().untyped_storage()
+            )
         elif not isinstance(serialized_engine, (bytes, bytearray)):
             engine_info[ENGINE_IDX] = bytes(serialized_engine)
-        if len(engine_info) > 7 and isinstance(engine_info[7], bytes):
-            engine_info[7] = engine_info[7].decode("utf-8", errors="replace")
-        blob = serialize_engine_info(engine_info)
+        input_names = _split_binding_names(
+            _get_str(engine_info, INPUT_BINDING_NAMES_IDX)
+        )
+        output_names = _split_binding_names(
+            _get_str(engine_info, OUTPUT_BINDING_NAMES_IDX)
+        )
+        io_bindings = [
+            TensorRTIOBinding(name=name, is_input=True) for name in input_names
+        ] + [TensorRTIOBinding(name=name, is_input=False) for name in output_names]
+
+        metadata = TensorRTBlobMetadata(
+            io_bindings=io_bindings,
+            hardware_compatible=_get_str(engine_info, HW_COMPATIBLE_IDX) == "1",
+            device_id=_parse_device_id(engine_info[DEVICE_IDX]),
+            serialized_metadata=_get_str(engine_info, SERIALIZED_METADATA_IDX),
+            target_platform=_get_str(engine_info, TARGET_PLATFORM_IDX),
+        )
+        blob = serialize_engine(bytes(engine_info[ENGINE_IDX]), metadata)
         return PreprocessResult(processed_bytes=blob)

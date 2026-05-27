@@ -1,16 +1,13 @@
 # Torch-TensorRT ExecuTorch Backend
 
 This package is included in `libtorchtrt.tar.gz` as
-`torch_tensorrt/src/torch_tensorrt/`. It builds the TensorRT backend delegate
-for ExecuTorch from source.
+`torch_tensorrt/src/torch_tensorrt/executorch/`. It builds the TensorRT
+backend delegate for ExecuTorch from source.
 
 ```text
 user_runner_project/
   executorch/
   torch_tensorrt/
-    include/torch_tensorrt/
-    lib/
-    src/torch_tensorrt/
 ```
 
 The normal integration path is to add both ExecuTorch and this package from
@@ -20,7 +17,7 @@ backend build step.
 
 ```cmake
 add_subdirectory("executorch")
-add_subdirectory("torch_tensorrt/src/torch_tensorrt")
+add_subdirectory("torch_tensorrt/src/torch_tensorrt/executorch")
 
 target_link_libraries(
   my_runner
@@ -61,7 +58,7 @@ cmake --build "${EXECUTORCH_ROOT}/cmake-out" --target executorch_core -j
 Then build the TensorRT backend archive from this package:
 
 ```bash
-cmake -S torch_tensorrt/src/torch_tensorrt -B build-torchtrt-executorch \
+cmake -S torch_tensorrt/src/torch_tensorrt/executorch -B build-torchtrt-executorch \
   -DEXECUTORCH_ROOT="${EXECUTORCH_ROOT}" \
   -DTensorRT_ROOT="${TensorRT_ROOT}"
 

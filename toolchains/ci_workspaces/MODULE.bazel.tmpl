@@ -37,6 +37,7 @@ local_repository(
 
 
 new_local_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:local.bzl", "new_local_repository")
+local_executorch = use_repo_rule("//toolchains:local_executorch.bzl", "local_executorch")
 
 local_executorch = use_repo_rule("//toolchains:local_executorch.bzl", "local_executorch")
 
@@ -160,6 +161,7 @@ new_local_repository(
 # Detect ExecuTorch from the active Python environment (VIRTUAL_ENV / CONDA_PREFIX / PATH).
 # Optional overrides:
 #   EXECUTORCH_ROOT=/path/to/executorch
+#   EXECUTORCH_SOURCE_DIR=/path/to/executorch
 local_executorch(name = "executorch")
 
 #new_local_repository(

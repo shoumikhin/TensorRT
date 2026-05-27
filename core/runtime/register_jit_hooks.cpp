@@ -4,6 +4,10 @@
 #include "core/runtime/runtime.h"
 #include "core/util/macros.h"
 
+// serialize_bindings / base64_encode / base64_decode are defined in
+// runtime_utils.cpp so the ExecuTorch backend can link them without
+// pulling in the torch::class_ registration below.
+
 namespace torch_tensorrt {
 namespace core {
 namespace runtime {

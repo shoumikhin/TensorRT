@@ -41,7 +41,7 @@ def _torch_nccl_detect_impl(repository_ctx):
                 "ProcessGroupNCCL",
                 lib_path,
             ])
-            has_nccl = (result.return_code == 0)
+            has_nccl = result.return_code == 0
 
             if has_nccl:
                 found = _find_nccl_include(repository_ctx, torch_path)
@@ -71,7 +71,9 @@ cc_library(
 """
 
     # Generate BUILD file with config_setting
-    repository_ctx.file("BUILD", """
+    repository_ctx.file(
+        "BUILD",
+        """
 load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
 load("@rules_cc//cc:defs.bzl", "cc_library")
 
@@ -87,7 +89,8 @@ config_setting(
     flag_values = {{":use_nccl": "True"}},
 )
 {nccl_headers_target}
-""".format(has_nccl = has_nccl, nccl_headers_target = nccl_headers_target))
+""".format(has_nccl = has_nccl, nccl_headers_target = nccl_headers_target),
+    )
 
 torch_nccl_detect = repository_rule(
     implementation = _torch_nccl_detect_impl,
