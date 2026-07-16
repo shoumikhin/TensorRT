@@ -1377,6 +1377,15 @@ def _save_as_executorch(exp_program: Any, file_path: str, **kwargs: Any) -> None
     executorch_program = edge_program.to_executorch(config=kwargs.get("backend_config"))
     with open(file_path, "wb") as f:
         executorch_program.write_to_file(f)
+    # Persist external delegate weight blobs (e.g. the CUDA/AOTInductor backend's
+    # <hash>_weights_blob .ptd files) next to the .pte. A coalesced .pte whose
+    # CUDA island has weight constants otherwise loads a null weights blob and
+    # the kernel reads out of bounds. (T280033029)
+    if getattr(executorch_program, "_tensor_data", None):
+        import os as _os
+
+        _out_dir = _os.path.dirname(_os.path.abspath(file_path)) or "."
+        executorch_program.write_tensor_data_to_file(_out_dir)
 
 
 def _normalize_engine_constants_to_python(exp_program: "ExportedProgram") -> None:
