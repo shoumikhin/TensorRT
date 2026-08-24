@@ -89,11 +89,10 @@ def _delegate_ids(pte_path):
 
 # NOTE: these tests are COMPOSITION-ONLY. They assert the serialized .pte carries
 # both a TensorRTBackend and a CudaBackend delegate (and, below, that external
-# CUDA weights are persisted as a .ptd). They do NOT load or run the program: a
-# coalesced ATen-mode .pte cannot be loaded yet because memory-planned CUDA
-# buffers get a CPU data pointer, so Method::init fails the CUDA backend's device
-# check (tensor_parser_aten hardcodes CPU). A load-run-allclose test should be
-# added once that runtime fix lands (follow-up).
+# CUDA weights are persisted as a .ptd). They do NOT load or run the program.
+# Execution of a coalesced program is covered by the reference runner gate, see
+# examples/torchtrt_executorch_example/export_coalesced.py and the third argument
+# of .github/scripts/verify-executorch-reference-runner.sh.
 
 
 def test_erfinv_routes_to_cuda_backend(tmp_path):

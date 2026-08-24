@@ -18,6 +18,11 @@ set +x
 #   examples/torchtrt_executorch_example/export_kv_cache_decode.py). When given,
 #   kv_cache_decode_check is built and run against it as well.
 #
+# Optional third argument: path to a coalesced TensorRT + CUDA .pte (see
+#   examples/torchtrt_executorch_example/export_coalesced.py). When given, both
+#   runners are run against it and their output is compared to the eager
+#   reference that export script wrote next to the model.
+#
 # Optional:
 #   TensorRT_ROOT=/path/to/extracted/TensorRT
 #     If unset, the script reuses Bazel's fetched TensorRT SDK when available
@@ -33,8 +38,8 @@ set +x
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${repo_root}"
 
-if [[ $# -lt 1 || $# -gt 2 ]]; then
-  echo "Usage: $0 PATH_TO_MODEL.pte [PATH_TO_KV_CACHE_DECODE.pte]" >&2
+if [[ $# -lt 1 || $# -gt 3 ]]; then
+  echo "Usage: $0 PATH_TO_MODEL.pte [PATH_TO_KV_CACHE_DECODE.pte [PATH_TO_COALESCED.pte]]" >&2
   exit 1
 fi
 model_path="$1"
@@ -45,6 +50,11 @@ fi
 kv_model_path="${2:-}"
 if [[ -n "${kv_model_path}" && ! -f "${kv_model_path}" ]]; then
   echo "KV-cache decode model not found: ${kv_model_path}" >&2
+  exit 1
+fi
+coalesced_model_path="${3:-}"
+if [[ -n "${coalesced_model_path}" && ! -f "${coalesced_model_path}" ]]; then
+  echo "Coalesced model not found: ${coalesced_model_path}" >&2
   exit 1
 fi
 
@@ -449,15 +459,25 @@ packaged_runner_log="${verify_root}/packaged_runner.log"
   --model_path="${model_path}" \
   --num_runs=1 2>&1 | tee "${packaged_runner_log}"
 
-# The sample model is x + 1 on a (2,3,4,4) input and both runners fill inputs with
-# 1.0f, so the shape is exactly [2,3,4,4] and every printed value is exactly 2.0000.
-# Assert both precisely. Matching only "shape=" accepts any shape, and matching one
-# 2.0000 anywhere on the values line accepts a line of wrong numbers that happens to
-# contain one right one, so neither catches a stream-ordering regression returning
-# stale or partial output. ET_LOG output is not part of the packaged runner contract
-# and may be compiled out, so nothing here depends on it.
-for _log in "${runner_log}" "${packaged_runner_log}"; do
-  if ! grep -q 'output\[0\] shape=\[2,3,4,4\]' "${_log}"; then
+# Assert the printed shape, and that EVERY value on the "first N values:" line is
+# the expected one. Matching only "shape=" accepts any shape, and matching one
+# right value anywhere on the values line accepts a line of wrong numbers that
+# happens to contain one, so neither on its own catches a stream-ordering
+# regression returning stale or partial output. ET_LOG output is not part of the
+# packaged runner contract and may be compiled out, so nothing here depends on it.
+# The models used here are elementwise on an all-ones input, so one number
+# describes the whole expected output.
+assert_runner_output() {
+  local _log="$1"
+  local _shape="$2"
+  local _expected="$3"
+  local _tolerance="$4"
+  local _values
+  local _value
+
+  # -F: the shape is bracketed, and an unescaped [2,3,4,4] is a regex character
+  # class that would match any single one of those characters.
+  if ! grep -qF "output[0] shape=${_shape}" "${_log}"; then
     echo "Unexpected output shape in ${_log}:" >&2
     grep 'output\[0\] shape=' "${_log}" >&2 || echo "  no shape line at all" >&2
     exit 1
@@ -470,11 +490,19 @@ for _log in "${runner_log}" "${packaged_runner_log}"; do
     exit 1
   fi
   for _value in ${_values}; do
-    if [[ "${_value}" != "2.0000" ]]; then
-      echo "Unexpected output value '${_value}' in ${_log}: ${_values}" >&2
+    if ! awk -v got="${_value}" -v want="${_expected}" -v tol="${_tolerance}" \
+        'BEGIN { d = got - want; if (d < 0) d = -d; exit !(d <= tol) }'; then
+      echo "Unexpected output value '${_value}' in ${_log}" \
+        "(expected ${_expected} within ${_tolerance}): ${_values}" >&2
       exit 1
     fi
   done
+}
+
+# The sample model is x + 1 on a (2,3,4,4) input, so every output value is exactly
+# 2. That is exact in float32, hence a zero tolerance.
+for _log in "${runner_log}" "${packaged_runner_log}"; do
+  assert_runner_output "${_log}" "[2,3,4,4]" "2.0000" 0
 done
 
 if [[ -n "${kv_model_path}" ]]; then
@@ -492,4 +520,39 @@ if [[ -n "${kv_model_path}" ]]; then
 
   "${kv_check_path}" --model_path="${kv_model_path}" 2>&1 | tee "${kv_check_log}"
   grep -q "PASS: decode at pos=1 observed the KV written at pos=0" "${kv_check_log}"
+fi
+
+if [[ -n "${coalesced_model_path}" ]]; then
+  # A coalesced program splits one graph across the TensorRT delegate and
+  # ExecuTorch's CUDA delegate, so a value produced by one delegate is consumed by
+  # the other on the device, inside one method. The checks above use a program with
+  # a single delegate, so they exercise neither the second backend nor the handover
+  # between the two.
+  coalesced_expected_path="${coalesced_model_path%.pte}.expected"
+  if [[ ! -f "${coalesced_expected_path}" ]]; then
+    echo "Coalesced reference output not found: ${coalesced_expected_path}" >&2
+    echo "It is written by examples/torchtrt_executorch_example/export_coalesced.py" >&2
+    exit 1
+  fi
+  coalesced_shape="$(sed -n '1p' "${coalesced_expected_path}")"
+  coalesced_value="$(sed -n '2p' "${coalesced_expected_path}")"
+  if [[ -z "${coalesced_shape}" || -z "${coalesced_value}" ]]; then
+    echo "Malformed coalesced reference output in ${coalesced_expected_path}" >&2
+    exit 1
+  fi
+
+  coalesced_runner_log="${verify_root}/coalesced_my_runner.log"
+  coalesced_packaged_runner_log="${verify_root}/coalesced_packaged_runner.log"
+  "${runner_path}" \
+    --model_path="${coalesced_model_path}" \
+    --num_runs=1 2>&1 | tee "${coalesced_runner_log}"
+  "${packaged_runner}" \
+    --model_path="${coalesced_model_path}" \
+    --num_runs=1 2>&1 | tee "${coalesced_packaged_runner_log}"
+
+  # TensorRT, AOTInductor and eager PyTorch compute the same math with different
+  # kernels, so compare within a tolerance instead of on the printed digits.
+  for _log in "${coalesced_runner_log}" "${coalesced_packaged_runner_log}"; do
+    assert_runner_output "${_log}" "${coalesced_shape}" "${coalesced_value}" 0.001
+  done
 fi
