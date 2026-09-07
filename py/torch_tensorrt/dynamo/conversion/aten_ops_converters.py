@@ -1,5 +1,6 @@
 # mypy: disallow-untyped-decorators=False
 
+import functools
 import logging
 import operator
 from typing import (
@@ -19,7 +20,7 @@ import numpy as np
 import torch
 from tensorrt import ITensor as TRTTensor
 from torch.fx.node import Argument, Node, Target
-from torch_tensorrt import ENABLED_FEATURES
+from torch_tensorrt import ENABLED_FEATURES, _enums
 from torch_tensorrt._features import needs_not_tensorrt_rtx
 from torch_tensorrt._utils import (
     is_tensorrt_rtx_version_supported,
@@ -266,16 +267,46 @@ def parse_cat_args(
     return input_tensors, dim
 
 
+def _is_rank1_empty_shape(shape: Sequence[int]) -> bool:
+    """Is this the shape of a rank-1 empty tensor, as torch.tensor([]) produces?"""
+    return len(shape) == 1 and shape[0] == 0
+
+
+def _is_rank1_empty(value: Any) -> bool:
+    """Is this operand a rank-1 empty tensor, as torch.tensor([]) produces?"""
+    shape = getattr(value, "shape", None)
+    return shape is not None and _is_rank1_empty_shape(shape)
+
+
+def _promoted_dtype(operands: Sequence[Any]) -> Optional[_enums.dtype]:
+    """The dtype torch.cat would produce over these operands.
+
+    A rank-1 empty operand contributes nothing to the shape but still takes part in
+    dtype promotion, so this has to run over the operands before any are dropped.
+    Returns None when they already agree, leaving the existing behaviour alone.
+    """
+    dtypes = []
+    for operand in operands:
+        dtype = getattr(operand, "dtype", None)
+        if dtype is None:
+            return None
+        dtypes.append(_enums.dtype._from(dtype).to(torch.dtype))
+    if not dtypes or all(dtype == dtypes[0] for dtype in dtypes):
+        return None
+    return _enums.dtype._from(functools.reduce(torch.promote_types, dtypes))
+
+
 def cat_validator(node: Node, settings: Optional[CompilationSettings] = None) -> bool:
     """
     Validator for torch.cat operation with empty tensor handling.
 
     PyTorch allows torch.tensor([]) (shape (0,)) to be concatenated with higher-dimensional
-    tensors, but TensorRT requires all inputs to have the same rank. This validator catches
-    this specific edge case.
+    tensors, but TensorRT requires all inputs to have the same rank. A rank-1 empty operand
+    holds no elements, so aten_ops_cat leaves it out and the ranks then agree.
 
-    Example valid case: cat([(3, 4), (0, 4)], dim=0) - same rank, properly shaped empty tensor for TRT
-    Example invalid case: cat([(3, 4), (0,)], dim=0) - torch.tensor([]) with rank mismatch
+    Example valid case: cat([(3, 4), (0,)], dim=0) - the empty operand is dropped
+    Example invalid case: cat([(0,), (2, 3), (2, 3, 4)], dim=0) - the operands that hold
+    elements still disagree on rank after the empty one is dropped
     """
     # Use parse_cat_args to properly extract inputs (handles both args and kwargs patterns)
     inputs, _ = parse_cat_args(node.args, node.kwargs)
@@ -304,18 +335,20 @@ def cat_validator(node: Node, settings: Optional[CompilationSettings] = None) ->
     # If all ranks are the same, it's fine (PyTorch and TensorRT both handle this)
     if len(set(ranks)) == 1:
         return True
-    # If ranks differ, check if we have a 1D empty tensor (0,) in the mix
-    # This is the torch.tensor([]) case that PyTorch allows but TensorRT doesn't
-    for i, shape in enumerate(input_metas):
-        if shape == (0,) or (len(shape) == 1 and shape[0] == 0):
-            # Found a 1D empty tensor with rank mismatch
-            _LOGGER.debug(
-                f"Concatenation rejected by TRT, torch.tensor([]) or 1D empty tensor at position {i} "
-                f"PyTorch allows this but TensorRT requires all inputs to have the same rank. "
-                f"Use torch.empty((0, ...)) with explicit dimensions matching other inputs instead. Falling back to Pytorch"
-            )
-            return False
-    return True
+    # A rank-1 empty operand holds no elements, so leaving it out of the
+    # concatenation gives the same result. Accept the node when the operands that
+    # do hold elements agree on rank; aten_ops_cat drops the empty ones before
+    # building the layer.
+    non_empty = [shape for shape in input_metas if not _is_rank1_empty_shape(shape)]
+    if len({len(shape) for shape in non_empty}) == 1:
+        return True
+    # Reaching here means the operands that survive still disagree on rank, which
+    # TensorRT cannot concatenate, so name those rather than the empty one.
+    _LOGGER.debug(
+        f"Concatenation rejected by TRT, operands {non_empty} do not all have the same "
+        f"rank. TensorRT requires every operand to have the same rank. Falling back to PyTorch"
+    )
+    return False
 
 
 @dynamo_tensorrt_converter(
@@ -331,6 +364,17 @@ def aten_ops_cat(
     name: str,
 ) -> Union[TRTTensor, Sequence[TRTTensor]]:
     inputs, dim = parse_cat_args(args, kwargs)
+    # TensorRT requires every operand to have the same rank, so a rank-1 empty operand
+    # has to go. It holds no elements, so leaving it out does not change the result,
+    # but torch.cat still counts it when it promotes the output dtype: concatenating
+    # torch.tensor([]), which is float32, onto a float16 tensor produces float32. Work
+    # the promoted dtype out over every operand and pass it through, or the engine
+    # builds the concatenation in the survivors' narrower type and overflows.
+    non_empty = [operand for operand in inputs if not _is_rank1_empty(operand)]
+    cast_dtype = None
+    if non_empty and len(non_empty) != len(inputs):
+        cast_dtype = _promoted_dtype(inputs)
+        inputs = non_empty
     return impl.cat.cat(
         ctx,
         target,
@@ -338,6 +382,7 @@ def aten_ops_cat(
         name,
         input=inputs,
         dim=dim,
+        cast_dtype=cast_dtype,
     )
 
 
