@@ -247,3 +247,48 @@ def test_symfloat_scalar_input():
     finally:
         torch._dynamo.config.capture_scalar_outputs = False
         torch._dynamo.reset()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("runtime_backend", ["python", "cpp"])
+def test_select_with_scalar_index_across_partition(runtime_backend):
+    """A computed index crossing the partition boundary must give eager's shape.
+
+    The index is produced by a Torch subgraph and arrives at the engine as a runtime value.
+    TensorRT's gather keeps the axis it gathers along unless the index is rank 0, so without
+    the squeeze this returns (1, 4) where eager returns (4,), silently.
+
+    This also covers the runtime half of that path, which a converter test cannot reach: a
+    converter test builds one engine and hands it real tensors, so it never sends a host
+    scalar into a binding.
+    """
+
+    class SelectComputedIndex(torch.nn.Module):
+        def forward(self, values, positions):
+            return torch.ops.aten.select.int(values, 0, positions.sum().item())
+
+    model = SelectComputedIndex().eval().cuda()
+    values = torch.randn(8, 4, device="cuda")
+    positions = torch.tensor([1, 2], dtype=torch.int64, device="cuda")
+    expected = model(values, positions)
+
+    exported = torch.export.export(model, (values, positions))
+    compiled = torchtrt.dynamo.compile(
+        exported,
+        inputs=[values, positions],
+        min_block_size=1,
+        use_python_runtime=(runtime_backend == "python"),
+        enabled_precisions={torch.float32},
+        truncate_double=True,
+    )
+    result = compiled(values, positions)
+
+    assertions.assertEqual(
+        tuple(result.shape),
+        tuple(expected.shape),
+        msg=f"expected {tuple(expected.shape)} to match eager, got {tuple(result.shape)}",
+    )
+    assertions.assertTrue(
+        cosine_similarity(expected, result) > COSINE_THRESHOLD,
+        msg="output does not match eager",
+    )
