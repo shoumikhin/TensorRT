@@ -104,7 +104,7 @@ class TestRandConverter(DispatchTestCase):
             for rand_op in rand_perm_ops
         ]
     )
-    def test_rand(self, name, op, shape_or_input):
+    def test_randperm(self, name, op, shape_or_input):
         class TestModule(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -127,6 +127,52 @@ class TestRandConverter(DispatchTestCase):
             inputs,
             expected_ops,
             [(comparator_shape, [False])],
+            use_dynamo_tracer=True,
+        )
+
+    def test_rand_distribution_is_uniform(self):
+        """The tests above compare shape and dtype only, so they pass whatever the values
+        are. Check the distribution too, which catches a converter that returns the wrong
+        range or a constant without needing to match eager sample for sample.
+        """
+
+        class Rand(nn.Module):
+            def forward(self, x):
+                return torch.ops.aten.rand([4096])
+
+        inputs = [torch.randint(1, 3, [1], dtype=torch.int32)]
+        comparator_uniform = lambda x, y, check_dtype: (
+            x.shape == y.shape
+            and float(x.min()) >= 0.0
+            and float(x.max()) <= 1.0
+            and abs(float(x.mean()) - 0.5) < 0.05
+        )
+        self.run_test_compare_tensor_attributes_only(
+            Rand(),
+            inputs,
+            [],
+            [(comparator_uniform, [False])],
+            use_dynamo_tracer=True,
+        )
+
+    def test_randn_distribution_is_standard_normal(self):
+        """Same idea for randn: mean near 0 and standard deviation near 1."""
+
+        class Randn(nn.Module):
+            def forward(self, x):
+                return torch.ops.aten.randn([4096])
+
+        inputs = [torch.randint(1, 3, [1], dtype=torch.int32)]
+        comparator_normal = lambda x, y, check_dtype: (
+            x.shape == y.shape
+            and abs(float(x.mean())) < 0.1
+            and abs(float(x.std()) - 1.0) < 0.1
+        )
+        self.run_test_compare_tensor_attributes_only(
+            Randn(),
+            inputs,
+            [],
+            [(comparator_normal, [False])],
             use_dynamo_tracer=True,
         )
 
