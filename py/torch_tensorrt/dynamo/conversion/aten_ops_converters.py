@@ -2127,7 +2127,7 @@ def aten_ops_log10(
     )
 
 
-@dynamo_tensorrt_converter(torch.ops.aten.log1p.default)
+@dynamo_tensorrt_converter(torch.ops.aten.log1p.default, supports_dynamic_shapes=True)
 def aten_ops_log1p(
     ctx: ConversionContext,
     target: Target,
