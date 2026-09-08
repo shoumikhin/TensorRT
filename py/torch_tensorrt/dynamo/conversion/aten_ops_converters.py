@@ -1812,13 +1812,76 @@ def aten_ops_clone_copy_dtype(
     )
 
 
+def _dynamic_placeholder_copy_supported(
+    node: Node, settings: Optional[CompilationSettings] = None
+) -> bool:
+    """Reject the cases this converter cannot serve once it accepts a dynamic input.
+
+    Each of these ran correctly in PyTorch before the placeholder path declared dynamic
+    shape support, so they fall back rather than fail:
+
+    A memory_format the copy cannot preserve. The layer produces standard contiguous
+    strides, so a channels-last copy would return the right values with the wrong layout,
+    silently.
+
+    An input dtype the engine cannot bind. float64 needs truncate_double, and without it
+    the binding expects float32 and rejects the caller's tensor at the first call. uint8
+    aborts the build outright.
+
+    """
+    if node.kwargs.get("memory_format") is not None:
+        _LOGGER.debug(
+            f"{node.target} with memory_format={node.kwargs['memory_format']} cannot "
+            "preserve strides, falling back"
+        )
+        return False
+
+    input_node = node.args[0] if node.args else None
+    input_meta = input_node.meta.get("val") if isinstance(input_node, Node) else None
+    if not isinstance(input_meta, torch.Tensor):
+        return True
+
+    if input_meta.dtype == torch.uint8:
+        _LOGGER.debug(
+            f"{node.target} with a uint8 input is not supported, falling back"
+        )
+        return False
+    if input_meta.dtype == torch.float64 and not (
+        settings is not None and settings.truncate_double
+    ):
+        _LOGGER.debug(
+            f"{node.target} with a float64 input needs truncate_double=True, falling back"
+        )
+        return False
+
+    return True
+
+
+def _clone_placeholder_validator(
+    node: Node, settings: Optional[CompilationSettings] = None
+) -> bool:
+    return is_only_operator_on_placeholder(
+        node, settings
+    ) and _dynamic_placeholder_copy_supported(node, settings)
+
+
+def _to_copy_placeholder_validator(
+    node: Node, settings: Optional[CompilationSettings] = None
+) -> bool:
+    return to_copy_dtype_validator(placeholder_only=True)(
+        node, settings
+    ) and _dynamic_placeholder_copy_supported(node, settings)
+
+
 @dynamo_tensorrt_converter(
     torch.ops.aten.clone.default,
-    capability_validator=is_only_operator_on_placeholder,
+    capability_validator=_clone_placeholder_validator,
+    supports_dynamic_shapes=True,
 )
 @dynamo_tensorrt_converter(
     torch.ops.aten._to_copy.default,
-    capability_validator=to_copy_dtype_validator(placeholder_only=True),
+    capability_validator=_to_copy_placeholder_validator,
+    supports_dynamic_shapes=True,
 )
 def aten_ops_clone_copy_placeholder(
     ctx: ConversionContext,
