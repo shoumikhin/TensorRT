@@ -1,7 +1,6 @@
 import logging
-import operator
 import warnings
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Dict, Optional, Union
 
 import tensorrt as trt
 import torch
@@ -23,39 +22,40 @@ from torch_tensorrt.dynamo.types import TRTDataType, TRTElementWiseOp, TRTTensor
 logger = logging.getLogger(__name__)
 
 
-def get_python_op_from_trt_elementwise_op(
+_TORCH_FOLD_OPS: Dict[TRTElementWiseOp, Callable[[Any, Any], Any]] = {
+    trt.ElementWiseOperation.SUM: torch.add,
+    trt.ElementWiseOperation.PROD: torch.mul,
+    trt.ElementWiseOperation.MAX: torch.maximum,
+    trt.ElementWiseOperation.MIN: torch.minimum,
+    trt.ElementWiseOperation.SUB: torch.sub,
+    trt.ElementWiseOperation.DIV: torch.div,
+    trt.ElementWiseOperation.POW: torch.pow,
+    trt.ElementWiseOperation.FLOOR_DIV: torch.floor_divide,
+    trt.ElementWiseOperation.AND: torch.logical_and,
+    trt.ElementWiseOperation.OR: torch.logical_or,
+    trt.ElementWiseOperation.XOR: torch.logical_xor,
+    trt.ElementWiseOperation.EQUAL: torch.eq,
+    trt.ElementWiseOperation.GREATER: torch.gt,
+    trt.ElementWiseOperation.LESS: torch.lt,
+}
+
+
+def _fold_constants(
     trt_op: TRTElementWiseOp,
-) -> Callable[[Any, Any], Any]:
-    if trt_op == trt.ElementWiseOperation.SUM:
-        return operator.add
-    elif trt_op == trt.ElementWiseOperation.PROD:
-        return operator.mul
-    elif trt_op == trt.ElementWiseOperation.MAX:
-        return lambda a, b: max(a, b)
-    elif trt_op == trt.ElementWiseOperation.MIN:
-        return lambda a, b: min(a, b)
-    elif trt_op == trt.ElementWiseOperation.SUB:
-        return operator.sub
-    elif trt_op == trt.ElementWiseOperation.DIV:
-        return operator.truediv
-    elif trt_op == trt.ElementWiseOperation.POW:
-        return operator.pow
-    elif trt_op == trt.ElementWiseOperation.FLOOR_DIV:
-        return operator.floordiv
-    elif trt_op == trt.ElementWiseOperation.AND:
-        return lambda a, b: a and b
-    elif trt_op == trt.ElementWiseOperation.OR:
-        return lambda a, b: a or b
-    elif trt_op == trt.ElementWiseOperation.XOR:
-        return lambda a, b: (a or b) and not (a and b)
-    elif trt_op == trt.ElementWiseOperation.EQUAL:
-        return operator.eq
-    elif trt_op == trt.ElementWiseOperation.GREATER:
-        return operator.gt
-    elif trt_op == trt.ElementWiseOperation.LESS:
-        return operator.lt
-    else:
+    lhs_val: Any,
+    rhs_val: Any,
+) -> torch.Tensor:
+    """Evaluate an elementwise op over two constants.
+
+    Folding in torch rather than in Python keeps this elementwise for operands that hold
+    more than one element, and returns a torch tensor, which is what the rest of the
+    conversion path accepts. A Python fold cannot do either: max and min compare whole
+    operands, and and, or and not call __bool__, which raises for an operand of more than
+    one element and quietly returns one whole operand for an operand of exactly one.
+    """
+    if trt_op not in _TORCH_FOLD_OPS:
         raise RuntimeError(f"{trt_op} is not supported yet!")
+    return _TORCH_FOLD_OPS[trt_op](to_torch(lhs_val), to_torch(rhs_val))
 
 
 def convert_binary_elementwise(
@@ -110,7 +110,7 @@ def convert_binary_elementwise(
             f"Both operands of the binary elementwise op {name} "
             "are constant. In this case, please consider constant fold the model first."
         )
-        return get_python_op_from_trt_elementwise_op(op_type)(lhs_val, rhs_val)
+        return _fold_constants(op_type, lhs_val, rhs_val)
 
     # If the following conditions are true:
     #  1. the network has implicit batch dimension,
