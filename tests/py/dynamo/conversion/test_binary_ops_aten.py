@@ -116,6 +116,62 @@ class TestBinaryOpConverters(DispatchTestCase):
         inputs = [torch.randn(2, 2)]
         self.run_test(m, inputs)
 
+    @parameterized.expand(
+        [
+            ("maximum", torch.ops.aten.maximum.default),
+            ("minimum", torch.ops.aten.minimum.default),
+        ]
+    )
+    def test_elementwise_op_with_both_constants_multi_element(
+        self, name, orig_op: Callable
+    ):
+        """A constant of more than one element. Folding two of those in Python compares
+        the whole operands rather than their elements, so max returns one operand."""
+
+        class TestModule(nn.Module):
+            def __init__(self, orig_op):
+                super().__init__()
+                self.constant0 = torch.nn.Parameter(torch.randn(3))
+                self.constant1 = torch.nn.Parameter(torch.randn(3))
+                self.orig_op = orig_op
+
+            def forward(self, x):
+                const = self.orig_op(self.constant0, self.constant1)
+                return self.orig_op(x, const)
+
+        m = TestModule(orig_op)
+        inputs = [torch.randn(3)]
+        self.run_test(m, inputs)
+
+    @parameterized.expand(
+        [
+            ("logical_and", torch.ops.aten.logical_and.default),
+            ("logical_or", torch.ops.aten.logical_or.default),
+            ("logical_xor", torch.ops.aten.logical_xor.default),
+        ]
+    )
+    def test_logical_op_with_both_constants_multi_element(
+        self, name, orig_op: Callable
+    ):
+        """Folding two bool constants in Python calls __bool__ on an operand, which raises
+        for more than one element. The result also has to stay bool: uint8 is rejected when
+        the constant is built."""
+
+        class TestModule(nn.Module):
+            def __init__(self, orig_op):
+                super().__init__()
+                self.register_buffer("constant0", torch.tensor([True, False, True]))
+                self.register_buffer("constant1", torch.tensor([True, True, False]))
+                self.orig_op = orig_op
+
+            def forward(self, x):
+                const = self.orig_op(self.constant0, self.constant1)
+                return self.orig_op(x > 0, const)
+
+        m = TestModule(orig_op)
+        inputs = [torch.randn(3)]
+        self.run_test(m, inputs)
+
     @parameterized.expand([(lambda x, y: torch.ops.aten.div.Tensor(x, y),)])
     def test_elementwise_op_div_with_two_ints(self, orig_op: Callable):
         class TestModule(nn.Module):
