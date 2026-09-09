@@ -170,6 +170,36 @@ class TestFallbackIsReported(TestCase):
             len(messages), 1, f"expected exactly one report, got {messages}"
         )
 
+    def test_global_partitioner_silent_on_fully_supported(self):
+        """The global partitioner asks about placeholder and output nodes as well as
+        operators. Recording those made a fully supported graph report its own inputs and
+        outputs as fallbacks, so this warns falsely without the callable-node guard."""
+        inputs = [torch.randn(8, 64, device="cuda")]
+        segments, messages = self._compile(
+            self._fully_supported_module(), inputs, use_fast_partitioner=False
+        )
+        self.assertFalse(
+            any("_run_on_gpu" in segment for segment in segments),
+            f"expected no PyTorch segment, got {segments}",
+        )
+        self.assertEqual(messages, [])
+
+    def test_requested_fallback_by_target_is_silent(self):
+        """torch_executed_ops accepts an operator target object, not only a qualified name
+        string. The report filter keys on names, so a target object has to be normalized or
+        the caller is warned about a fallback they asked for."""
+        inputs = [torch.randn(8, 64, device="cuda")]
+        segments, messages = self._compile(
+            self._fully_supported_module(),
+            inputs,
+            torch_executed_ops={torch.ops.aten.relu.default},
+        )
+        self.assertTrue(
+            any("_run_on_gpu" in segment for segment in segments),
+            f"expected a PyTorch segment, got {segments}",
+        )
+        self.assertEqual(messages, [])
+
 
 if __name__ == "__main__":
     run_tests()

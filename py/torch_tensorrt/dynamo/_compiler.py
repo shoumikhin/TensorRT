@@ -37,6 +37,7 @@ from torch_tensorrt.dynamo.conversion import (
 from torch_tensorrt.dynamo.conversion._ConverterRegistry import (
     DYNAMO_CONVERTERS as CONVERTERS,
 )
+from torch_tensorrt.dynamo.conversion._ConverterRegistry import ConverterRegistry
 from torch_tensorrt.dynamo.debug._DebuggerConfig import DebuggerConfig
 from torch_tensorrt.dynamo.debug._supports_debugger import fn_supports_debugger
 from torch_tensorrt.dynamo.lowering import (
@@ -1392,15 +1393,18 @@ def compile_module(
 
     dryrun_tracker.unsupported_ops = supported_ops.fallback_operators
 
-    # Both partitioners meet here, so this reports once per compile rather than once per
-    # partitioner. Everything the partition report prints is DEBUG, which is off by default,
-    # so a model that quietly became several engines plus a PyTorch segment looked exactly
-    # like one that compiled whole. Operators the caller named in torch_executed_ops are left
-    # out: that fallback was asked for.
+    # Operators the caller named in torch_executed_ops are left out: that fallback was
+    # asked for. The set can hold either a qualified name string or an operator target
+    # object, and fallback_operators is keyed by name, so normalize to names first or a
+    # target object never matches and the caller is warned about their own choice.
+    excluded_names = {
+        ConverterRegistry.qualified_name_or_str(op)
+        for op in settings.torch_executed_ops
+    }
     reported_fallbacks = {
         node_name: count
         for node_name, count in supported_ops.fallback_operators.items()
-        if node_name not in settings.torch_executed_ops
+        if node_name not in excluded_names
     }
     if reported_fallbacks:
         named = ", ".join(
