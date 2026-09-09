@@ -160,6 +160,42 @@ class TestCumsumConverter(DispatchTestCase):
 
     @parameterized.expand(
         [
+            ("float16", torch.float16),
+            ("bfloat16", torch.bfloat16),
+        ]
+    )
+    def test_cumsum_reduced_precision_float_stays_accurate(self, _, dtype):
+        """A long running sum in a narrow float drifts, because every partial total is
+        rounded to the operand type. eager accumulates in float32, so the engine has to as
+        well and cast the result back, or a thousand-long sum is off by many units.
+        """
+
+        class Cumsum(nn.Module):
+            def forward(self, x):
+                return torch.ops.aten.cumsum.default(x, 1)
+
+        values = torch.ones((2, 1000), dtype=dtype, device="cuda")
+        module = Cumsum().eval().cuda()
+        expected = module(values)
+
+        compiled = torch_tensorrt.dynamo.compile(
+            torch.export.export(module, (values,)),
+            inputs=[values],
+            min_block_size=1,
+            enabled_precisions={torch.float32},
+            truncate_double=True,
+        )
+        result = compiled(values)
+        self.assertEqual(result.dtype, expected.dtype)
+        max_abs_diff = (result.float() - expected.float()).abs().max().item()
+        self.assertLess(
+            max_abs_diff,
+            1.0,
+            f"cumsum drifted by {max_abs_diff}, so it accumulated in {dtype} not float32",
+        )
+
+    @parameterized.expand(
+        [
             ("bool", torch.bool),
             ("int32", torch.int32),
         ]

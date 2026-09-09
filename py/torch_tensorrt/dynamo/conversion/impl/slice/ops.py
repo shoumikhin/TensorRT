@@ -474,11 +474,19 @@ def cumsum(
     if dtype is not None:
         # The layer has no float64, so a caller who asked for it has already accepted
         # float32 by setting truncate_double; the validator refuses it otherwise.
-        accumulator_dtype = torch.float32 if dtype is torch.float64 else dtype
+        output_dtype = torch.float32 if dtype is torch.float64 else dtype
     elif input_dtype.is_floating_point:
-        accumulator_dtype = input_dtype
+        output_dtype = input_dtype
     else:
-        accumulator_dtype = torch.int64
+        output_dtype = torch.int64
+
+    # A running sum loses precision fast in a narrow float: every partial total is rounded
+    # to the operand type, so a long float16 or bfloat16 sum drifts far from eager, which
+    # accumulates in float32. Accumulate in float32 and cast the result back, the way the
+    # old loop did by seeding a float32 accumulator.
+    accumulator_dtype = output_dtype
+    if output_dtype in (torch.float16, torch.bfloat16):
+        accumulator_dtype = torch.float32
 
     casted_input = cast_trt_tensor(
         ctx, input, accumulator_dtype, f"{name}_casted", target, source_ir
@@ -498,7 +506,12 @@ def cumsum(
     )
     assert layer, f"Failed to add a cumulative layer for {name}"
     set_layer_name(layer, target, name, source_ir)
-    return layer.get_output(0)
+    result = layer.get_output(0)
+    if accumulator_dtype is not output_dtype:
+        result = cast_trt_tensor(
+            ctx, result, output_dtype, f"{name}_output_cast", target, source_ir
+        )
+    return result
 
 
 def tile(
