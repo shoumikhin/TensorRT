@@ -1828,6 +1828,9 @@ def _dynamic_placeholder_copy_supported(
     the binding expects float32 and rejects the caller's tensor at the first call. uint8
     aborts the build outright.
 
+    A non-contiguous input with no memory_format. Default clone preserves the input strides,
+    so a channels-last or transposed input keeps its layout in eager, but the copy the layer
+    builds is contiguous. That returns the right values with the wrong strides, silently.
     """
     if node.kwargs.get("memory_format") is not None:
         _LOGGER.debug(
@@ -1840,6 +1843,15 @@ def _dynamic_placeholder_copy_supported(
     input_meta = input_node.meta.get("val") if isinstance(input_node, Node) else None
     if not isinstance(input_meta, torch.Tensor):
         return True
+
+    if not input_meta.is_contiguous():
+        # No memory_format was given (checked above), so this is a preserve-format copy of a
+        # non-contiguous input, which the contiguous layer cannot reproduce.
+        _LOGGER.debug(
+            f"{node.target} preserves the strides of a non-contiguous input, which the "
+            "copy cannot, falling back"
+        )
+        return False
 
     if input_meta.dtype == torch.uint8:
         _LOGGER.debug(

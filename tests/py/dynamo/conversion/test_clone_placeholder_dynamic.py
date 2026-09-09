@@ -82,7 +82,31 @@ class TestClonePlaceholderDynamicShape(TestCase):
         )
         torch.testing.assert_close(result, module(*inputs))
 
-    @parameterized.expand([("float64", torch.float64), ("uint8", torch.uint8)])
+    def test_default_clone_of_channels_last_falls_back(self):
+        """A default clone with no memory_format still preserves the input strides, so a
+        channels-last input keeps its layout in eager. Export represents this with empty
+        kwargs, so it is not caught by the explicit-memory_format check; the copy the layer
+        builds is contiguous, which is the same silent layout change one level down."""
+
+        class CloneDefault(torch.nn.Module):
+            def forward(self, x):
+                return torch.ops.aten.clone.default(x)
+
+        module = CloneDefault().eval().cuda()
+        inputs = (
+            torch.randn(3, 4, 5, 3, device="cuda").to(
+                memory_format=torch.channels_last
+            ),
+        )
+        compiled = self._compile(module, inputs)
+        result = compiled(*inputs)
+
+        self.assertTrue(
+            result.is_contiguous(memory_format=torch.channels_last),
+            f"expected channels-last strides, got {result.stride()}",
+        )
+        torch.testing.assert_close(result, module(*inputs))
+
     def test_unbindable_input_dtype_falls_back(self, _, dtype):
         """float64 needs truncate_double, and without it the binding expects float32 and
         rejects the caller's tensor. uint8 aborts the build. Both run in PyTorch."""
