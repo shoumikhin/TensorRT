@@ -955,6 +955,13 @@ def inline_trt_modules(
                         "device": trt_module.target_device,
                     },
                 )
+                # Set meta on the scalar_tensor node itself before wrapping it. The
+                # non-retracing export path builds an ExportedProgram straight from this
+                # graph and its verifier requires a val on every node, so a node left
+                # without one fails verification.
+                scalar_input.meta["val"] = scalar_tensor_meta(
+                    info["dtype"], trt_module.target_device
+                )
                 binding_rank = info.get("binding_rank", 0)
                 if binding_rank:
                     # scalar_tensor is rank 0, and this binding declares a higher rank, so
@@ -962,9 +969,9 @@ def inline_trt_modules(
                     scalar_input = gm.graph.call_function(
                         torch.ops.aten.unsqueeze.default, (scalar_input, 0)
                     )
-                scalar_input.meta["val"] = scalar_tensor_meta(
-                    info["dtype"], trt_module.target_device, binding_rank
-                )
+                    scalar_input.meta["val"] = scalar_tensor_meta(
+                        info["dtype"], trt_module.target_device, binding_rank
+                    )
                 engine_inputs[index] = scalar_input
 
             if cross_compile_module:
