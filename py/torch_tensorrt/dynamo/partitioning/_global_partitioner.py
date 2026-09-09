@@ -145,6 +145,9 @@ class TorchTensorRTOperatorSupport(OperatorSupport):  # type: ignore[misc]
         # Initialize sets of supported/unsupported operators
         self.supported_operators: Dict[str, int] = {}
         self.unsupported_operators: Dict[str, int] = {}
+        # unsupported_operators skips impure nodes, so it cannot answer "did anything
+        # fall back". This one records every refusal.
+        self.fallback_operators: Dict[str, int] = {}
         self.torch_executed_ops: Collection[Target] = torch_executed_ops
         self._non_target_device_cache: Dict[torch.fx.Node, bool] = {}
 
@@ -274,6 +277,9 @@ class TorchTensorRTOperatorSupport(OperatorSupport):  # type: ignore[misc]
                 "non-target device region",
                 node_name,
             )
+            self.fallback_operators[node_name] = (
+                self.fallback_operators.get(node_name, 0) + 1
+            )
             return False
 
         if self._exceeds_max_tensor_rank(node):
@@ -282,6 +288,9 @@ class TorchTensorRTOperatorSupport(OperatorSupport):  # type: ignore[misc]
                 self.unsupported_operators[node_name] = (
                     self.unsupported_operators.get(node_name, 0) + 1
                 )
+            self.fallback_operators[node_name] = (
+                self.fallback_operators.get(node_name, 0) + 1
+            )
             return False
 
         if self._has_complex_dtype(node):
@@ -291,6 +300,9 @@ class TorchTensorRTOperatorSupport(OperatorSupport):  # type: ignore[misc]
                 self.unsupported_operators[node_name] = (
                     self.unsupported_operators.get(node_name, 0) + 1
                 )
+            self.fallback_operators[node_name] = (
+                self.fallback_operators.get(node_name, 0) + 1
+            )
             return False
 
         if (
@@ -304,6 +316,9 @@ class TorchTensorRTOperatorSupport(OperatorSupport):  # type: ignore[misc]
                 self.unsupported_operators[node_name] = (
                     self.unsupported_operators.get(node_name, 0) + 1
                 )
+            self.fallback_operators[node_name] = (
+                self.fallback_operators.get(node_name, 0) + 1
+            )
             return False
 
         if (
@@ -326,6 +341,9 @@ class TorchTensorRTOperatorSupport(OperatorSupport):  # type: ignore[misc]
                 else:
                     self.unsupported_operators[node_name] += 1
 
+            self.fallback_operators[node_name] = (
+                self.fallback_operators.get(node_name, 0) + 1
+            )
             return False
 
     def print_support_overview(

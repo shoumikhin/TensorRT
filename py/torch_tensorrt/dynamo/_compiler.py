@@ -1390,7 +1390,28 @@ def compile_module(
             cpu_memory_budget=settings.cpu_memory_budget,
         )
 
-    dryrun_tracker.unsupported_ops = supported_ops.unsupported_operators
+    dryrun_tracker.unsupported_ops = supported_ops.fallback_operators
+
+    # Both partitioners meet here, so this reports once per compile rather than once per
+    # partitioner. Everything the partition report prints is DEBUG, which is off by default,
+    # so a model that quietly became several engines plus a PyTorch segment looked exactly
+    # like one that compiled whole. Operators the caller named in torch_executed_ops are left
+    # out: that fallback was asked for.
+    reported_fallbacks = {
+        node_name: count
+        for node_name, count in supported_ops.fallback_operators.items()
+        if node_name not in settings.torch_executed_ops
+    }
+    if reported_fallbacks:
+        named = ", ".join(
+            f"{node_name} + Operator Count: {count}"
+            for node_name, count in sorted(reported_fallbacks.items())
+        )
+        logger.warning(
+            f"{len(reported_fallbacks)} operator(s) have no TensorRT converter and will "
+            f"run in PyTorch, so this model was split around them: {named}. "
+            f"Compile with dryrun=True for the full report."
+        )
 
     # The global partitioner leaves non-TRT nodes as-is
     if not settings.use_fast_partitioner:
