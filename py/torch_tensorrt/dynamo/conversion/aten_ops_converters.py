@@ -316,10 +316,12 @@ def cat_validator(node: Node, settings: Optional[CompilationSettings] = None) ->
 
     # Collect metadata for all inputs
     input_metas = []
+    input_dtypes = []
     for inp in inputs:
         if isinstance(inp, TRTTensor):
             # TRTTensor has shape directly
             input_metas.append(inp.shape)
+            input_dtypes.append(inp.dtype)
         else:
             # For nodes, get metadata
             meta = getattr(inp, "meta", {}).get("tensor_meta")
@@ -328,6 +330,25 @@ def cat_validator(node: Node, settings: Optional[CompilationSettings] = None) ->
                 return True
             shape = tuple(meta.shape)
             input_metas.append(shape)
+            input_dtypes.append(meta.dtype)
+
+    # Dropping an empty operand also drops it from dtype promotion, so aten_ops_cat works
+    # the promoted dtype out over every operand and passes it through. TensorRT has no
+    # float64, so if the promotion lands there and truncate_double is not set, the build
+    # fails on a graph that used to fall back. Refuse it here instead.
+    if any(_is_rank1_empty_shape(tuple(shape)) for shape in input_metas):
+        try:
+            promoted = functools.reduce(torch.promote_types, input_dtypes)
+        except TypeError:
+            promoted = None
+        if promoted == torch.float64 and not (
+            settings is not None and settings.truncate_double
+        ):
+            _LOGGER.debug(
+                "Concatenation rejected by TRT, dropping the empty operand promotes to "
+                "float64, which needs truncate_double. Falling back to PyTorch"
+            )
+            return False
 
     # Check for the specific problematic case:
     # 1D empty tensor (0,) being concatenated with higher-dimensional tensors
@@ -374,6 +395,10 @@ def aten_ops_cat(
     cast_dtype = None
     if non_empty and len(non_empty) != len(inputs):
         cast_dtype = _promoted_dtype(inputs)
+        # TensorRT has no float64. The validator only lets float64 reach here when
+        # truncate_double is set, which means the caller accepts float32, so map it.
+        if cast_dtype is not None and cast_dtype.to(torch.dtype) == torch.float64:
+            cast_dtype = _enums.dtype._from(torch.float32)
         inputs = non_empty
     return impl.cat.cat(
         ctx,

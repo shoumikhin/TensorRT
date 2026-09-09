@@ -408,6 +408,29 @@ class TestCatConverter(DispatchTestCase):
             enable_passes=True,
         )
 
+    def test_cat_rank1_empty_float64_with_truncation(self):
+        """A float32 tensor concatenated with a float64 empty constant. torch.cat promotes
+        to float64, and dropping the empty operand carries that promoted dtype through, but
+        TensorRT has no float64. The converter test harness sets truncate_double, so the
+        caller accepts float32 and this has to build rather than raise. All operands are
+        rank 1, so the validator always accepted this shape and TensorRT compiled it before
+        the empty-operand change."""
+
+        class CatFloat64Empty(nn.Module):
+            def forward(self, x):
+                empty = torch.tensor([], dtype=torch.float64, device=x.device)
+                # Cast to float32 so the reference is float32 too: with truncate_double the
+                # engine returns float32, and the test compares dtype as well as values.
+                return torch.ops.aten.cat.default((empty, x), 0).to(torch.float32)
+
+        inputs = [torch.tensor([0.0, 1.0, 2.0], dtype=torch.float32, device="cuda")]
+        self.run_test(
+            CatFloat64Empty(),
+            inputs,
+            use_dynamo_tracer=True,
+            enable_passes=True,
+        )
+
 
 if __name__ == "__main__":
     run_tests()
