@@ -164,6 +164,7 @@ message(STATUS "torch_tensorrt: CMAKE_CXX_STANDARD_LIBRARIES now = "
 add_subdirectory("${EXECUTORCH_SOURCE_DIR}" executorch)
 
 add_library(torch_tensorrt_executorch_backend STATIC
+  "${TORCH_TENSORRT_SOURCE_DIR}/cpp/src/torch_tensorrt/executorch/PooledScratchInstall.cpp"
   "${TORCH_TENSORRT_SOURCE_DIR}/cpp/src/torch_tensorrt/executorch/TensorRTBackend.cpp"
   "${TORCH_TENSORRT_SOURCE_DIR}/cpp/src/torch_tensorrt/executorch/TensorRTBlobHeader.cpp"
   "${TORCH_TENSORRT_SOURCE_DIR}/cpp/src/torch_tensorrt/executorch/WeightStreamingBudget.cpp")
@@ -173,6 +174,9 @@ target_compile_definitions(torch_tensorrt_executorch_backend
 target_include_directories(torch_tensorrt_executorch_backend PRIVATE
   "${TORCH_TENSORRT_SOURCE_DIR}"
   "${TORCH_TENSORRT_SOURCE_DIR}/cpp/include"
+  # Headers the backend sources include but that are not part of the installed
+  # API, such as SharedScratchPool.h.
+  "${TORCH_TENSORRT_SOURCE_DIR}/cpp/src"
   "${EXECUTORCH_SOURCE_DIR}/.."
   "${EXECUTORCH_SOURCE_DIR}/runtime/core/portable_type/c10")
 if(NOT TARGET extension_cuda)
