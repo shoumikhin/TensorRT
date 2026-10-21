@@ -251,6 +251,9 @@ def select_scatter_decomposition(
     dim: int,
     index: int,
 ) -> torch.Tensor:
+    # Counted from the end, index -1 would become the empty slice -1:0.
+    if index < 0:
+        index += input_tensor.shape[dim]
     src_tensor = torch.unsqueeze(src_tensor, dim)
     return torch.slice_scatter(input_tensor, src_tensor, dim, index, index + 1, 1)
 

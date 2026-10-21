@@ -2855,5 +2855,39 @@ class TestLowering(TestCase):
         )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Skip because CUDA is not available")
+class TestSelectScatterEndToEnd(TestCase):
+    """``out[index] = src`` on an int index exports as select_scatter, which is
+    decomposed into a one-wide slice_scatter."""
+
+    class Write(torch.nn.Module):
+        def __init__(self, index):
+            super().__init__()
+            self.index = index
+
+        def forward(self, x, src):
+            out = x.clone()
+            out[self.index] = src
+            return out
+
+    @parameterized.expand(
+        [
+            ("last_column", (slice(None), -1), (6,)),
+            ("last_column_after_ellipsis", (Ellipsis, -1), (6,)),
+            ("last_row", -1, (8,)),
+            ("negative_interior_column", (slice(None), -3), (6,)),
+            ("positive_column", (slice(None), 7), (6,)),
+        ]
+    )
+    def test_write_matches_eager(self, _, index, src_shape):
+        mod = self.Write(index).eval().cuda()
+        inputs = (torch.randn(6, 8).cuda(), torch.randn(src_shape).cuda())
+        ep = torch.export.export(mod, inputs)
+        trt_mod = torch_tensorrt.dynamo.compile(
+            ep, list(inputs), min_block_size=1, use_python_runtime=True
+        )
+        torch.testing.assert_close(trt_mod(*inputs), mod(*inputs))
+
+
 if __name__ == "__main__":
     run_tests()
