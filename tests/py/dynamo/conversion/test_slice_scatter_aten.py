@@ -172,13 +172,14 @@ class TestSliceScatterFallback(DispatchTestCase):
 class TestSliceScatterFallbackLayers(unittest.TestCase):
     """Which layers the fallback emits, read from the network it builds."""
 
-    def _write(self, start, end, step, cache_dtype=trt.float32):
+    def _write(self, start, end, step, cache_dtype=trt.float32, width=None):
         builder = trt.Builder(trt.Logger(trt.Logger.ERROR))
         network = builder.create_network(
             1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
         )
         cache = network.add_input("cache", cache_dtype, (4, 16, 8))
-        width = len(range(start, end, step))
+        if width is None:
+            width = len(range(start, end, step))
         update = network.add_input("update", trt.float32, (4, 16, width))
         output = slice_scatter_impl(
             ConversionContext(network),
@@ -206,6 +207,13 @@ class TestSliceScatterFallbackLayers(unittest.TestCase):
 
     def test_strided_write_is_a_scatter(self):
         self.assertIn(trt.LayerType.SCATTER, self._layer_types(step=2))
+
+    def test_src_that_does_not_fit_the_slice_raises(self):
+        """As in torch, a src wider or narrower than the slice is an error, empty
+        slices included, rather than a result of the wrong size."""
+        for start, end, width in ((3, 5, 5), (3, 5, 1), (5, 5, 2), (-1, 0, 1)):
+            with self.assertRaisesRegex(ValueError, "src has size"):
+                self._write(start, end, 1, width=width)
 
     def test_contiguous_write_keeps_the_input_dtype(self):
         """torch casts ``src`` to the input's dtype; the result must not be promoted."""

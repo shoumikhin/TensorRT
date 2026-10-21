@@ -399,6 +399,12 @@ def slice_scatter(
     # A concatenation takes its size from its parts, so a src that is dynamic on dim
     # would make the output dynamic there too. The scatter keeps the input's shape.
     if step == 1 and src.shape[dim] != DYNAMIC_DIM:
+        slice_len = max(end - start, 0)
+        if src.shape[dim] != slice_len:
+            raise ValueError(
+                f"slice_scatter: src has size {src.shape[dim]} on dim {dim}, but the "
+                f"slice {start}:{end} it writes has size {slice_len}"
+            )
         return _concat_write(ctx, target, source_ir, name, input, src, dim, start, end)
 
     # Strided write, or src dynamic on dim: build broadcast indices and scatter.
