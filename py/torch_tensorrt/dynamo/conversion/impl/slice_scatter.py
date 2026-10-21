@@ -359,9 +359,17 @@ def slice_scatter(
             f"for a rank-{rank} input; dim must be a Python int in [-{rank}, {rank})"
         )
 
-    # Trivial: full overwrite.
+    # Trivial: full overwrite. A layer rather than src itself, which may be an input.
     if status is KVWriteStatus.FULL_OVERWRITE:
-        return src
+        return impl.cast.to_copy(
+            ctx,
+            target,
+            source_ir,
+            name + "_full_overwrite",
+            src,
+            src.dtype,
+            force_layer=True,
+        )
 
     if status is KVWriteStatus.DYNAMIC_BOUNDS:
         raise NotImplementedError(

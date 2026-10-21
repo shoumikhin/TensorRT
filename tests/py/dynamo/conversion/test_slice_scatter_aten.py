@@ -152,10 +152,7 @@ class TestSliceScatterFallback(DispatchTestCase):
 
     def test_full_overwrite_is_identity(self):
         """When start=0, end=dim_size, step=1, the converter short-circuits
-        and returns ``src`` directly. Wrap the returned tensor in a small op
-        so it isn't simultaneously a network input and a network output —
-        which TRT rejects (handled by ``repair_input_as_output`` in
-        production but bypassed in this lower-level harness)."""
+        to a copy of ``src``."""
 
         class M(torch.nn.Module):
             def forward(self, cache_in, update):
@@ -260,6 +257,24 @@ class TestSliceScatterFallbackEndToEnd(TestCase):
         """The result is the input, which must not be returned as the engine input."""
         self._assert_matches_eager(
             self.EmptyWrite(start, end, second_output), (torch.randn(4, 8),)
+        )
+
+    class FullOverwrite(torch.nn.Module):
+        """A write over the whole of dim 1, whose result is ``src``."""
+
+        def __init__(self, second_output=False):
+            super().__init__()
+            self.second_output = second_output
+
+        def forward(self, x, src):
+            out = torch.ops.aten.slice_scatter.default(x, src, 1, 0, 8)
+            return (out, src * 2) if self.second_output else out
+
+    @parameterized.expand([("one_output", False), ("two_outputs", True)])
+    def test_full_overwrite_with_src_an_input(self, _, second_output):
+        """The result is ``src``, which must not be returned as the engine input."""
+        self._assert_matches_eager(
+            self.FullOverwrite(second_output), (torch.randn(4, 8), torch.randn(4, 8))
         )
 
     def test_two_writes_with_src_dynamic_on_the_written_dim(self):
