@@ -10,6 +10,7 @@ import json
 import logging
 import mmap
 import operator
+import os
 import sys
 from typing import Any, Container, Iterable, List, Optional, Set, final
 
@@ -36,7 +37,6 @@ from torch_tensorrt.dynamo.runtime._TorchTensorRTModule import (
     TARGET_PLATFORM_IDX,
     deserialize_aliased_io,
 )
-from torch_tensorrt.dynamo._exporter import ENGINE_FILE_ATTR
 from torch_tensorrt.executorch._export_utils import ENGINE_BYTES_ATTR
 from torch_tensorrt.executorch.serialization import (
     TensorRTBlobMetadata,
@@ -552,6 +552,34 @@ def _external_engine_tag(compile_specs: List[CompileSpec]) -> Optional[str]:
     return tag
 
 
+def _engine_file(engine: torch.Tensor) -> Optional[str]:
+    """The ``.engine`` file (``engine_output_dir``) that ``engine`` maps whole, if it maps one.
+
+    ``torch.from_file`` keeps no file name for a private mapping, so the mapping is found in
+    ``/proc/self/maps``: it must start at the tensor, at file offset 0, and the tensor must
+    cover the whole file.
+    """
+    if not sys.platform.startswith("linux") or not engine.numel():
+        return None
+    start = engine.data_ptr()
+    nbytes = engine.numel() * engine.element_size()
+    with open("/proc/self/maps") as maps:
+        for line in maps:
+            fields = line.split()
+            lo, hi = (int(bound, 16) for bound in fields[0].split("-"))
+            if lo <= start < hi:
+                path = fields[-1] if len(fields) >= 6 else ""
+                if (
+                    lo == start
+                    and int(fields[2], 16) == 0
+                    and path.endswith(".engine")
+                    and os.path.getsize(path) == nbytes
+                ):
+                    return path
+                return None
+    return None
+
+
 def _drop_engine_file_pages(engine: torch.Tensor) -> None:
     """Drop the resident pages of an engine read from its file (``engine_output_dir``) once it is in the blob.
 
@@ -629,7 +657,11 @@ class TensorRTBackend(BackendDetails):  # type: ignore[misc]
         # gigabytes, so reuse the `bytes` the export staged the engine from
         # (engine_bytes_tensor) and copy only a tensor that did not come from one.
         engine_bytes = getattr(serialized_engine, ENGINE_BYTES_ATTR, None)
-        engine_file = getattr(serialized_engine, ENGINE_FILE_ATTR, None)
+        engine_file = (
+            _engine_file(serialized_engine)
+            if isinstance(serialized_engine, torch.Tensor)
+            else None
+        )
         if engine_file is not None:
             # An engine still in its file (engine_output_dir) is copied into the program from the
             # file when it is written, so the save never holds its bytes.
