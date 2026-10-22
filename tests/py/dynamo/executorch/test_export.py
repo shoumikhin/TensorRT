@@ -877,6 +877,13 @@ def test_lowering_stores_the_staged_engine_bytes_as_named_data(monkeypatch, capl
 
     monkeypatch.setattr(_export_utils, "engine_bytes_tensor", recording)
     monkeypatch.setattr(backend_module, "_warned_engine_copy", False)
+@pytest.mark.skipif(
+    torch_tensorrt.ENABLED_FEATURES.torch_tensorrt_runtime,
+    reason="specifically validates a Python-only wheel",
+)
+def test_python_only_build_saves_engines_from_their_files(tmp_path):
+    """With engine_output_dir the exporter emits the placeholder op itself, which a
+    Python-only build registers only through meta_ops."""
 
     class AddOne(torch.nn.Module):
         def forward(self, value):
@@ -900,6 +907,19 @@ def test_lowering_stores_the_staged_engine_bytes_as_named_data(monkeypatch, capl
     assert staged and named
     assert all(any(buffer is engine for engine in staged) for buffer in named)
     assert _export_utils.ENGINE_BYTES_ATTR not in caplog.text
+        engine_output_dir=str(tmp_path / "engines"),
+    )
+    output = tmp_path / "python-only-engine-files.pte"
+
+    torch_tensorrt.save(
+        compiled,
+        str(output),
+        output_format="executorch",
+        arg_inputs=example,
+        retrace=False,
+    )
+
+    assert output.stat().st_size > 0
 
 
 @pytest.mark.unit
