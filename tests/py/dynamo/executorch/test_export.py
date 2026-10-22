@@ -877,13 +877,6 @@ def test_lowering_stores_the_staged_engine_bytes_as_named_data(monkeypatch, capl
 
     monkeypatch.setattr(_export_utils, "engine_bytes_tensor", recording)
     monkeypatch.setattr(backend_module, "_warned_engine_copy", False)
-@pytest.mark.skipif(
-    torch_tensorrt.ENABLED_FEATURES.torch_tensorrt_runtime,
-    reason="specifically validates a Python-only wheel",
-)
-def test_python_only_build_saves_engines_from_their_files(tmp_path):
-    """With engine_output_dir the exporter emits the placeholder op itself, which a
-    Python-only build registers only through meta_ops."""
 
     class AddOne(torch.nn.Module):
         def forward(self, value):
@@ -907,19 +900,6 @@ def test_python_only_build_saves_engines_from_their_files(tmp_path):
     assert staged and named
     assert all(any(buffer is engine for engine in staged) for buffer in named)
     assert _export_utils.ENGINE_BYTES_ATTR not in caplog.text
-        engine_output_dir=str(tmp_path / "engines"),
-    )
-    output = tmp_path / "python-only-engine-files.pte"
-
-    torch_tensorrt.save(
-        compiled,
-        str(output),
-        output_format="executorch",
-        arg_inputs=example,
-        retrace=False,
-    )
-
-    assert output.stat().st_size > 0
 
 
 @pytest.mark.unit
@@ -2143,3 +2123,68 @@ def test_export_rejects_caller_set_zero_copy_compile_spec_per_method(monkeypatch
             },
         )
     assert "compile_specs for 'decode'" in str(excinfo.value)
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(
+    torch_tensorrt.ENABLED_FEATURES.torch_tensorrt_runtime,
+    reason="specifically validates a Python-only wheel",
+)
+def test_python_only_build_saves_engines_from_their_files(tmp_path):
+    """With engine_output_dir the exporter emits the placeholder op itself, which a
+    Python-only build registers only through meta_ops."""
+
+    class AddOne(torch.nn.Module):
+        def forward(self, value):
+            return value + 1
+
+    example = (torch.randn(2, 3, 4, 4, device="cuda"),)
+    compiled = torch_tensorrt.dynamo.compile(
+        torch.export.export(AddOne().eval().cuda(), example),
+        arg_inputs=example,
+        min_block_size=1,
+        engine_output_dir=str(tmp_path / "engines"),
+    )
+    output = tmp_path / "python-only-engine-files.pte"
+
+    torch_tensorrt.save(
+        compiled,
+        str(output),
+        output_format="executorch",
+        arg_inputs=example,
+        retrace=False,
+    )
+
+    assert output.stat().st_size > 0
+
+
+@pytest.mark.unit
+def test_save_leaves_no_lowered_program_alive(tmp_path):
+    """A saved program's delegates, and so its engines, must not outlive save()."""
+    from executorch.exir.lowered_backend_module import LoweredBackendModule
+
+    # No gc.collect() of its own: save() has to hand the memory back before it returns.
+    def live_lowered_modules():
+        return sum(isinstance(o, LoweredBackendModule) for o in gc.get_objects())
+
+    class AddOne(torch.nn.Module):
+        def forward(self, value):
+            return value + 1
+
+    example = (torch.randn(2, 3, 4, 4, device="cuda"),)
+    compiled = torch_tensorrt.dynamo.compile(
+        torch.export.export(AddOne().eval().cuda(), example),
+        arg_inputs=example,
+        min_block_size=1,
+    )
+    before = live_lowered_modules()
+
+    torch_tensorrt.save(
+        compiled,
+        str(tmp_path / "add_one.pte"),
+        output_format="executorch",
+        arg_inputs=example,
+        retrace=False,
+    )
+
+    assert live_lowered_modules() == before
