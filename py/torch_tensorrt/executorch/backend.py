@@ -15,6 +15,7 @@ from typing import Any, Container, Iterable, List, Optional, Set, final
 
 import torch
 import torch.fx
+from executorch.exir._serialize._cord import FileBackedData
 from executorch.exir._serialize._named_data_store import NamedDataStore
 from executorch.exir.backend.backend_details import (
     BackendDetails,
@@ -35,6 +36,7 @@ from torch_tensorrt.dynamo.runtime._TorchTensorRTModule import (
     TARGET_PLATFORM_IDX,
     deserialize_aliased_io,
 )
+from torch_tensorrt.dynamo._exporter import ENGINE_FILE_ATTR
 from torch_tensorrt.executorch._export_utils import ENGINE_BYTES_ATTR
 from torch_tensorrt.executorch.serialization import (
     TensorRTBlobMetadata,
@@ -627,7 +629,12 @@ class TensorRTBackend(BackendDetails):  # type: ignore[misc]
         # gigabytes, so reuse the `bytes` the export staged the engine from
         # (engine_bytes_tensor) and copy only a tensor that did not come from one.
         engine_bytes = getattr(serialized_engine, ENGINE_BYTES_ATTR, None)
-        if not isinstance(engine_bytes, bytes):
+        engine_file = getattr(serialized_engine, ENGINE_FILE_ATTR, None)
+        if engine_file is not None:
+            # An engine still in its file (engine_output_dir) is copied into the program from the
+            # file when it is written, so the save never holds its bytes.
+            engine_bytes = FileBackedData(engine_file)
+        elif not isinstance(engine_bytes, bytes):
             if isinstance(serialized_engine, torch.Tensor):
                 _warn_engine_copy()
                 # `bytes(storage)` looks equivalent but iterates element by element in
@@ -696,7 +703,12 @@ class TensorRTBackend(BackendDetails):  # type: ignore[misc]
             target_platform=_get_str(engine_info, TARGET_PLATFORM_IDX),
             # Content-keyed, so identical engines in different methods share one
             # entry and different engines can never collide on a key.
-            engine_key="tensorrt_engine_" + hashlib.sha256(engine_bytes).hexdigest(),
+            engine_key="tensorrt_engine_"
+            + (
+                engine_bytes.sha256().hex()
+                if isinstance(engine_bytes, FileBackedData)
+                else hashlib.sha256(engine_bytes).hexdigest()
+            ),
         )
         # The engine goes to named data by reference and is streamed into the .pte, or
         # into <external_engine_data>.ptd when set, so the delegate blob holds only the

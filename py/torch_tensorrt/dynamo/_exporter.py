@@ -67,6 +67,10 @@ def _resolve_lifted_custom_obj(
     return obj
 
 
+# The file an engine buffer was mapped from (engine_output_dir), which the ExecuTorch save copies from.
+ENGINE_FILE_ATTR = "_trt_engine_file"
+
+
 def export(
     gm: torch.fx.GraphModule,
     *,
@@ -1076,6 +1080,7 @@ def inline_trt_modules(
                 engine_tensor = torch.from_file(
                     path, shared=False, size=os.path.getsize(path), dtype=torch.uint8
                 )
+                setattr(engine_tensor, ENGINE_FILE_ATTR, path)
                 buffer_name = f"{name}_engine"
                 gm.register_buffer(buffer_name, engine_tensor)
                 engine_node = gm.graph.get_attr(buffer_name)
