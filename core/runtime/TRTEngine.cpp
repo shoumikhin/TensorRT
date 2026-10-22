@@ -387,11 +387,12 @@ TRTEngine::TRTEngine(
 }
 
 TRTEngine::~TRTEngine() {
+  // Release the captured graph and context before the TensorRT objects below, which unload the kernels it runs.
+  invalidate_exec_ctx();
   // Disk persistence for runtime caches is owned by the Python side
   // (`RuntimeCacheHandle.save()` invoked from the runtime_cache CM or the engine
   // wrapper). The C++ side just lets refcounts drop.
   trt_engine_profiler.reset();
-  exec_ctx_.reset();
   cuda_engine.reset();
   if (empty_tensor_placeholder) {
     cudaFree(empty_tensor_placeholder);
@@ -1034,6 +1035,9 @@ nvinfer1::IExecutionContext* TRTEngine::exec_ctx() {
 }
 
 void TRTEngine::invalidate_exec_ctx() noexcept {
+  // A captured graph replays this context's kernels and memory, so it must not outlive it.
+  reset_captured_graph();
+  runtime_states.context_changed = true;
   exec_ctx_.reset();
 }
 
