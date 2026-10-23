@@ -162,3 +162,55 @@ class TestDynamicWorkspaceAllocation(unittest.TestCase):
                 workspace_bytes,
                 msg="the workspace outlived the CUDA graph",
             )
+
+    def test_python_runtime_cudagraph_keeps_its_workspace(self):
+        if torch_trt.ENABLED_FEATURES.torch_tensorrt_runtime:
+            self.skipTest("Checks the Python runtime.")
+        if torch_trt.ENABLED_FEATURES.tensorrt_rtx:
+            self.skipTest(
+                "On TensorRT-RTX the Python runtime does not capture a CUDA graph of its own."
+            )
+        self.addCleanup(torch._dynamo.reset)
+        self.addCleanup(torch_trt.runtime.set_cudagraphs_mode, False)
+
+        model = (
+            torch.nn.Sequential(
+                torch.nn.Conv2d(3, 8, 3), torch.nn.ReLU(), torch.nn.Conv2d(8, 16, 3)
+            )
+            .eval()
+            .cuda()
+        )
+        inputs = [torch.rand((8, 3, 64, 64), device="cuda")]
+        compiled_module = torch_trt.compile(
+            model,
+            inputs=inputs,
+            ir="dynamo",
+            dynamically_allocate_resources=True,
+            min_block_size=1,
+        )
+        (runtime_module,) = [
+            module
+            for module in compiled_module.modules()
+            if isinstance(module, TorchTensorRTModule)
+        ]
+        engine = runtime_module.engine
+
+        with torch.no_grad():
+            expected = model(*inputs)
+            torch_trt.runtime.set_cudagraphs_mode(True)
+            compiled_module(*inputs)
+            graph, workspace = engine.cudagraph, engine._dynamic_workspace
+            output = compiled_module(*inputs)
+            torch.cuda.synchronize()
+
+        self.assertIs(
+            engine._dynamic_workspace,
+            workspace,
+            msg="the engine replaced the workspace its CUDA graph replays into",
+        )
+        self.assertIs(
+            engine.cudagraph,
+            graph,
+            msg="a same-shape call recorded the CUDA graph again",
+        )
+        torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)

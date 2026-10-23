@@ -1403,7 +1403,8 @@ class TRTEngine(OpaqueBase):  # type: ignore[misc]
             if caller_on_default:
                 engine_stream.wait_stream(caller_stream)
             with torch.cuda.stream(engine_stream):
-                if self.resource_allocation_strategy:
+                # A captured graph replays into the workspace it was recorded with.
+                if self.resource_allocation_strategy and self.cudagraph is None:
                     workspace_bytes = self.cuda_engine.device_memory_size_v2
                     self._dynamic_workspace = torch.empty(
                         workspace_bytes,
