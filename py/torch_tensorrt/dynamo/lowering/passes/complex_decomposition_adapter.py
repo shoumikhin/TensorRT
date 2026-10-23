@@ -40,6 +40,7 @@ from torch_tensorrt.dynamo.lowering.passes.mark_constant_fold_exclusions import 
 from torch_tensorrt.dynamo.lowering.passes.pass_utils import (
     clean_up_graph_after_modifications,
 )
+from torch_tensorrt.dynamo.lowering.passes.remove_alias import remove_alias
 
 # Reuse the I/O-signature capture helpers already written for the legacy pass.
 from .complex_graph_rewrite import (
@@ -122,10 +123,12 @@ def complex_decomposition_adapter(
         return complex_graph_detection(gm, settings)
     gm = decomposed_gm
 
-    # (3) Fold constants again. The retrace builds the module from scratch, so
-    #     a constant that the constant-folding stage had already reduced to one
-    #     frozen tensor comes back as a live chain of ops reading it, and the
-    #     converters for those ops expect a TRT tensor rather than a weight.
+    # (3) Remove alias nodes and fold constants again. The retrace builds the
+    #     module from scratch, so it brings back alias nodes, and a constant
+    #     that the constant-folding stage had already reduced to one frozen
+    #     tensor comes back as a live chain of ops reading it. The converters
+    #     for those ops expect a TRT tensor rather than a weight.
+    gm = remove_alias(gm, settings)
     gm = mark_constant_fold_exclusions(gm, settings)
     gm = constant_fold(gm, settings)
 
@@ -154,9 +157,9 @@ def _trt_decomposition_table(
     it returns is built from whatever ``ComplexTensor`` dispatched to, not from
     the ops that survived the decomposition run at export time. Without a table
     that retrace re-introduces ops the flow has already decided to expand
-    (``aten.stack``) or to drop (``aten.alias``), long after the stage that
-    would have handled them, and the partitioner then cuts the graph around
-    them. Handing the retrace the same table keeps the two in step.
+    (``aten.stack``), long after the stage that would have handled them, and
+    the partitioner then cuts the graph around them. Handing the retrace the
+    same table keeps the two in step.
     """
     from torch_tensorrt.dynamo.lowering import (
         filter_decomposition_table,

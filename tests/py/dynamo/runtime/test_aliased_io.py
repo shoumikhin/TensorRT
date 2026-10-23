@@ -208,6 +208,30 @@ class TestBufferBackedKVCache(TestCase):
         self.assertTrue(torch.allclose(compiled.cache, eager_m.cache))
         self.assertTrue(torch.allclose(ret_val, eager_ret))
 
+    def test_buffer_written_through_an_alias_in_place(self):
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("cache", torch.zeros(2, 4, 16, 8))
+
+            def forward(self, x):
+                cache = self.cache[...]
+                cache[:, :, 3:4, :] = x
+                return self.cache.sum()
+
+        x = torch.ones(2, 4, 1, 8, device="cuda") * 7.0
+        compiled = _compile_cpp(M().cuda(), (x.clone(),))
+
+        aliased = _find_aliased_io(compiled)
+        self.assertEqual(len(aliased), 1)
+        _, kind = next(iter(aliased.values()))
+        self.assertEqual(kind, "kv_cache_update")
+
+        compiled(x)
+        eager_m = M().cuda()
+        eager_m(x)
+        self.assertTrue(torch.allclose(compiled.cache, eager_m.cache))
+
     def test_paired_buffer_caches(self):
         class M(torch.nn.Module):
             def __init__(self):

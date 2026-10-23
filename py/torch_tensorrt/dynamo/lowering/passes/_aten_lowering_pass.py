@@ -35,6 +35,7 @@ from .fuse_prims_broadcast import fuse_prims_broadcast
 from .lower_associative_scan import lower_associative_scan
 from .normalize_negative_slice_stop import normalize_negative_slice_stop  # noqa: F401
 from .pass_manager import DynamoPassManager
+from .remove_alias import remove_alias
 from .remove_assert_nodes import remove_assert_nodes
 from .remove_detach import remove_detach
 from .remove_input_alias_fixing_clones import remove_input_alias_fixing_clones
@@ -66,6 +67,7 @@ def complex_lowering_pass(
 
 
 post_lowering_pass_list = [
+    remove_alias,
     replace_fused_rms_norm,
     remove_input_alias_fixing_clones,
     lower_associative_scan,
