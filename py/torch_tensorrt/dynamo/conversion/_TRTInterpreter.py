@@ -961,13 +961,12 @@ class TRTInterpreter(torch.fx.Interpreter):  # type: ignore[misc]
 
         scalar_output_positions = self._scalar_output_positions()
 
-        marked_outputs_ids = []
+        marked_outputs_ids: set[int] = set()
         for i, output in enumerate(outputs):
-            # In some cases, the same output tensor may be marked multiple times, such as _to_copy,
-            # so we skip marking if the output is already marked
-            if id(output) in marked_outputs_ids:
-                continue
-            marked_outputs_ids.append(id(output))
+            # The same tensor can sit at several output positions, for example when a
+            # converter returns its input as is. Each position gets its own copy below.
+            repeated = id(output) in marked_outputs_ids
+            marked_outputs_ids.add(id(output))
             if i < num_declared_outputs:
                 self._num_user_outputs += 1
 
@@ -1007,7 +1006,7 @@ class TRTInterpreter(torch.fx.Interpreter):  # type: ignore[misc]
             original_id = id(output)
             # If this output was emitted by an aliased layer (e.g.
             # IKVCacheUpdateLayer), it shares storage with its source input.
-            alias_info = aliased_info_by_id.get(original_id)
+            alias_info = None if repeated else aliased_info_by_id.get(original_id)
 
             # Skip the dtype cast for aliased outputs: a cast inserts a new
             # layer whose output no longer shares storage with the source
@@ -1029,6 +1028,13 @@ class TRTInterpreter(torch.fx.Interpreter):  # type: ignore[misc]
             # reason as the cast above.
             if alias_info is None and i in scalar_output_positions:
                 output = self._reshape_output_to_scalar(output, name)
+
+            # TensorRT rejects a network input that is also an output, and a tensor
+            # can be marked as an output only once, so mark a copy.
+            if output.is_network_input or repeated:
+                layer = self.ctx.net.add_cast(output, output.dtype)
+                layer.name = f"Copy {output.name} to output {name}"
+                output = layer.get_output(0)
 
             output.name = name
             outputs = outputs[:i] + (output,) + outputs[i + 1 :]
