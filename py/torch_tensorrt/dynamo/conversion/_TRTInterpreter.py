@@ -964,8 +964,9 @@ class TRTInterpreter(torch.fx.Interpreter):  # type: ignore[misc]
         marked_outputs_ids = []
         for i, output in enumerate(outputs):
             # In some cases, the same output tensor may be marked multiple times, such as _to_copy,
-            # so we skip marking if the output is already marked
-            if id(output) in marked_outputs_ids:
+            # so we skip marking if the output is already marked. A network input is not
+            # skipped, because each position gets its own copy of it below.
+            if id(output) in marked_outputs_ids and not output.is_network_input:
                 continue
             marked_outputs_ids.append(id(output))
             if i < num_declared_outputs:
@@ -1029,6 +1030,13 @@ class TRTInterpreter(torch.fx.Interpreter):  # type: ignore[misc]
             # reason as the cast above.
             if alias_info is None and i in scalar_output_positions:
                 output = self._reshape_output_to_scalar(output, name)
+
+            # A converter can return one of its inputs as is, but TensorRT rejects a
+            # network input that is also an output, so the output is a copy of it.
+            if output.is_network_input:
+                layer = self.ctx.net.add_cast(output, output.dtype)
+                layer.name = f"Copy input {output.name} to output {name}"
+                output = layer.get_output(0)
 
             output.name = name
             outputs = outputs[:i] + (output,) + outputs[i + 1 :]

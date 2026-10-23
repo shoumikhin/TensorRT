@@ -60,6 +60,32 @@ class TestInputAsOutput(TestCase):
         )
         torch._dynamo.reset()
 
+    class ReturnsInput(torch.nn.Module):
+        def __init__(self, copies):
+            super().__init__()
+            self.copies = copies
+
+        def forward(self, x, y):
+            return (x + y,) + (y,) * self.copies
+
+    def _assert_input_returned_matches_eager(self, copies):
+        """``y`` is an engine input that is also an engine output."""
+        inputs = (torch.randn(5, 7).cuda(), torch.randn(5, 7).cuda())
+        mod = self.ReturnsInput(copies)
+        trt_mod = torch_tensorrt.dynamo.compile(
+            torch.export.export(mod, inputs),
+            list(inputs),
+            min_block_size=1,
+            require_full_compilation=True,
+        )
+        torch.testing.assert_close(trt_mod(*inputs), mod(*inputs))
+
+    def test_input_returned_next_to_a_computed_output(self):
+        self._assert_input_returned_matches_eager(copies=1)
+
+    def test_input_returned_twice(self):
+        self._assert_input_returned_matches_eager(copies=2)
+
 
 class TestLoweringPassMembership(TestCase):
     def insert_at_end(self):
