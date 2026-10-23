@@ -306,6 +306,8 @@ struct TRTEngine : torch::CustomClassHolder {
   // explicit ownership makes capture/replay behavior consistent across x86-64
   // and AArch64.
   at::cuda::CUDAGraph cudagraph = {true};
+  // Dynamically allocated workspace that ``cudagraph`` replays write to, kept for as long as the graph.
+  at::Tensor cudagraph_workspace;
   at::cuda::CUDAStream engine_stream = c10::cuda::getDefaultCUDAStream();
   at::cuda::CUDAStream caller_stream = c10::cuda::getDefaultCUDAStream();
   at::cuda::CUDAStream default_stream = c10::cuda::getDefaultCUDAStream();

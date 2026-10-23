@@ -6,6 +6,7 @@ import unittest
 
 import torch
 import torch_tensorrt as torch_trt
+from torch.profiler import ProfilerActivity, profile
 from torch_tensorrt.dynamo.runtime import TorchTensorRTModule
 
 import tensorrt as trt  # isort: skip  # imported after torch_tensorrt for RTX alias
@@ -71,3 +72,93 @@ class TestDynamicWorkspaceAllocation(unittest.TestCase):
                 f"output={output_bytes}, tolerance={allocator_tolerance}"
             ),
         )
+
+    def test_cudagraph_keeps_its_workspace(self):
+        if not torch_trt.ENABLED_FEATURES.torch_tensorrt_runtime:
+            self.skipTest("Checks the C++ runtime.")
+        if torch_trt.ENABLED_FEATURES.tensorrt_rtx:
+            self.skipTest(
+                "On TensorRT-RTX the C++ runtime does not capture a CUDA graph of its own."
+            )
+        self.addCleanup(torch._dynamo.reset)
+        self.addCleanup(torch_trt.runtime.set_cudagraphs_mode, False)
+
+        model = (
+            torch.nn.Sequential(
+                torch.nn.Conv2d(3, 8, 3), torch.nn.ReLU(), torch.nn.Conv2d(8, 16, 3)
+            )
+            .eval()
+            .cuda()
+        )
+        inputs = [torch.rand((8, 3, 64, 64), device="cuda")]
+        compiled_module = torch_trt.compile(
+            model,
+            inputs=inputs,
+            ir="dynamo",
+            dynamically_allocate_resources=True,
+            min_block_size=1,
+        )
+        (runtime_module,) = [
+            module
+            for module in compiled_module.modules()
+            if isinstance(module, TorchTensorRTModule)
+        ]
+        runtime = trt.Runtime(trt.Logger(trt.Logger.ERROR))
+        engine = runtime.deserialize_cuda_engine(runtime_module.serialized_engine)
+        workspace_bytes = engine.device_memory_size_v2
+        self.assertGreater(workspace_bytes, 0)
+        del engine, runtime
+
+        def captures():
+            with profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
+            ) as prof:
+                compiled_module(*inputs)
+                torch.cuda.synchronize()
+            return [e.name for e in prof.events()].count("cudaStreamBeginCapture")
+
+        with torch.no_grad():
+            expected = model(*inputs)
+            torch_trt.runtime.set_cudagraphs_mode(True)
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            self.assertEqual(captures(), 1)
+            # The caching allocator hands out any workspace that an earlier call freed.
+            buffer = torch.zeros(workspace_bytes, dtype=torch.uint8, device="cuda")
+            self.assertEqual(
+                captures(),
+                0,
+                msg="an allocation between calls made a call record again",
+            )
+            output = compiled_module(*inputs)
+            torch.cuda.synchronize()
+            self.assertEqual(
+                torch.count_nonzero(buffer).item(),
+                0,
+                msg="a CUDA graph replay wrote to a workspace freed after recording",
+            )
+            torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
+
+            torch_trt.runtime.set_cudagraphs_mode(False)
+            held = torch.cuda.memory_allocated()
+            side_stream = torch.cuda.Stream()
+            side_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side_stream):
+                # Delays the call below until after the default stream zeroes its buffer.
+                torch.cuda._sleep(500_000_000)
+                compiled_module(*inputs)
+            # The default stream allocated the workspace that the call above released.
+            late_buffer = torch.zeros(workspace_bytes, dtype=torch.uint8, device="cuda")
+            torch.cuda.synchronize()
+            self.assertEqual(
+                torch.count_nonzero(late_buffer).item(),
+                0,
+                msg="a call on another stream wrote to a workspace handed out again",
+            )
+            del late_buffer
+            torch.cuda.empty_cache()
+            self.assertGreaterEqual(
+                held - torch.cuda.memory_allocated(),
+                workspace_bytes,
+                msg="the workspace outlived the CUDA graph",
+            )

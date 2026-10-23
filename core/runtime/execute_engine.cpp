@@ -329,22 +329,6 @@ std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intr
   auto* ctx = compiled_engine->exec_ctx();
 
   torch::Tensor dynamic_workspace;
-  if (compiled_engine->resource_allocation_strategy == TRTEngine::ResourceAllocationStrategy::kDynamic) {
-    const auto workspace_bytes = compiled_engine->cuda_engine->getDeviceMemorySizeV2();
-    try {
-      dynamic_workspace =
-          torch::empty({workspace_bytes}, torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
-    } catch (c10::Error& e) {
-      TORCH_RETHROW(
-          e,
-          "Failed to allocate the ",
-          workspace_bytes,
-          "-byte activation workspace of engine ",
-          compiled_engine->name,
-          ".");
-    }
-    ctx->setDeviceMemoryV2(dynamic_workspace.data_ptr(), workspace_bytes);
-  }
 
   auto run_standard_execution = [&]() {
     bool cudagraphs_enabled = (CUDAGRAPHS_MODE == SUBGRAPH_CUDAGRAPHS);
@@ -423,7 +407,7 @@ std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intr
     }
 
     if (need_cudagraphs_reset) {
-      compiled_engine->cudagraph.reset();
+      compiled_engine->reset_captured_graph();
     }
 
     std::vector<at::Tensor> outputs(compiled_engine->num_io.second);
@@ -548,6 +532,7 @@ std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intr
                 "TensorRT failed to run engine " << compiled_engine->name << ", see the TensorRT error above");
           });
           compiled_engine->cudagraph.instantiate();
+          compiled_engine->cudagraph_workspace = dynamic_workspace;
           if (compiled_engine->profile_execution) {
             cudaError_t debug_dump_err = cudaGraphDebugDotPrint(
                 compiled_engine->cudagraph.raw_cuda_graph(),
@@ -806,6 +791,32 @@ std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intr
         *in = in->to(torch::Device(target_device));
       }
     }
+  }
+
+  // Under the lock, because the choice of workspace depends on graph state that other calls change.
+  if (compiled_engine->resource_allocation_strategy == TRTEngine::ResourceAllocationStrategy::kDynamic) {
+    const auto workspace_bytes = compiled_engine->cuda_engine->getDeviceMemorySizeV2();
+    if (compiled_engine->cudagraph_workspace.defined()) {
+      // The graph replays into the workspace it was recorded with. This call may run on another stream than the one
+      // that allocated it, so the allocator must not hand it out again before this stream is done with it.
+      dynamic_workspace = compiled_engine->cudagraph_workspace;
+      c10::cuda::CUDACachingAllocator::recordStream(
+          dynamic_workspace.storage().data_ptr(), c10::cuda::getCurrentCUDAStream());
+    } else {
+      try {
+        dynamic_workspace =
+            torch::empty({workspace_bytes}, torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
+      } catch (c10::Error& e) {
+        TORCH_RETHROW(
+            e,
+            "Failed to allocate the ",
+            workspace_bytes,
+            "-byte activation workspace of engine ",
+            compiled_engine->name,
+            ".");
+      }
+    }
+    ctx->setDeviceMemoryV2(dynamic_workspace.data_ptr(), workspace_bytes);
   }
 
   if (compiled_engine->requires_output_allocator) { // engine requires OA
