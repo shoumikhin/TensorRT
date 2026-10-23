@@ -2,10 +2,14 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import logging
+import operator
 from typing import Any, Optional
 
 import torch
 from torch_tensorrt.dynamo._settings import CompilationSettings
+from torch_tensorrt.dynamo.lowering.passes.normalize_negative_slice_stop import (
+    _negative_symint_operand,
+)
 from torch_tensorrt.dynamo.lowering.passes.pass_utils import (
     clean_up_graph_after_modifications,
 )
@@ -62,6 +66,14 @@ def decompose_dynamic_slice_scatter(
             step = 1
 
         with gm.graph.inserting_before(node):
+
+            # As in normalize_negative_slice_stop, a start of -n counts from the end.
+            negated_start = _negative_symint_operand(start)
+            if negated_start is not None:
+                dim_size = gm.graph.call_function(
+                    torch.ops.aten.sym_size.int, (input_node, dim)
+                )
+                start = gm.graph.call_function(operator.sub, (dim_size, negated_start))
 
             src_val = src_node.meta.get("val")
 
