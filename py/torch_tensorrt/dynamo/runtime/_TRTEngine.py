@@ -348,10 +348,12 @@ class TRTEngine(OpaqueBase):  # type: ignore[misc]
         return self._context
 
     def invalidate_context(self) -> None:
-        """Drop the live execution context. Next ``self.context`` read
-        rebuilds it with the then-current ``runtime_settings``. Called from
-        every settings-mutation path so reads of ``self.context`` always
-        observe up-to-date settings."""
+        """Drop the live execution context, and the CUDA graph captured on it.
+        Next ``self.context`` read rebuilds it with the then-current
+        ``runtime_settings``. Called from every settings-mutation path so reads
+        of ``self.context`` always observe up-to-date settings."""
+        # The graph replays this context's kernels and memory, so it must go first.
+        self.reset_captured_graph()
         self._context = None
 
     def has_context(self) -> bool:
@@ -1036,10 +1038,8 @@ class TRTEngine(OpaqueBase):  # type: ignore[misc]
         if budget_bytes < 0:
             budget_bytes = self.streamable_device_memory_budget
         # TRT 11+ rejects setWeightStreamingBudgetV2 while a live
-        # IExecutionContext exists (its use_count must be 1). A captured
-        # cudagraph also keeps the context alive, so drop the graph first and
-        # then the context -- matching the C++ TRTEngine::set_device_memory_budget.
-        self.reset_captured_graph()
+        # IExecutionContext exists (its use_count must be 1), so drop it first,
+        # matching the C++ TRTEngine::set_device_memory_budget.
         self.invalidate_context()
         self.cuda_engine.weight_streaming_budget_v2 = budget_bytes
         if self.cuda_engine.weight_streaming_budget_v2 != budget_bytes:
