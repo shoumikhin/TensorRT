@@ -128,3 +128,54 @@ class TestDynamicWorkspaceAllocation(unittest.TestCase):
             msg="a CUDA graph replay wrote to a workspace freed after recording",
         )
         torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
+
+    def test_python_runtime_cudagraph_replay_writes_only_to_its_own_workspace(self):
+        if torch_trt.ENABLED_FEATURES.torch_tensorrt_runtime:
+            self.skipTest(
+                "Checks the Python runtime; the test above covers the C++ runtime."
+            )
+        if torch_trt.ENABLED_FEATURES.tensorrt_rtx:
+            self.skipTest(
+                "On TensorRT-RTX the Python runtime does not capture a CUDA graph of its own."
+            )
+        self.addCleanup(torch._dynamo.reset)
+        self.addCleanup(torch_trt.runtime.set_cudagraphs_mode, False)
+
+        model = (
+            torch.nn.Sequential(
+                torch.nn.Conv2d(3, 8, 3), torch.nn.ReLU(), torch.nn.Conv2d(8, 16, 3)
+            )
+            .eval()
+            .cuda()
+        )
+        inputs = [torch.rand((8, 3, 64, 64), device="cuda")]
+        compiled_module = torch_trt.compile(
+            model,
+            inputs=inputs,
+            ir="dynamo",
+            dynamically_allocate_resources=True,
+            min_block_size=1,
+        )
+        (runtime_module,) = [
+            module
+            for module in compiled_module.modules()
+            if isinstance(module, TorchTensorRTModule)
+        ]
+
+        with torch.no_grad():
+            expected = model(*inputs)
+            torch_trt.runtime.set_cudagraphs_mode(True)
+            compiled_module(*inputs)
+            torch.cuda.synchronize()
+            # Holding the recording call's workspace makes the next call get a new one.
+            recorded_workspace = runtime_module.engine._dynamic_workspace
+            recorded_workspace.zero_()
+            output = compiled_module(*inputs)
+            torch.cuda.synchronize()
+
+        self.assertEqual(
+            torch.count_nonzero(recorded_workspace).item(),
+            0,
+            msg="a CUDA graph replay wrote to the workspace of an earlier call",
+        )
+        torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)

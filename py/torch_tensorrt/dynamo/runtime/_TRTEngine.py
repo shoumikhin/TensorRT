@@ -273,6 +273,8 @@ class TRTEngine(OpaqueBase):  # type: ignore[misc]
         self.shape_key: Optional[str] = None
         self._empty_tensor_placeholder: Optional[torch.Tensor] = None
         self._dynamic_workspace: Optional[torch.Tensor] = None
+        # Address of the dynamic workspace that ``cudagraph`` was recorded with.
+        self._cudagraph_workspace: Optional[int] = None
         self.runtime_states = TorchTRTRuntimeStates(
             torch_tensorrt.runtime.get_cudagraphs_mode()
         )
@@ -410,6 +412,7 @@ class TRTEngine(OpaqueBase):  # type: ignore[misc]
         self.shape_key = None
         self._empty_tensor_placeholder = None
         self._dynamic_workspace = None
+        self._cudagraph_workspace = None
         self.runtime_states = TorchTRTRuntimeStates(
             torch_tensorrt.runtime.get_cudagraphs_mode()
         )
@@ -1407,6 +1410,9 @@ class TRTEngine(OpaqueBase):  # type: ignore[misc]
             with torch.cuda.stream(engine_stream):
                 if self.resource_allocation_strategy:
                     workspace_bytes = self.cuda_engine.device_memory_size_v2
+                    # Free the old workspace first so the allocator can hand the same
+                    # block back and a captured graph does not need recording again.
+                    self._dynamic_workspace = None
                     self._dynamic_workspace = torch.empty(
                         workspace_bytes,
                         dtype=torch.uint8,
@@ -1415,6 +1421,14 @@ class TRTEngine(OpaqueBase):  # type: ignore[misc]
                     self.context.set_device_memory(
                         self._dynamic_workspace.data_ptr(), workspace_bytes
                     )
+                    if (
+                        effective_cudagraphs
+                        and self._dynamic_workspace.data_ptr()
+                        != self._cudagraph_workspace
+                    ):
+                        # The captured graph writes to the workspace it was recorded with.
+                        need_cudagraphs_record = True
+                        self._cudagraph_workspace = self._dynamic_workspace.data_ptr()
 
                 if effective_cudagraphs:
                     if need_cudagraphs_record:
