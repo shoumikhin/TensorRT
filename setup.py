@@ -211,7 +211,8 @@ else:
 # runtime API is not stable across minor releases, and an unbounded floor would resolve a future
 # minor against a backend built for this one. Everything below that ceiling resolves: later 1.5
 # nightlies, a 1.5 release candidate, and 1.5 patch releases alike, since the exact pin belongs in
-# the runtime package, which does derive it.
+# the runtime package, which does derive it. Where a wheel's extras also require that package,
+# they admit only the one ExecuTorch build it pins.
 # The floor currently names a dev build, because the runtime split the delegate needs does not
 # exist in any ExecuTorch release yet: 1.4.1's executorch/lib carries no standalone linkable
 # runtime, and no CUDA wheel at all.
@@ -230,13 +231,25 @@ EXTRAS_REQUIRE = {
     "executorch": [EXECUTORCH_REQUIREMENT],
     "all": [EXECUTORCH_REQUIREMENT],
 }
-# A published wheel's extras also require the exact companion its build job produced. The workflow
-# names it in this variable before building either wheel, and the companion build reads the same
-# value. Source builds leave it out, so the lock keeps following the source pins.
+# A published wheel's extras also require the exact companion its build job produced, but only for
+# a nightly pinning a development ExecuTorch build: only there does the wheel's own index carry
+# that build, and pip does not fail on an extra it cannot meet, it quietly installs another torch-
+# tensorrt. A release candidate pinning an ExecuTorch release has both on the test index, but
+# promotion copies the wheel to the stable index without the companion, so releases leave it out
+# until promotion carries it. PyPI has no CUDA ExecuTorch. The workflow names the version, and the
+# channel for any build but a PyPI release, before building either wheel, and the companion build
+# reads the same version. Source builds leave both out, so the lock keeps following the source
+# pins.
+EXECUTORCH_CHANNEL = "nightly" if ".dev" in __executorch_version__ else "test"
 EXECUTORCH_RUNTIME_VERSION = (
     os.environ.get("TORCH_TENSORRT_EXECUTORCH_RUNTIME_VERSION", "") if RELEASE else ""
 )
-if EXECUTORCH_RUNTIME_VERSION:
+EXECUTORCH_RUNTIME_CHANNEL = (
+    os.environ.get("TORCH_TENSORRT_EXECUTORCH_RUNTIME_CHANNEL", "")
+    if EXECUTORCH_RUNTIME_VERSION
+    else ""
+)
+if EXECUTORCH_RUNTIME_CHANNEL == EXECUTORCH_CHANNEL == "nightly":
     for _extra in ("executorch", "all"):
         EXTRAS_REQUIRE[_extra].append(
             f"torch-tensorrt-executorch-runtime=={EXECUTORCH_RUNTIME_VERSION}; "
