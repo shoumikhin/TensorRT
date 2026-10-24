@@ -134,15 +134,21 @@ the stable Torch-TensorRT from the public index, which is far older. Without `--
 keeps an older nightly that is already installed, and with it an extra that may not bring this
 wheel. NVIDIA's index lets pip take TensorRT's wheel directly. Without it, TensorRT comes from a
 PyPI source package that downloads that wheel while it builds, which takes longer.
-PyTorch you never name: it arrives as a dependency of Torch-TensorRT. This wheel asks for it by
-name with no version, because ExecuTorch imports it and leaves the choice open, so installing this
+On Linux you never name PyTorch: it arrives as a dependency of Torch-TensorRT. This wheel asks
+for it by name with no version, because ExecuTorch imports it and leaves the choice open, so installing this
 wheel on its own lets the resolver pick a PyTorch older than the ExecuTorch it pins. That
 combination installs, imports and loads a program, then fails at the first run with a message about
 a tensor rather than about versions. Install it the way this section shows and the question does not
 arise. Building this wheel
 by hand is only needed to work on it, and those instructions are below.
 
-On a fresh environment that command was measured installing:
+On Windows there is one extra step. Install PyTorch first, with
+`python -m pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu132`,
+then add `--extra-index-url https://download.pytorch.org/whl/nightly/cpu` to the command above.
+ExecuTorch's Windows nightly needs torchao, and only that index carries its Windows build. With
+PyTorch already installed, pip does not take the CPU build of PyTorch from that index.
+
+On a fresh environment the nightly command was measured installing:
 
 | package | version |
 | --- | --- |
