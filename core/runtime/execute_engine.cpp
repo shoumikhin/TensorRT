@@ -329,22 +329,30 @@ std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intr
   auto* ctx = compiled_engine->exec_ctx();
 
   torch::Tensor dynamic_workspace;
-  if (compiled_engine->resource_allocation_strategy == TRTEngine::ResourceAllocationStrategy::kDynamic) {
+  auto set_dynamic_workspace = [&](bool replay) {
+    if (compiled_engine->resource_allocation_strategy != TRTEngine::ResourceAllocationStrategy::kDynamic) {
+      return;
+    }
     const auto workspace_bytes = compiled_engine->cuda_engine->getDeviceMemorySizeV2();
-    try {
-      dynamic_workspace =
-          torch::empty({workspace_bytes}, torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
-    } catch (c10::Error& e) {
-      TORCH_RETHROW(
-          e,
-          "Failed to allocate the ",
-          workspace_bytes,
-          "-byte activation workspace of engine ",
-          compiled_engine->name,
-          ".");
+    if (replay) {
+      // A graph replays into the workspace it was recorded with.
+      dynamic_workspace = compiled_engine->cudagraph_workspace;
+    } else {
+      try {
+        dynamic_workspace =
+            torch::empty({workspace_bytes}, torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
+      } catch (c10::Error& e) {
+        TORCH_RETHROW(
+            e,
+            "Failed to allocate the ",
+            workspace_bytes,
+            "-byte activation workspace of engine ",
+            compiled_engine->name,
+            ".");
+      }
     }
     ctx->setDeviceMemoryV2(dynamic_workspace.data_ptr(), workspace_bytes);
-  }
+  };
 
   auto run_standard_execution = [&]() {
     bool cudagraphs_enabled = (CUDAGRAPHS_MODE == SUBGRAPH_CUDAGRAPHS);
@@ -404,6 +412,10 @@ std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intr
     bool need_cudagraphs_record = std::get<0>(result);
     bool can_use_pre_allocated_outputs = std::get<1>(result);
     bool need_cudagraphs_reset = std::get<2>(result);
+    if (need_cudagraphs_record) {
+      // Cleared once the graph is recorded, so a call that fails before then records again when retried.
+      compiled_engine->runtime_states.context_changed = true;
+    }
 
     // Pre-allocated outputs are disabled entirely for engines with aliased I/O.
     // An aliased output reuses the caller's input storage, so there is no
@@ -423,8 +435,9 @@ std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intr
     }
 
     if (need_cudagraphs_reset) {
-      compiled_engine->cudagraph.reset();
+      compiled_engine->reset_captured_graph();
     }
+    set_dynamic_workspace(effective_cudagraphs && !need_cudagraphs_record);
 
     std::vector<at::Tensor> outputs(compiled_engine->num_io.second);
 
@@ -548,6 +561,8 @@ std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intr
                 "TensorRT failed to run engine " << compiled_engine->name << ", see the TensorRT error above");
           });
           compiled_engine->cudagraph.instantiate();
+          compiled_engine->cudagraph_workspace = dynamic_workspace;
+          compiled_engine->runtime_states.context_changed = false;
           if (compiled_engine->profile_execution) {
             cudaError_t debug_dump_err = cudaGraphDebugDotPrint(
                 compiled_engine->cudagraph.raw_cuda_graph(),
@@ -637,6 +652,11 @@ std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intr
     if (shape_changed && compiled_engine->num_optimization_profiles > 1 && compiled_engine->auto_select_profiles) {
       compiled_engine->auto_select_profile(inputs);
     }
+
+    // The next standard call cannot see the stream and shape changes made here, so it must record a new graph.
+    compiled_engine->reset_captured_graph();
+    compiled_engine->runtime_states.context_changed = true;
+    set_dynamic_workspace(false);
 
     // Discard map: the output-allocator path is incompatible with aliased I/O
     // (validated at engine construction). The bound-inputs map is unused here.
