@@ -111,7 +111,8 @@ def resolve_slice_scatter_write(
     * ``OK`` — the bounds are concrete, and the caller goes on to
       ``_kv_eligible(cache_shape, dim, start, end - start, step)``.
     * ``FULL_OVERWRITE`` — the slice spans the whole dim with a step equal to 1, so
-      the converter returns ``src`` in the input's dtype and emits no KV layer.
+      the converter returns ``src`` in the input's dtype, or scatters it when ``src``
+      is dynamic on a dim where the input is static, and emits no KV layer.
       ``step`` comes back as the integer 1, which is all this branch establishes: the
       caller's own step may be a symbolic object that merely compares equal to it, so
       the converter uses the returned 1.
@@ -307,7 +308,8 @@ def slice_scatter(
         )
 
     if status is KVWriteStatus.DYNAMIC_DIM_SIZE:
-        # The validator keeps these out of TensorRT, so this is only reachable for a
+        # The validator keeps these out of TensorRT, so this is only reachable when
+        # TensorRT sees a dim as dynamic that the graph records as static, or for a
         # node it could not read a shape from.
         raise NotImplementedError(
             f"slice_scatter: dim {dim} of the input is dynamic, so this write's bounds "
@@ -325,7 +327,15 @@ def slice_scatter(
         )
 
     # Trivial: full overwrite. As torch does, src is written in the input's dtype.
-    if status is KVWriteStatus.FULL_OVERWRITE:
+    # Returned as is, a src that is dynamic where the input is static would make the
+    # output dynamic there too, so that write takes the scatter, which keeps the
+    # input's shape.
+    full_overwrite = status is KVWriteStatus.FULL_OVERWRITE
+    src_keeps_static_dims = all(
+        src_size != DYNAMIC_DIM or size == DYNAMIC_DIM
+        for src_size, size in zip(src.shape, input.shape)
+    )
+    if full_overwrite and src_keeps_static_dims:
         return cast_trt_tensor(
             ctx, src, input.dtype, name + "_full_overwrite", target, source_ir
         )
@@ -340,7 +350,7 @@ def slice_scatter(
     )
     kv_out = (
         None
-        if kv_forbidden
+        if kv_forbidden or full_overwrite
         else try_emit_kv_cache_update(
             ctx, name, input, src, dim, start, update_len, step
         )
