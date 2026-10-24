@@ -342,6 +342,23 @@ Graph Partitioning
        converters. When combined with ``use_fp32_acc=True``, decomposed FP16 attention
        keeps its intermediate calculation in FP32 and casts only the final output back
        to FP16.
+   * - ``fold_shared_kv_attention``
+     - ``False``
+     - Run attention whose query heads share one key/value head (multi-query attention)
+       as two plain matrix products against that head, instead of repeating it per query
+       head as Hugging Face models do. This avoids copying the repeated keys and values
+       and replaces TensorRT's fused attention kernel. At head size 256 this was faster
+       on A100 and H100 and slower on Jetson Orin, so measure it on the target GPU.
+       With FP16 the plain matrix products can be less accurate: at head size 256 their
+       largest error against FP32 was 1.2 to 7 times that of the unfolded attention.
+       ``use_fp32_acc=True`` accumulates each matrix product in FP32 and brought that
+       down to 0.9 to 2.3 times. Only attention
+       written as matrix products with static shapes changes;
+       ``scaled_dot_product_attention`` also needs ``decompose_attention=True``. It
+       has no effect under ``torch.compile`` with ``use_distributed_mode_trace``,
+       which lowers matrix products to ``bmm`` first; ``torch.compile`` also turns
+       that on by itself for multi-process ``torch.distributed`` jobs and for graphs
+       that use vmap.
 
 ----
 
@@ -442,7 +459,8 @@ rebuilt from scratch:
 ``l2_limit_for_tiling``, ``enable_autocast``, ``autocast_low_precision_type``,
 ``autocast_excluded_nodes``, ``autocast_excluded_ops``,
 ``autocast_max_output_threshold``, ``autocast_max_depth_of_reduction``,
-``autocast_calibration_dataloader``, ``decompose_attention``, ``attn_bias_is_causal``.
+``autocast_calibration_dataloader``, ``decompose_attention``, ``attn_bias_is_causal``,
+``fold_shared_kv_attention``.
 
 Settings not in this list (e.g., ``debug``, ``dryrun``, ``pass_through_build_failures``)
 can be changed without invalidating the cache.
