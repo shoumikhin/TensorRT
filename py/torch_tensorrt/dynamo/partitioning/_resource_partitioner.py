@@ -49,6 +49,7 @@ Notes
 """
 
 import logging
+import operator
 from typing import Dict, List, Optional, Set, Tuple
 
 import psutil
@@ -168,6 +169,13 @@ class ResourcePartitioner(_SplitterBase):  # type: ignore
                 nodes.append(node)
         subgraphs = [Subgraph(is_acc=True, nodes=nodes)]
         self.fusion_patterns = get_node_in_fusion_pattern(self.module.graph)
+        # A TensorRT engine cannot output a tuple, so a node that returns several values
+        # stays in one subgraph with the getitems that unpack them, like a fusion group.
+        for node in nodes:
+            group = {node} | {u for u in node.users if u.target == operator.getitem}
+            if len(group) > 1:
+                for n in group:
+                    self.fusion_patterns.setdefault(n, set()).update(group)
 
         return subgraphs
 

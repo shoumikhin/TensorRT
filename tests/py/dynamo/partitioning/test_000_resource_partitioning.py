@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
+import operator
 import sys
 import unittest.mock as mock
 
@@ -151,6 +152,35 @@ class TestResourcePartitioning(TestCase):
         # The add and the whole chain it reads moved to the first subgraph, in order.
         assert subgraphs[0].nodes == nodes
         assert subgraphs[1].nodes == []
+
+    def test_getitems_stay_with_the_node_they_unpack(self):
+        class Chunks(nn.Module):
+            def forward(self, x):
+                a, b = x.chunk(2)
+                return a.sin() + b.cos()
+
+        gm = torch.export.export(Chunks(), (torch.randn(4),)).module(check_guards=False)
+        partitioner = ResourcePartitioner(
+            gm, cpu_memory_budget=None, submodule_name="m"
+        )
+        nodes = partitioner.put_nodes_into_subgraphs()[0].nodes
+        (chunk,) = [
+            n for n in nodes if any(u.target == operator.getitem for u in n.users)
+        ]
+        # Split right after the chunk, which would make the first engine output a tuple.
+        cut = nodes.index(chunk) + 1
+        subgraphs = [
+            Subgraph(is_acc=True, nodes=nodes[:cut]),
+            Subgraph(is_acc=True, nodes=nodes[cut:]),
+        ]
+        leaf_node = partitioner.get_leaf_node(subgraphs[0].nodes)
+        assert partitioner.step_if_break_fusion(
+            subgraphs,
+            leaf_node,
+            set(subgraphs[0].nodes),
+            set(subgraphs[1].nodes),
+        )
+        assert set(chunk.users) <= set(subgraphs[0].nodes)
 
 
 if __name__ == "__main__":
