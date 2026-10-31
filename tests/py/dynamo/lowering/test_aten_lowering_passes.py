@@ -588,7 +588,7 @@ class TestRewriteEfficientAttention(TestCase):
             model(*inputs), trt_module(*inputs), rtol=1e-2, atol=1e-2
         )
 
-    def test_force_causal_efficient_attention_trusts_an_unproven_bias_only_when_asked(
+    def test_force_causal_efficient_attention_replaces_by_setting(
         self,
     ):
         upper = torch.ones(32, 32, dtype=torch.bool, device="cuda").triu(1)
@@ -616,7 +616,13 @@ class TestRewriteEfficientAttention(TestCase):
         dynamic_seq = ({2: seq}, {2: seq, 3: seq})
         # (model, inputs, dynamic shapes, settings, whether the bias is replaced)
         cases = [
-            (InputBias(), (query, causal), None, CompilationSettings(), False),
+            (
+                InputBias(),
+                (query, causal),
+                None,
+                CompilationSettings(attn_bias_is_causal=None),
+                False,
+            ),
             (
                 InputBias(),
                 (query, causal),
@@ -647,12 +653,12 @@ class TestRewriteEfficientAttention(TestCase):
                 CompilationSettings(attn_bias_is_causal=True),
                 False,
             ),
-            # Blocked only to -1e9: unknown, so kept by default and replaced with True.
+            # Blocked only to -1e9: unknown, so kept with None and replaced with True.
             (
                 BufferBias(causal.nan_to_num(neginf=-1e9)),
                 (query,),
                 None,
-                CompilationSettings(),
+                CompilationSettings(attn_bias_is_causal=None),
                 False,
             ),
             (
@@ -737,6 +743,7 @@ class TestRewriteEfficientAttention(TestCase):
             [query, attn_bias],
             min_block_size=1,
             require_full_compilation=True,
+            attn_bias_is_causal=None,
         )
         torch.testing.assert_close(
             model(query, attn_bias), trt_module(query, attn_bias), rtol=1e-2, atol=1e-2
@@ -762,7 +769,9 @@ class TestRewriteEfficientAttention(TestCase):
                 gm = torch.export.export(model, (query, attn_bias)).module()
                 # Lowering drops the unused getitems that export keeps.
                 gm.graph.eliminate_dead_code()
-                gm = force_causal_efficient_attention(gm, CompilationSettings())
+                gm = force_causal_efficient_attention(
+                    gm, CompilationSettings(attn_bias_is_causal=None)
+                )
                 (attention,) = [
                     node
                     for node in gm.graph.nodes
