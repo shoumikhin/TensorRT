@@ -1,11 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
+import tensorrt as trt
 import torch
 import torch.nn as nn
 from parameterized import parameterized
 from torch.testing._internal.common_utils import run_tests
 from torch_tensorrt import Input
+from torch_tensorrt.dynamo._SourceIR import SourceIR
+from torch_tensorrt.dynamo.conversion import impl
+from torch_tensorrt.dynamo.conversion._ConversionContext import ConversionContext
 from torch_tensorrt.dynamo.conversion._ConverterRegistry import DYNAMO_CONVERTERS
 
 from .harness import DispatchTestCase, skip_if_trt_rtx_turing
@@ -425,6 +429,35 @@ class TestScaledDotProductAttention(DispatchTestCase):
         self.run_test(
             SDPA(), [query, key, value], rtol=1e-2, atol=1e-2, enable_passes=True
         )
+
+    @parameterized.expand(
+        [(trt.float16, True), (trt.float32, True), (trt.bfloat16, False)]
+    )
+    def test_default_scale_comes_from_query_shape_except_in_bf16(
+        self, dtype, from_shape
+    ):
+        for attention in (
+            impl.attention.scaled_dot_product_attention,
+            impl.attention.scaled_dot_product_efficient_attention,
+        ):
+            network = trt.Builder(trt.Logger(trt.Logger.ERROR)).create_network(
+                1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED)
+            )
+            query, key, value = (
+                network.add_input(n, dtype, (2, 8, 64, 80)) for n in "qkv"
+            )
+            attention(
+                ConversionContext(network),
+                torch.ops.aten.scaled_dot_product_attention.default,
+                SourceIR.ATEN,
+                "attention",
+                query,
+                key,
+                value,
+            )
+            layers = {network.get_layer(i).type for i in range(network.num_layers)}
+            with self.subTest(attention=attention.__name__):
+                self.assertEqual(trt.LayerType.SHAPE in layers, from_shape)
 
     # A constant key is decomposed, because TensorRT's attention layer gets it wrong.
     @parameterized.expand([("query", 0), ("key", 1), ("value", 2)])

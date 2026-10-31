@@ -276,12 +276,21 @@ def scaled_dot_product_attention(
     key = get_trt_tensor(ctx, key, f"{name}_key")
     value = get_trt_tensor(ctx, value, f"{name}_value")
 
-    # A constant scale lets TensorRT fold it into the fused attention kernel, which
-    # applies it in float32 like PyTorch. TensorRT folds a scale computed from the
-    # runtime shape in fewer cases, and an unfolded scale rounds the scaled query
-    # to the input dtype first, which costs accuracy in bfloat16. FP8 MHA fusion
-    # also needs this single same-dtype Mul in front of IAttention.
-    if scale is None and query.shape[-1] > 0:
+    # When FP8 softmax normalization is active (modelopt FP8 MHA pattern) TRT's
+    # FP8 MHA fusion requires the Q/DQ output to feed IAttention via a single
+    # same-dtype Mul; any HALF<->FLOAT cast inserted by the default dynamic
+    # 1/sqrt(D) computation breaks the fusion.  Use a static same-dtype scalar
+    # scale computed from the concrete head_dim.
+    fp8_norm_active = (
+        ctx.current_node is not None
+        and ctx.current_node.meta.get("_fp8_softmax_scale") is not None
+    )
+    # Also BF16, where a dynamic scale costs accuracy; a constant was not clearly better in FP16.
+    if (
+        (fp8_norm_active or query.dtype == trt.DataType.BF16)
+        and scale is None
+        and query.shape[-1] > 0
+    ):
         scale = 1.0 / math.sqrt(query.shape[-1])
 
     query = _restore_static_query_heads(ctx, target, source_ir, name, query)
@@ -396,8 +405,15 @@ def scaled_dot_product_efficient_attention(
     key = get_trt_tensor(ctx, key, f"{name}_key")
     value = get_trt_tensor(ctx, value, f"{name}_value")
 
-    # See scaled_dot_product_attention for why the default scale is a constant.
-    if scale is None and query.shape[-1] > 0:
+    fp8_norm_active = (
+        ctx.current_node is not None
+        and ctx.current_node.meta.get("_fp8_softmax_scale") is not None
+    )
+    if (
+        (fp8_norm_active or query.dtype == trt.DataType.BF16)
+        and scale is None
+        and query.shape[-1] > 0
+    ):
         scale = 1.0 / math.sqrt(query.shape[-1])
 
     query = _restore_static_query_heads(ctx, target, source_ir, name, query)
