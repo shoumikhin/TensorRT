@@ -1874,7 +1874,7 @@ def _index_put_accumulate_validator(
     Requires: dtype/bool checks pass, accumulate=True, and the
     ScatterAdd plugin is present in the TRT plugin registry (registered
     at library init time when torch_tensorrt_runtime is loaded).
-    Supports any number of non-None index tensors.
+    Supports any number of non-None integer index tensors, with no None before them.
     """
     if not (
         index_dtype_validator(node, settings)
@@ -1882,6 +1882,15 @@ def _index_put_accumulate_validator(
     ):
         return False
     if not args_bounds_check(node.args, 3, False):
+        return False
+    # The plugin hands only the non-None indices to at::index_put, as integers, so a None before
+    # an index or a bool mask would select the wrong elements.
+    positions = [d for d, index in enumerate(node.args[1]) if index is not None]
+    if (
+        not positions
+        or None in node.args[1][: positions[-1]]
+        or index_has_bool_indices(node, settings)
+    ):
         return False
     return _scatter_add_plugin_available()
 
