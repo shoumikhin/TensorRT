@@ -109,11 +109,13 @@ class TestDivConverter(DispatchTestCase):
             def forward(self, lhs_val, rhs_val):
                 return torch.ops.prims.div.default(lhs_val, rhs_val) * 2
 
-        inputs = [
-            torch.randint(-50, 50, (2, 8), dtype=torch.int32),
-            torch.tensor([1, -2, 3, -4, 5, -6, 7, -8], dtype=torch.int32).repeat(2, 1),
-        ]
-        self.run_test(div(), inputs)
+        # Large values catch a sign taken from a product that overflows.
+        lhs_val = torch.randint(-50, 50, (2, 8), dtype=torch.int32)
+        lhs_val[0, :2] = torch.tensor([3000000, -3000000])
+        rhs_val = torch.tensor([1, -2, 3, -4, 5, -6, 7, -8], dtype=torch.int32)
+        rhs_val = rhs_val.repeat(2, 1)
+        rhs_val[0, :2] = 1000
+        self.run_test(div(), [lhs_val, rhs_val])
 
     def test_div_of_integers_is_float(self):
         # Reciprocal lowers to 1 / x, so it is a true division too.
