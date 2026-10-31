@@ -39,6 +39,8 @@ from torch_tensorrt.dynamo.conversion._ConverterRegistry import (
 )
 from torch_tensorrt.dynamo.conversion._TRTBuilderMonitor import TRTBulderMonitor
 from torch_tensorrt.dynamo.conversion.converter_utils import (
+    UINT8_DATA_MOVEMENT_OPS,
+    cast_trt_tensor,
     get_node_io,
     get_node_name,
     get_trt_tensor,
@@ -829,6 +831,18 @@ class TRTInterpreter(torch.fx.Interpreter):  # type: ignore[misc]
         if converter_info.get("requires_pytorch_plugin", False):
             self.ctx.pytorch_plugin_ops.add(CONVERTERS.qualified_name_or_str(target))
             _LOGGER.debug(f"{target} adds a plugin that runs PyTorch")
+
+        if target in UINT8_DATA_MOVEMENT_OPS:
+            args = torch.fx.node.map_aggregate(
+                args,
+                lambda arg: (
+                    cast_trt_tensor(
+                        self.ctx, arg, trt.int32, f"{self._cur_node_name}_{arg.name}"
+                    )
+                    if isinstance(arg, trt.ITensor) and arg.dtype == trt.uint8
+                    else arg
+                ),
+            )
 
         self.ctx.current_node = self._cur_node
         if calling_convention is CallingConvention.LEGACY:

@@ -288,7 +288,8 @@ class TestUInt8Support(TestCase):
         )
 
     def test_uint8_shape_op_before_cast(self):
-        # TensorRT has no layer that reshapes uint8, so these must stay in PyTorch.
+        # TensorRT has no uint8 layer for these, so the interpreter widens their uint8
+        # input. A partial slice_scatter still writes in PyTorch.
         shape_ops = {
             "permute": lambda image: image.permute(2, 0, 1),
             "unsqueeze": lambda image: image.unsqueeze(0),
@@ -317,11 +318,10 @@ class TestUInt8Support(TestCase):
                     inputs=[in_tensor],
                     pass_through_build_failures=True,
                     min_block_size=1,
+                    require_full_compilation=name != "partial slice_scatter",
                     cache_built_engines=False,
                     reuse_cached_engines=False,
                 )
-                engines = [n for n, _ in trt_mod.named_children() if "_run_on_acc" in n]
-                self.assertEqual(len(engines), 1)
                 torch.testing.assert_close(trt_mod(in_tensor), mod(in_tensor))
 
     def test_uint8_where(self):
@@ -372,6 +372,31 @@ class TestUInt8Support(TestCase):
                     reuse_cached_engines=False,
                 )
                 torch.testing.assert_close(trt_mod(*inputs), mod(*inputs))
+
+        # A select runs in PyTorch, and so does a where in torch_executed_ops, so uint8
+        # data reaches the next engine as an input, which the interpreter widens.
+        class SelectThenUnsqueeze(nn.Module):
+            def forward(self, mask, a, b):
+                return torch.where(mask, a, b)[..., 0].unsqueeze(0).float()
+
+        partial = {
+            "select, then unsqueezed": (SelectThenUnsqueeze(), {}),
+            "where in PyTorch, then permuted": (
+                SelectThenPermute(),
+                {"torch_executed_ops": {torch.ops.aten.where.self}},
+            ),
+        }
+        for name, (mod, settings) in partial.items():
+            with self.subTest(name):
+                trt_mod = torch_tensorrt.dynamo.compile(
+                    torch.export.export(mod, (mask, a, b)),
+                    inputs=[mask, a, b],
+                    min_block_size=1,
+                    cache_built_engines=False,
+                    reuse_cached_engines=False,
+                    **settings,
+                )
+                torch.testing.assert_close(trt_mod(mask, a, b), mod(mask, a, b))
 
         # torch.compile converts in a fake mode, and 114 becomes a uint8 constant.
         class Fill(nn.Module):
