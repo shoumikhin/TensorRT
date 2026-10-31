@@ -272,6 +272,10 @@ def scaled_dot_product_attention(
     Returns:
         TRTTensor: Attention output tensor with shape [batch, heads, seq_len, head_dim]
     """
+    query = get_trt_tensor(ctx, query, f"{name}_query")
+    key = get_trt_tensor(ctx, key, f"{name}_key")
+    value = get_trt_tensor(ctx, value, f"{name}_value")
+
     # A constant scale lets TensorRT fold it into the fused attention kernel, which
     # applies it in float32 like PyTorch. TensorRT folds a scale computed from the
     # runtime shape in fewer cases, and an unfolded scale rounds the scaled query
@@ -388,6 +392,10 @@ def scaled_dot_product_efficient_attention(
     is_causal: bool = False,
     scale: Optional[float] = None,
 ) -> Tuple[TRTTensor, Optional[TRTTensor], Optional[TRTTensor], Optional[TRTTensor]]:
+    query = get_trt_tensor(ctx, query, f"{name}_query")
+    key = get_trt_tensor(ctx, key, f"{name}_key")
+    value = get_trt_tensor(ctx, value, f"{name}_value")
+
     # See scaled_dot_product_attention for why the default scale is a constant.
     if scale is None and query.shape[-1] > 0:
         scale = 1.0 / math.sqrt(query.shape[-1])

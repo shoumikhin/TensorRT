@@ -6,6 +6,7 @@ import torch.nn as nn
 from parameterized import parameterized
 from torch.testing._internal.common_utils import run_tests
 from torch_tensorrt import Input
+from torch_tensorrt.dynamo.conversion._ConverterRegistry import DYNAMO_CONVERTERS
 
 from .harness import DispatchTestCase, skip_if_trt_rtx_turing
 
@@ -425,6 +426,42 @@ class TestScaledDotProductAttention(DispatchTestCase):
             SDPA(), [query, key, value], rtol=1e-2, atol=1e-2, enable_passes=True
         )
 
+    # A constant key is decomposed, because TensorRT's attention layer gets it wrong.
+    @parameterized.expand([("query", 0), ("key", 1), ("value", 2)])
+    def test_sdpa_constant_input(self, _, index):
+        shape = (2, 8, 32, 16)
+
+        class SDPA(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer(
+                    "constant", torch.randn(shape, dtype=torch.float16)
+                )
+
+            def forward(self, query, other):
+                args = [query, other, other]
+                args[index] = self.constant
+                return torch.ops.aten.scaled_dot_product_attention.default(*args)
+
+        inputs = [torch.randn(shape, dtype=torch.float16) for _ in range(2)]
+        self.run_test(SDPA(), inputs, rtol=1e-2, atol=1e-2, enable_passes=True)
+
+    def test_constant_key_is_declined(self):
+        graph = torch.fx.Graph()
+        query, value = graph.placeholder("q"), graph.placeholder("v")
+        key = graph.get_attr("k")
+        view = graph.call_function(torch.ops.aten.view.default, (key, [-1]))
+        for op in (
+            torch.ops.aten.scaled_dot_product_attention.default,
+            torch.ops.aten._scaled_dot_product_flash_attention.default,
+            torch.ops.aten._scaled_dot_product_efficient_attention.default,
+            torch.ops.aten._scaled_dot_product_cudnn_attention.default,
+        ):
+            for k in (key, view):
+                with self.subTest(op=op, key=k.name):
+                    node = graph.call_function(op, (query, k, value))
+                    self.assertNotIn(node, DYNAMO_CONVERTERS)
+
 
 class TestScaledDotProductEfficientAttention(DispatchTestCase):
     @parameterized.expand(
@@ -669,6 +706,22 @@ class TestScaledDotProductEfficientAttention(DispatchTestCase):
             atol=1e-2,
             enable_passes=True,
         )
+
+    def test_efficient_sdpa_constant_value(self):
+        shape = (2, 8, 32, 16)
+
+        class EfficientSDPA(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("value", torch.randn(shape, dtype=torch.float16))
+
+            def forward(self, query, key):
+                return torch.ops.aten._scaled_dot_product_efficient_attention.default(
+                    query, key, self.value, None, False
+                )[0]
+
+        inputs = [torch.randn(shape, dtype=torch.float16) for _ in range(2)]
+        self.run_test(EfficientSDPA(), inputs, rtol=1e-2, atol=1e-2, enable_passes=True)
 
 
 if __name__ == "__main__":

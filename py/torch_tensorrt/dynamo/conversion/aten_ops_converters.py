@@ -5356,6 +5356,21 @@ def _inputs_quantized_to_fp8(node: Node) -> bool:
     )
 
 
+def _has_constant_key(node: Node) -> bool:
+    # TensorRT 11.2 to 11.4 give wrong FP16 and BF16 results for an attention layer whose key is a
+    # constant: they fold the transpose of the key into the constant, and the fused kernel output is then
+    # wrong. Seen on an A100 and an H100, and declined on every version. The decomposition and PyTorch
+    # are correct, though the decomposition rounds the scores to BF16 and so is less accurate there.
+    key = _pass_through_source(node.args[1])
+    if isinstance(key, Node) and key.op == "get_attr":
+        _LOGGER.debug(
+            "Declining attention %s: its key is a constant, which TensorRT's attention layer gets wrong.",
+            node.name,
+        )
+        return True
+    return False
+
+
 def scaled_dot_product_attention_validator(
     node: Node, settings: Optional[CompilationSettings] = None
 ) -> bool:
@@ -5381,6 +5396,8 @@ def scaled_dot_product_attention_validator(
             "cannot build unless its inputs are FP8 too.",
             node.name,
         )
+        return False
+    if _has_constant_key(node):
         return False
 
     attn_mask = args_bounds_check(node.args, 3, None)
@@ -5484,6 +5501,9 @@ def scaled_dot_product_flash_attention_validator(
     if not attention_capability_validator(node, settings):
         return False
 
+    if _has_constant_key(node):
+        return False
+
     if args_bounds_check(node.args, 5, False):
         _LOGGER.debug("return_debug_mask is not yet supported.")
         return False
@@ -5579,6 +5599,9 @@ def scaled_dot_product_efficient_attention_validator(
     node: Node, settings: Optional[CompilationSettings] = None
 ) -> bool:
     if not attention_capability_validator(node, settings):
+        return False
+
+    if _has_constant_key(node):
         return False
 
     if args_bounds_check(node.args, 4, False):
