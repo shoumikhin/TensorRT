@@ -182,6 +182,53 @@ class TestResourcePartitioning(TestCase):
         )
         assert set(chunk.users) <= set(subgraphs[0].nodes)
 
+    def test_split_subgraphs_fit_the_budget(self):
+        class TwoBranches(nn.Module):
+            def __init__(self):
+                super().__init__()
+                # 3 MiB, read at both ends of the large branch.
+                self.scale = nn.Parameter(torch.ones(1536, 512))
+                self.layers = nn.Sequential(
+                    *[nn.Linear(512, 512, bias=False) for _ in range(4)]
+                )
+
+            def forward(self, a, x):
+                # A branch without weights, which must not become an engine of its own.
+                small = a.sin().sum()
+                x = self.layers(x * self.scale)
+                # Enough nodes for the split to take steps of several nodes.
+                for _ in range(300):
+                    x = torch.sin(x)
+                return small + (x * self.scale).sum()
+
+        inputs = (torch.randn(2, 4), torch.randn(1536, 512))
+        gm = torch.export.export(TwoBranches(), inputs).module(check_guards=False)
+        weights = gm.state_dict()
+        # The second budget is smaller than the scale.
+        for budget in (5 << 20, 2 << 20):
+            partitioner = ResourcePartitioner(
+                gm, cpu_memory_budget=None, submodule_name="m"
+            )
+            subgraphs = partitioner.break_subgraphs(
+                partitioner.put_nodes_into_subgraphs(), subgraph_size_budget=budget
+            )
+            for subgraph in subgraphs:
+                # Every engine embeds each weight it reads, even one that another engine also reads.
+                read = {
+                    i.target
+                    for n in subgraph.nodes
+                    for i in n.all_input_nodes
+                    if i.op == "get_attr"
+                }
+                size = sum(weights[t].nbytes for t in read)
+                # Only a single weight that is larger than the budget may exceed it,
+                # and no engine is left without weights.
+                assert read and (
+                    size <= budget or len(read) == 1
+                ), f"{size} bytes in a subgraph, budget {budget}"
+            partitioner.tag(subgraphs)
+            torch.testing.assert_close(partitioner.split()(*inputs), gm(*inputs))
+
 
 if __name__ == "__main__":
     run_tests()
