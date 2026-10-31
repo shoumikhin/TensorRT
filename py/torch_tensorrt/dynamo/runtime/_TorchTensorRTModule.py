@@ -716,6 +716,9 @@ class TorchTensorRTModule(torch.nn.Module):  # type: ignore[misc]
         state.setdefault("_serialized_engine", None)
         state.setdefault("_runtime_settings", RuntimeSettings(runtime_cache=None))
         state.setdefault("_implicit_cache_handle", None)
+        # A module pickled before the mark existed reads as using no PyTorch plugin,
+        # as set_extra_state reads an older state.
+        state.setdefault("pytorch_plugin_ops", [])
         set_state = getattr(super(), "__setstate__", None)
         if set_state is not None:
             set_state(state)
