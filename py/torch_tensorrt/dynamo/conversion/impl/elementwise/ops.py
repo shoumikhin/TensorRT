@@ -564,9 +564,7 @@ def prims_div(
     rhs_val: Union[TRTTensor, int, float],
 ) -> TRTTensor:
     """prims.div divides floats and truncates integers, keeping them integer."""
-    if _is_float(lhs_val) or _is_float(rhs_val):
-        return div(ctx, target, source_ir, name, lhs_val, rhs_val)
-    # TensorRT's integer DIV already truncates toward zero.
+    # TensorRT's DIV does both: it truncates integers toward zero.
     return convert_binary_elementwise(
         ctx, target, source_ir, name, trt.ElementWiseOperation.DIV, lhs_val, rhs_val
     )
