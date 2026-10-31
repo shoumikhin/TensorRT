@@ -459,8 +459,7 @@ class TestScaledDotProductAttention(DispatchTestCase):
             with self.subTest(attention=attention.__name__):
                 self.assertEqual(trt.LayerType.SHAPE in layers, from_shape)
 
-    # A constant key is decomposed, because TensorRT's attention layer gets it wrong.
-    @parameterized.expand([("query", 0), ("key", 1), ("value", 2)])
+    @parameterized.expand([("query", 0), ("value", 2)])
     def test_sdpa_constant_input(self, _, index):
         shape = (2, 8, 32, 16)
 
@@ -479,21 +478,29 @@ class TestScaledDotProductAttention(DispatchTestCase):
         inputs = [torch.randn(shape, dtype=torch.float16) for _ in range(2)]
         self.run_test(SDPA(), inputs, rtol=1e-2, atol=1e-2, enable_passes=True)
 
-    def test_constant_key_is_declined(self):
+    def test_only_a_constant_key_is_declined(self):
         graph = torch.fx.Graph()
-        query, value = graph.placeholder("q"), graph.placeholder("v")
+        query, value, start = (graph.placeholder(n) for n in ("q", "v", "start"))
         key = graph.get_attr("k")
-        view = graph.call_function(torch.ops.aten.view.default, (key, [-1]))
+        is_constant = {
+            key: True,
+            graph.call_function(torch.ops.aten.view.default, (key, [-1])): True,
+            graph.call_function(torch.ops.aten.slice.Tensor, (key, 0, 0, 1)): True,
+            # The slice offset comes from an input, so the key is not a constant.
+            graph.call_function(torch.ops.aten.slice.Tensor, (key, 0, start)): False,
+        }
+        for k in is_constant:
+            k.meta["val"] = torch.empty(1, dtype=torch.float16, device="meta")
         for op in (
             torch.ops.aten.scaled_dot_product_attention.default,
             torch.ops.aten._scaled_dot_product_flash_attention.default,
             torch.ops.aten._scaled_dot_product_efficient_attention.default,
             torch.ops.aten._scaled_dot_product_cudnn_attention.default,
         ):
-            for k in (key, view):
+            for k, constant in is_constant.items():
                 with self.subTest(op=op, key=k.name):
                     node = graph.call_function(op, (query, k, value))
-                    self.assertNotIn(node, DYNAMO_CONVERTERS)
+                    self.assertEqual(node not in DYNAMO_CONVERTERS, constant)
 
 
 class TestScaledDotProductEfficientAttention(DispatchTestCase):

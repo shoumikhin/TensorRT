@@ -101,6 +101,40 @@ class TestDecomposeUnsupportedAttention(TestCase):
         targets = {n.target for n in gm.graph.nodes if n.op == "call_function"}
         self.assertIn(torch.ops.aten.scaled_dot_product_attention.default, targets)
 
+    def test_attention_with_a_constant_key_is_left_for_pytorch(self):
+        # TensorRT's attention layer gets a constant key wrong in FP16 and BF16. FP32 is right,
+        # and a key that takes its batch from an input keeps the layer as before.
+        class ConstantKey(nn.Module):
+            def __init__(self, dtype):
+                super().__init__()
+                self.register_buffer("k", torch.randn(1, 2, 4, 8, dtype=dtype))
+
+            def forward(self, q, v):
+                k = self.k.expand(q.shape[0], -1, -1, -1)
+                return torch.ops.aten.scaled_dot_product_attention.default(q, k, v)
+
+        sdpa = torch.ops.aten.scaled_dot_product_attention.default
+        settings = CompilationSettings(min_block_size=1, decompose_attention=False)
+        batch = torch.export.Dim("batch")
+        for dtype, dynamic_shapes, supported in (
+            (torch.float16, None, False),
+            (torch.bfloat16, None, False),
+            (torch.float16, ({0: batch}, {0: batch}), True),
+            (torch.float32, None, True),
+        ):
+            with self.subTest(dtype=dtype, dynamic=dynamic_shapes is not None):
+                inputs = tuple(torch.randn(2, 2, 4, 8, dtype=dtype) for _ in range(2))
+                ep = torch.export.export(
+                    ConstantKey(dtype), inputs, dynamic_shapes=dynamic_shapes
+                )
+                gm = decompose_unsupported_attention(ep.module(), settings)
+                nodes = [n for n in gm.graph.nodes if n.target == sdpa]
+                self.assertEqual(len(nodes), 1)
+                self.assertEqual(
+                    scaled_dot_product_attention_validator(nodes[0], settings),
+                    supported,
+                )
+
     def test_post_lowering_mla_fully_supported(self):
         class MLA(nn.Module):
             def forward(self, q, k, v):

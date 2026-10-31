@@ -114,8 +114,9 @@ def decompose_unsupported_attention(
     Attention ops are deliberately left out of the default decomposition table so
     ``IAttentionLayer`` can consume them whole. When the capability validator
     rejects a node (e.g. MLA where K and V head dims differ), leave the rest of
-    the graph on the native path and decompose only the declined nodes. Hardware
-    capability rejections keep the fused op intact for PyTorch fallback.
+    the graph on the native path and decompose only the declined nodes. Capability
+    rejections (TensorRT-RTX on Turing, a constant key) keep the fused op intact for
+    PyTorch fallback.
     """
     if settings.decompose_attention:
         return gm
@@ -127,8 +128,9 @@ def decompose_unsupported_attention(
         if node.op != "call_function" or node.target not in _ATTENTION_FALLBACKS:
             continue
 
-        # Decomposition cannot make FP32 GEMMs supported on Turing. Preserve the
-        # fused op so partitioning falls back to PyTorch for the whole attention.
+        # Decomposition cannot make FP32 GEMMs supported on Turing, and for a constant key
+        # it is less exact than PyTorch (NaN for a fully masked row, FP16 overflow). Preserve
+        # the fused op so partitioning falls back to PyTorch for the whole attention.
         if not attention_capability_validator(node, settings):
             continue
 

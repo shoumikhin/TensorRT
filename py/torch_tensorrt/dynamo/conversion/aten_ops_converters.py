@@ -5259,13 +5259,17 @@ def aten_ops_linear(
 def attention_capability_validator(
     node: Node, settings: Optional[CompilationSettings] = None
 ) -> bool:
-    """Reject fused attention TensorRT-RTX cannot serve when Turing (SM 7.5) is a target.
+    """Reject fused attention TensorRT cannot serve, so it runs in PyTorch.
 
-    A fused attention op carries the same FP32 GEMMs ``gemm_capability_validator``
-    rejects, but inside the converter, so the graph holds one node and no ``mm``/``bmm``
-    for that guard to see. On Turing TRT-RTX this results in failure. Only the q/k/v
-    dtypes matter, so FP16 attention keeps running on TensorRT.
+    One case is a constant key, see ``_has_constant_key``. The other is TensorRT-RTX
+    when Turing (SM 7.5) is a target. A fused attention op carries the same FP32 GEMMs
+    ``gemm_capability_validator`` rejects, but inside the converter, so the graph holds
+    one node and no ``mm``/``bmm`` for that guard to see. On Turing TRT-RTX this results
+    in failure. Only the q/k/v dtypes matter, so FP16 attention keeps running on TensorRT.
     """
+    if _has_constant_key(node):
+        return False
+
     if not trt_rtx_targets_turing(settings):
         return True
 
@@ -5359,10 +5363,29 @@ def _inputs_quantized_to_fp8(node: Node) -> bool:
 def _has_constant_key(node: Node) -> bool:
     # TensorRT 11.2 to 11.4 give wrong FP16 and BF16 results for an attention layer whose key is a
     # constant: they fold the transpose of the key into the constant, and the fused kernel output is then
-    # wrong. Seen on an A100 and an H100, and declined on every version. The decomposition and PyTorch
-    # are correct, though the decomposition rounds the scores to BF16 and so is less accurate there.
-    key = _pass_through_source(node.args[1])
-    if isinstance(key, Node) and key.op == "get_attr":
+    # wrong. Seen on an A100 and an H100, and declined on every version. FP32 attention does not use that
+    # kernel and is right. A key whose shape or offset comes from an input keeps the layer as before;
+    # TensorRT can still fold it when the optimization profile fixes the input sizes the key uses.
+    from torch_tensorrt.dynamo.lowering.passes.reset_folded_constructors import (
+        _aliases_input,
+    )
+
+    key = source = node.args[1]
+    # Constant folding keeps some views of a constant, such as one that is also a graph output.
+    while (
+        isinstance(source, Node)
+        and (source.target in _PASS_THROUGH_OPS or _aliases_input(source))
+        and source.all_input_nodes == [source.args[0]]
+    ):
+        source = source.args[0]
+    dtype = (
+        getattr(key.meta.get("val"), "dtype", None) if isinstance(key, Node) else None
+    )
+    if (
+        isinstance(source, Node)
+        and source.op == "get_attr"
+        and dtype in (torch.float16, torch.bfloat16)
+    ):
         _LOGGER.debug(
             "Declining attention %s: its key is a constant, which TensorRT's attention layer gets wrong.",
             node.name,
@@ -5396,8 +5419,6 @@ def scaled_dot_product_attention_validator(
             "cannot build unless its inputs are FP8 too.",
             node.name,
         )
-        return False
-    if _has_constant_key(node):
         return False
 
     attn_mask = args_bounds_check(node.args, 3, None)
@@ -5501,9 +5522,6 @@ def scaled_dot_product_flash_attention_validator(
     if not attention_capability_validator(node, settings):
         return False
 
-    if _has_constant_key(node):
-        return False
-
     if args_bounds_check(node.args, 5, False):
         _LOGGER.debug("return_debug_mask is not yet supported.")
         return False
@@ -5599,9 +5617,6 @@ def scaled_dot_product_efficient_attention_validator(
     node: Node, settings: Optional[CompilationSettings] = None
 ) -> bool:
     if not attention_capability_validator(node, settings):
-        return False
-
-    if _has_constant_key(node):
         return False
 
     if args_bounds_check(node.args, 4, False):
