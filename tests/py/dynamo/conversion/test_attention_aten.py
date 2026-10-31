@@ -406,6 +406,25 @@ class TestScaledDotProductAttention(DispatchTestCase):
             )
         self.run_test_with_dynamic_shape(SDPA(), input_specs, output_dtypes=[dtype])
 
+    def test_sdpa_default_scale_bf16(self):
+        skip_if_trt_rtx_turing(self, "bfloat16")
+
+        class SDPA(nn.Module):
+            def forward(self, query, key, value):
+                return torch.ops.aten.scaled_dot_product_attention.default(
+                    query, key, value
+                )
+
+        # A peaked softmax magnifies any bfloat16 rounding of the scaled query,
+        # and sqrt(80) is not a power of two, so dividing by it rounds.
+        shape = (2, 8, 64, 80)
+        query = 4 * torch.randn(shape, dtype=torch.bfloat16)
+        key = 4 * torch.randn(shape, dtype=torch.bfloat16)
+        value = torch.randn(shape, dtype=torch.bfloat16)
+        self.run_test(
+            SDPA(), [query, key, value], rtol=1e-2, atol=1e-2, enable_passes=True
+        )
+
 
 class TestScaledDotProductEfficientAttention(DispatchTestCase):
     @parameterized.expand(
