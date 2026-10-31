@@ -617,6 +617,7 @@ def _native_project(tmp_path, tools, *, mutation=None, static_cuda=False):
     )
     (modules / "FindTensorRT.cmake").write_text(
         "add_library(TensorRT::nvinfer INTERFACE IMPORTED)\n"
+        "add_library(TensorRT::nvinfer_plugin INTERFACE IMPORTED)\n"
     )
     (modules / "FindCUDAToolkit.cmake").write_text(
         "add_library(CUDA::cudart SHARED IMPORTED)\n"

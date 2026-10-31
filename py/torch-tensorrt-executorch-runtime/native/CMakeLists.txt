@@ -74,6 +74,7 @@ target_link_libraries(executorch_backend_tensorrt PRIVATE
   executorch::extension_cuda
   CUDA::cudart
   TensorRT::nvinfer
+  TensorRT::nvinfer_plugin
   Threads::Threads)
 
 # Build to the standard ExecuTorch's own exported configuration asks for. The delegate is compiled

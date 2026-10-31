@@ -207,6 +207,7 @@ endif()
 set(_executorch_backend_tensorrt_link_libraries
     CUDA::cudart
     TensorRT::nvinfer
+    TensorRT::nvinfer_plugin
     Threads::Threads
     extension_cuda
 )
