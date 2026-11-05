@@ -14,6 +14,7 @@ from torch_tensorrt.dynamo._SourceIR import SourceIR
 from torch_tensorrt.dynamo.conversion import impl
 from torch_tensorrt.dynamo.conversion._ConversionContext import ConversionContext
 from torch_tensorrt.dynamo.conversion.converter_utils import (
+    cast_trt_tensor,
     get_trt_tensor,
     set_layer_name,
     to_torch,
@@ -83,6 +84,7 @@ def quantize(
             max_bound = 448
 
         axis = None
+        zero_amax_bound = max_bound / torch.finfo(torch.float32).max
         # Dynamic amax (TRT ITensor) is always treated as per-tensor; numel()/shape
         # checks only apply to constant torch/numpy amax values.
         if not isinstance(amax, trt.ITensor):
@@ -105,9 +107,36 @@ def quantize(
                 ), f"{name=} is per-tensor quantization, expected amax is a singular value, but got {amax.shape=}"
 
             amax = to_torch(amax, None)
+            if dtype == trt.DataType.FP8:
+                # An amax of 0 makes an FP8 scale of 0, which zeroes the input or gives
+                # NaN. ModelOpt 0.48's FP8 fake quantization works in float32, where a
+                # small amax still gives a nonzero scale, and uses an amax of 1 at or
+                # below 448 / float32 max (earlier versions use 2**-24).
+                amax = amax.float()
+                amax = torch.where(amax <= zero_amax_bound, torch.ones_like(amax), amax)
             scale = torch.divide(amax, max_bound)
             scale = get_trt_tensor(ctx, scale, name + "_scale", dtype=torch.float32)
         else:
+            if dtype == trt.DataType.FP8:
+                amax = cast_trt_tensor(
+                    ctx, amax, trt.float32, f"{name}_amax_float", target, get_ir(target)
+                )
+                amax = impl.condition.where(
+                    ctx,
+                    target,
+                    get_ir(target),
+                    f"{name}_amax_or_one",
+                    torch.tensor(1.0),
+                    amax,
+                    impl.elementwise.le(
+                        ctx,
+                        target,
+                        get_ir(target),
+                        f"{name}_zero_amax",
+                        amax,
+                        zero_amax_bound,
+                    ),
+                )
             scale = impl.elementwise.div(
                 ctx,
                 target,
