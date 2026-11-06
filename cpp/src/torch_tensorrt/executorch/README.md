@@ -303,13 +303,16 @@ kernels on the green context's SMs.
 An engine keeps such a graph for each of up to 4 green contexts, and one for plain streams, so a
 caller that uses both, or up to 4 green contexts in turn, replays on each. These graphs share one
 record of the engine's input shapes, so they replay only while every caller passes the same shapes:
-a call with other shapes starts every graph over, not only its own. A fifth green context
-takes the place of the one called longest ago, and a green context whose graph was replaced starts
-over: a warm-up call, then a recording on its next call. So a caller that makes one call on each of
-more than 4 green contexts in turn never replays. Each green graph holds any buffers it records on
-until the engine is destroyed or its place is taken. TensorRT requires a green context to outlive the
-graphs recorded in it, so destroy the engine before its green contexts. The stream a graph is
-recorded on is destroyed right after the recording, so it is not kept in the green context.
+a call with other shapes starts every graph over, not only its own. A fifth green context takes the
+place of the one called longest ago, and a green context whose graph was replaced starts over: a
+warm-up call, then a recording on its next call. So a caller that makes one call on each of more
+than 4 green contexts in turn never replays. Each green graph keeps the buffers it allocates for
+itself until the engine is destroyed or its place is taken. It does not keep a caller's buffers
+alive, so a caller must not free the buffers a graph replays on. A caller may destroy a green
+context before the engine, for example to split the SMs another way. CUDA detaches that context's
+streams, and each green context has an id of its own, so the engine never replays that graph again:
+it only frees it, when its place is taken or the engine is destroyed. The stream a graph is recorded
+on is destroyed right after the recording, so it is not kept in the green context.
 
 Some calls do not replay:
 
