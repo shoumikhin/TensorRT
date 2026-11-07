@@ -1852,8 +1852,100 @@ TEST_F(ExecutionGraphReplayTest, PooledCallFromAnotherRegularContextFailsAndKeep
 }
 
 // The refusal comes before the call claims the shared scratch, so a pool that would have to grow for
-// it stays as it was, in the context that made it.
+// it stays as it was, in the context that made it. That holds with replay off, before the engine has run
+// in its own context, and from a thread with no current context, as it does for a replaying engine.
 TEST_F(ExecutionGraphReplayTest, PooledCallFromAnotherRegularContextLeavesThePoolAlone) {
+  const auto create_context = driver_entry<PFN_cuCtxCreate_v3020>("cuCtxCreate", 3020);
+  const auto destroy_context = driver_entry<PFN_cuCtxDestroy_v4000>("cuCtxDestroy", 4000);
+  const auto get_current = driver_entry<PFN_cuCtxGetCurrent_v4000>("cuCtxGetCurrent", 4000);
+  const auto set_current = driver_entry<PFN_cuCtxSetCurrent_v4000>("cuCtxSetCurrent", 4000);
+  ASSERT_NE(create_context, nullptr);
+  ASSERT_NE(destroy_context, nullptr);
+  ASSERT_NE(get_current, nullptr);
+  ASSERT_NE(set_current, nullptr);
+  int device = 0;
+  ASSERT_EQ(cudaGetDevice(&device), cudaSuccess);
+  CUcontext primary = nullptr;
+  CUcontext other = nullptr;
+  ASSERT_EQ(get_current(&primary), CUDA_SUCCESS);
+  ASSERT_EQ(create_context(&other, 0, device), CUDA_SUCCESS);
+  std::unique_ptr<void, std::function<void(void*)>> restore(&primary, [&](void*) {
+    set_current(primary);
+    destroy_context(other);
+  });
+  ASSERT_EQ(set_current(primary), CUDA_SUCCESS);
+
+  const SizesType rows = 8;
+  const SizesType cols = 32;
+  const auto blob = build_scratch_blob(rows, cols);
+  ASSERT_FALSE(blob.empty());
+  struct Case {
+    const char* name;
+    bool replay;
+    bool ran_in_own_context;
+    bool from_thread_without_context;
+  };
+  const Case cases[] = {
+      {"replay on", true, true, false},
+      {"replay off", false, true, false},
+      {"before the engine ran", true, false, false},
+      {"thread with no current context", true, true, true},
+  };
+  for (const Case& c : cases) {
+    SCOPED_TRACE(c.name);
+    ASSERT_TRUE(reset_shared_scratch_pool_for_testing());
+    BackendOption options[] = {option(kScratchOption, true), option(kGraphOption, c.replay)};
+    ASSERT_EQ(set_options({options, 2}), Error::Ok);
+    {
+      LoadedGraphEngine engine;
+      ASSERT_EQ(engine.load(blob), Error::Ok);
+      ASSERT_TRUE(engine.handle()->claims_pooled_scratch);
+      ASSERT_EQ(engine.handle()->execution_graph != nullptr, c.replay);
+      const int engine_device = engine.handle()->device_id;
+      const size_t count = static_cast<size_t>(rows) * cols;
+      const std::vector<float> ones(count, 1.0f);
+      std::vector<float> actual(count);
+      ASSERT_EQ(cudaMemcpy(inputs_[0], ones.data(), count * sizeof(float), cudaMemcpyHostToDevice), cudaSuccess);
+      if (c.ran_in_own_context) {
+        for (int i = 0; i < 2; ++i) {
+          ASSERT_EQ(engine.run(inputs_[0], outputs_[0], rows, cols, streams_[0]), Error::Ok);
+        }
+        ASSERT_EQ(cudaStreamSynchronize(streams_[0]), cudaSuccess);
+      }
+      // An empty pool would have to grow for the next call.
+      ASSERT_TRUE(reset_shared_scratch_pool_for_testing());
+      ASSERT_EQ(shared_scratch_capacity_for_testing(engine_device), 0u);
+
+      ASSERT_EQ(set_current(other), CUDA_SUCCESS);
+      cudaStream_t other_stream = nullptr;
+      ASSERT_EQ(cudaStreamCreate(&other_stream), cudaSuccess);
+      Error error = Error::Ok;
+      if (c.from_thread_without_context) {
+        std::thread([&] { error = engine.run(inputs_[0], outputs_[1], rows, cols, other_stream); }).join();
+      } else {
+        error = engine.run(inputs_[0], outputs_[1], rows, cols, other_stream);
+      }
+      EXPECT_EQ(error, Error::InvalidState);
+      EXPECT_EQ(cudaStreamSynchronize(other_stream), cudaSuccess);
+      EXPECT_EQ(cudaStreamDestroy(other_stream), cudaSuccess);
+      ASSERT_EQ(set_current(primary), CUDA_SUCCESS);
+      EXPECT_EQ(shared_scratch_capacity_for_testing(engine_device), 0u);
+
+      // The engine's own context grows the pool itself and keeps working.
+      ASSERT_EQ(engine.run(inputs_[0], outputs_[0], rows, cols, streams_[0]), Error::Ok);
+      ASSERT_EQ(cudaMemcpy(actual.data(), outputs_[0], count * sizeof(float), cudaMemcpyDeviceToHost), cudaSuccess);
+      for (float value : actual) {
+        ASSERT_FLOAT_EQ(value, 1.0f / rows);
+      }
+      EXPECT_GT(shared_scratch_capacity_for_testing(engine_device), 0u);
+    }
+  }
+  EXPECT_TRUE(reset_shared_scratch_pool_for_testing());
+}
+
+// The refusal clears the CUDA error state only when its own device query failed. An error the caller
+// left pending is not sticky, so clearing it would hide it from the caller for good.
+TEST_F(ExecutionGraphReplayTest, ARefusedCallFromAnotherContextLeavesTheCallersPendingCudaErrorAlone) {
   const auto create_context = driver_entry<PFN_cuCtxCreate_v3020>("cuCtxCreate", 3020);
   const auto destroy_context = driver_entry<PFN_cuCtxDestroy_v4000>("cuCtxDestroy", 4000);
   const auto get_current = driver_entry<PFN_cuCtxGetCurrent_v4000>("cuCtxGetCurrent", 4000);
@@ -1885,35 +1977,20 @@ TEST_F(ExecutionGraphReplayTest, PooledCallFromAnotherRegularContextLeavesThePoo
     LoadedGraphEngine engine;
     ASSERT_EQ(engine.load(blob), Error::Ok);
     ASSERT_TRUE(engine.handle()->claims_pooled_scratch);
-    const int engine_device = engine.handle()->device_id;
-    const size_t count = static_cast<size_t>(rows) * cols;
-    const std::vector<float> ones(count, 1.0f);
-    std::vector<float> actual(count);
-    ASSERT_EQ(cudaMemcpy(inputs_[0], ones.data(), count * sizeof(float), cudaMemcpyHostToDevice), cudaSuccess);
-    for (int i = 0; i < 2; ++i) {
-      ASSERT_EQ(engine.run(inputs_[0], outputs_[0], rows, cols, streams_[0]), Error::Ok);
-    }
-    ASSERT_EQ(cudaStreamSynchronize(streams_[0]), cudaSuccess);
-    // An empty pool would have to grow for the next call.
-    ASSERT_TRUE(reset_shared_scratch_pool_for_testing());
-    ASSERT_EQ(shared_scratch_capacity_for_testing(engine_device), 0u);
 
     ASSERT_EQ(set_current(other), CUDA_SUCCESS);
     cudaStream_t other_stream = nullptr;
     ASSERT_EQ(cudaStreamCreate(&other_stream), cudaSuccess);
-    EXPECT_EQ(engine.run(inputs_[0], outputs_[1], rows, cols, other_stream), Error::InvalidState);
-    EXPECT_EQ(cudaStreamSynchronize(other_stream), cudaSuccess);
+    void* impossible = nullptr;
+    ASSERT_EQ(cudaMalloc(&impossible, static_cast<std::size_t>(1) << 62), cudaErrorMemoryAllocation);
+    const Error refused = engine.run(inputs_[0], outputs_[1], rows, cols, other_stream);
+    // Read before any assertion can return with it still pending.
+    const cudaError_t pending = cudaGetLastError();
+    EXPECT_EQ(refused, Error::InvalidState);
+    EXPECT_EQ(pending, cudaErrorMemoryAllocation)
+        << "the refusal cleared an error this backend did not cause: got " << cudaGetErrorString(pending);
     EXPECT_EQ(cudaStreamDestroy(other_stream), cudaSuccess);
     ASSERT_EQ(set_current(primary), CUDA_SUCCESS);
-    EXPECT_EQ(shared_scratch_capacity_for_testing(engine_device), 0u);
-
-    // The engine's own context grows the pool itself and keeps working.
-    ASSERT_EQ(engine.run(inputs_[0], outputs_[0], rows, cols, streams_[0]), Error::Ok);
-    ASSERT_EQ(cudaMemcpy(actual.data(), outputs_[0], count * sizeof(float), cudaMemcpyDeviceToHost), cudaSuccess);
-    for (float value : actual) {
-      ASSERT_FLOAT_EQ(value, 1.0f / rows);
-    }
-    EXPECT_GT(shared_scratch_capacity_for_testing(engine_device), 0u);
   }
   EXPECT_TRUE(reset_shared_scratch_pool_for_testing());
 }
@@ -2305,12 +2382,8 @@ TEST_F(ExecutionGraphReplayTest, PooledEngineWithAliasedOutputsStaysPlain) {
 }
 
 // The plain path can fail after the claim too, so it also has to drain before the pool's lock is
-// released. A caller stream on another device makes enqueueV3 fail.
+// released. A failed record of the enqueue on the pool's event fails the call after its enqueue.
 TEST_F(ExecutionGraphTest, AFailedPooledPlainCallDrainsBeforeReleasingThePool) {
-  int device_count = 0;
-  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count < 2) {
-    GTEST_SKIP() << "Requires two CUDA devices for a caller stream that enqueueV3 refuses";
-  }
   const auto blob = build_scratch_blob(8, 32);
   ASSERT_FALSE(blob.empty());
   ASSERT_TRUE(reset_shared_scratch_pool_for_testing());
@@ -2321,19 +2394,16 @@ TEST_F(ExecutionGraphTest, AFailedPooledPlainCallDrainsBeforeReleasingThePool) {
     ASSERT_EQ(engine.load(blob), Error::Ok);
     ASSERT_TRUE(engine.handle()->claims_pooled_scratch);
     ASSERT_EQ(engine.handle()->execution_graph, nullptr);
-    ASSERT_EQ(engine.handle()->device_id, 0);
-    // Run once on the engine's device, so the failing call finds the pool's buffer already there.
+    std::vector<float> input(kMaxElements, 1.0f), output(kMaxElements, -1.0f);
+    ASSERT_EQ(cudaMemcpy(inputs_[0], input.data(), kMaxBytes, cudaMemcpyHostToDevice), cudaSuccess);
     ASSERT_EQ(engine.run(inputs_[0], outputs_[0], 8, 32, streams_[0]), Error::Ok);
-    cudaStream_t other = nullptr;
-    ASSERT_EQ(cudaSetDevice(1), cudaSuccess);
-    ASSERT_EQ(cudaStreamCreateWithFlags(&other, cudaStreamNonBlocking), cudaSuccess);
-    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-    SharedScratchDevice& dev = scratch_pool().get(0);
+    SharedScratchDevice& dev = scratch_pool().get(engine.handle()->device_id);
     std::vector<bool> held_at_drain;
     {
       CudaCalls calls;
+      calls.fail_event_record_call = 1;
       calls.before_synchronize = [&](cudaStream_t stream) {
-        if (stream != other) {
+        if (stream != streams_[0]) {
           return;
         }
         // try_lock on the thread that owns the lock is undefined, so the probe runs on another thread.
@@ -2345,12 +2415,76 @@ TEST_F(ExecutionGraphTest, AFailedPooledPlainCallDrainsBeforeReleasingThePool) {
                                    return lock_free;
                                  }).get());
       };
-      EXPECT_NE(engine.run(inputs_[0], outputs_[0], 8, 32, other), Error::Ok);
+      EXPECT_EQ(engine.run(inputs_[0], outputs_[0], 8, 32, streams_[0]), Error::InvalidState);
+      EXPECT_EQ(calls.event_record_calls, 1u);
     }
-    EXPECT_EQ(cudaStreamDestroy(other), cudaSuccess);
     ASSERT_FALSE(held_at_drain.empty()) << "the failed call never drained its stream";
     EXPECT_EQ(held_at_drain, std::vector<bool>(held_at_drain.size(), true))
         << "the pool's lock was released before the failed call's stream was drained";
+    ASSERT_EQ(cudaMemset(outputs_[0], 0xff, kMaxBytes), cudaSuccess);
+    ASSERT_EQ(engine.run(inputs_[0], outputs_[0], 8, 32, streams_[0]), Error::Ok);
+    ASSERT_EQ(cudaMemcpy(output.data(), outputs_[0], kMaxBytes, cudaMemcpyDeviceToHost), cudaSuccess);
+    for (float value : output) {
+      ASSERT_FLOAT_EQ(value, 1.0f / 8);
+    }
+  }
+  EXPECT_TRUE(reset_shared_scratch_pool_for_testing());
+}
+
+// The pool's buffer and completion event belong to the engine's device, so a pooled call on a stream of
+// another device is refused before it claims the pool: nothing is queued, and the pool is left as the
+// engine's last call left it. An empty pool, which such a call would otherwise grow, stays empty.
+TEST_F(ExecutionGraphTest, APooledCallOnAStreamOfAnotherDeviceIsRefusedBeforeItClaimsThePool) {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count < 2) {
+    GTEST_SKIP() << "Requires two CUDA devices";
+  }
+  const auto blob = build_scratch_blob(8, 32);
+  ASSERT_FALSE(blob.empty());
+  ASSERT_TRUE(reset_shared_scratch_pool_for_testing());
+  BackendOption options[] = {option(kScratchOption, true), option(kGraphOption, false)};
+  ASSERT_EQ(set_options({options, 2}), Error::Ok);
+  {
+    LoadedGraphEngine engine;
+    ASSERT_EQ(engine.load(blob), Error::Ok);
+    ASSERT_TRUE(engine.handle()->claims_pooled_scratch);
+    ASSERT_EQ(engine.handle()->device_id, 0);
+    std::vector<float> input(kMaxElements, 1.0f), output(kMaxElements, -1.0f);
+    ASSERT_EQ(cudaMemcpy(inputs_[0], input.data(), kMaxBytes, cudaMemcpyHostToDevice), cudaSuccess);
+    // The engine's own call leaves the pool with a buffer and an enqueue for the next claimant to wait for.
+    ASSERT_EQ(engine.run(inputs_[0], outputs_[0], 8, 32, streams_[0]), Error::Ok);
+    SharedScratchDevice& dev = scratch_pool().get(0);
+    const size_t capacity = shared_scratch_capacity_for_testing(0);
+    ASSERT_GT(capacity, 0u);
+    cudaStream_t other = nullptr;
+    ASSERT_EQ(cudaSetDevice(1), cudaSuccess);
+    ASSERT_EQ(cudaStreamCreateWithFlags(&other, cudaStreamNonBlocking), cudaSuccess);
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    {
+      CudaCalls calls;
+      EXPECT_EQ(engine.run(inputs_[0], outputs_[0], 8, 32, other), Error::InvalidState);
+      EXPECT_TRUE(calls.operations.empty()) << "the refused call queued work";
+      EXPECT_EQ(calls.event_record_calls, 0u);
+    }
+    EXPECT_EQ(shared_scratch_capacity_for_testing(0), capacity);
+    {
+      std::lock_guard<std::mutex> lock(dev.mu);
+      EXPECT_TRUE(dev.marker.pending);
+    }
+    ASSERT_TRUE(reset_shared_scratch_pool_for_testing());
+    {
+      CudaCalls calls;
+      EXPECT_EQ(engine.run(inputs_[0], outputs_[0], 8, 32, other), Error::InvalidState);
+      EXPECT_TRUE(calls.operations.empty()) << "the refused call queued work";
+    }
+    EXPECT_EQ(shared_scratch_capacity_for_testing(0), 0u) << "the refused call grew the pool";
+    EXPECT_EQ(cudaStreamDestroy(other), cudaSuccess);
+    ASSERT_EQ(cudaMemset(outputs_[0], 0xff, kMaxBytes), cudaSuccess);
+    ASSERT_EQ(engine.run(inputs_[0], outputs_[0], 8, 32, streams_[0]), Error::Ok);
+    ASSERT_EQ(cudaMemcpy(output.data(), outputs_[0], kMaxBytes, cudaMemcpyDeviceToHost), cudaSuccess);
+    for (float value : output) {
+      ASSERT_FLOAT_EQ(value, 1.0f / 8);
+    }
   }
   EXPECT_TRUE(reset_shared_scratch_pool_for_testing());
 }

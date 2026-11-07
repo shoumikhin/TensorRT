@@ -1211,6 +1211,38 @@ Error refuse_pooled_call_on_a_capturing_stream(cudaStream_t stream, int device_i
   return Error::NotSupported;
 }
 
+// Refuses a pooled call on a stream of another device or of another regular CUDA context. The pool's
+// buffer and completion event belong to the engine's device and context, so such a call would claim, and
+// maybe grow, the pool there, and only then fail in enqueueV3. A green context stream reports the primary
+// context of its device, so it passes when the engine was loaded in that context.
+Error refuse_pooled_call_from_another_context(cudaStream_t stream, const EngineHandle& engine) {
+  static const auto get_context = driver_entry_point<PFN_cuStreamGetCtx_v12050>("cuStreamGetCtx", 12050);
+  CUcontext context = nullptr;
+  CUgreenCtx green = nullptr;
+  if (engine.context == nullptr || get_context == nullptr || get_context(stream, &context, &green) != CUDA_SUCCESS ||
+      context == engine.context) {
+    return Error::Ok;
+  }
+  int stream_device = -1;
+  const cudaError_t device_err = cudaStreamGetDevice(stream, &stream_device);
+  if (device_err == cudaSuccess && stream_device != engine.device_id) {
+    ET_LOG(
+        Error,
+        "TensorRTBackend::execute: the selected stream belongs to CUDA device %d, and this engine and its shared activation scratch are on device %d",
+        stream_device,
+        engine.device_id);
+  } else {
+    if (device_err != cudaSuccess) {
+      // The query's own error. Anything pending before it was left by the caller, who reads it next.
+      cudaGetLastError();
+    }
+    ET_LOG(
+        Error,
+        "TensorRTBackend::execute: an engine on the shared activation scratch cannot run on a stream of another regular CUDA context");
+  }
+  return Error::InvalidState;
+}
+
 // Sets out_ptr to a buffer of at least `need` bytes on `device_id`, with `stream`
 // ordered after the enqueue that last used the buffer. Returns with `claim`
 // holding the device's lock: the caller must submit its enqueue, call
@@ -1863,14 +1895,9 @@ Error TensorRTBackend::execute(BackendExecutionContext& context, DelegateHandle*
     if (capture_err != Error::Ok) {
       return capture_err;
     }
-    // The pool's completion event belongs to the engine's context, so such a call would fail only after
-    // it had set its shapes and claimed, and maybe grown, the pool in that other context.
-    if (engine->execution_graph && engine->execution_graph->serves_another_regular_context(stream)) {
-      ET_LOG(
-          Error,
-          "TensorRTBackend::execute: an engine on the shared activation scratch cannot run on a stream of "
-          "another regular CUDA context");
-      return Error::InvalidState;
+    const Error context_err = refuse_pooled_call_from_another_context(stream, *engine);
+    if (context_err != Error::Ok) {
+      return context_err;
     }
   }
 

@@ -333,11 +333,10 @@ Some calls do not replay:
   recording fails), the call fails with an error that says why. The engine's own calls keep their
   graph, unless that call brought new shapes, which drop it. The buffers the delegate keeps for
   such a call are allocated in the engine's context, so that other context may be destroyed first.
-- An engine on the shared activation scratch cannot serve a stream of another regular CUDA context
-  at all, with or without replay: the scratch's completion event belongs to the engine's context.
-  With replay on, once the engine has run in its own context, such a call made while that other
-  context is current fails before it sets its shapes or claims the shared scratch, and the engine
-  keeps its graphs. With replay off, or with no context current, the call is not refused up front.
+- An engine on the shared activation scratch cannot serve a stream of another device or of another
+  regular CUDA context, with or without replay: the scratch and its completion event belong to the
+  engine's device and context. Such a call fails before it sets its shapes or claims the shared
+  scratch, and the engine keeps its graphs.
 - After three failed recordings for one set of shapes, the engine logs an error and stays on the
   ordinary path until its shapes or its profile change. Each graph counts its own, and a green graph
   that gives up its place to a newer green context starts over.
