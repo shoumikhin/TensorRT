@@ -172,6 +172,12 @@ An input that the engine updates in place must be row-major, or the call fails w
 order, so a tensor built by hand that is not row-major must carry strides that describe its layout.
 A tensor with no strides is read as row-major.
 
+Every input and output must have the type its engine binding has, or the call fails with
+`Error::InvalidProgram` and the log names both types. TensorRT has no float64, so a float64 model
+compiled without `truncate_double=True` gets an engine that binds float32, while the program keeps
+float64 tensors. Run anyway, it would return wrong numbers. Export such a model again with
+`truncate_double=True`.
+
 ### CUDA streams
 
 - With no stream chosen, the delegate runs on `cudaStreamPerThread`, the default stream of the
