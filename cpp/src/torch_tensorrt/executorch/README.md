@@ -187,6 +187,12 @@ A tensor with no strides is read as row-major.
 - `execute()` always waits for the engine to finish before it returns, on any stream.
 - Calls on one delegate handle are serialized by the delegate. Destroying a handle while a call on
   it runs is not allowed.
+- If another thread uses the same stream at the same time, for example to launch a CUDA graph and
+  synchronize the stream, build the engine with `max_aux_streams=0`. NVIDIA drivers 580 and 595 were
+  seen to drop a stream's wait on an event in that case, and TensorRT joins the auxiliary streams it
+  runs kernels on back to your stream with such a wait at the end of each call. When that wait is
+  dropped, the call returns outputs computed from unfinished results, with no error. An engine built
+  with `max_aux_streams=0` has no auxiliary streams.
 
 `torch_tensorrt::executorch_backend::CudaStreamGuard` was removed in Torch-TensorRT 2.14. Use
 `CallerStreamGuard` instead; it is the same idea, shared by every CUDA delegate:
