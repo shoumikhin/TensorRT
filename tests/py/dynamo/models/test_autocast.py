@@ -1178,6 +1178,32 @@ def test_autocast_keeps_the_dtype_an_op_is_given(given):
 
 @pytest.mark.unit
 @pytest.mark.critical
+@pytest.mark.parametrize(
+    "excluded_ops",
+    [set(), {torch.ops.aten.view.dtype}],
+    ids=["autocast", "excluded"],
+)
+def test_autocast_keeps_the_input_dtype_of_a_dtype_view(excluded_ops):
+    class Model(nn.Module):
+        def forward(self, x):
+            return (x + 0).view(torch.int32)
+
+    model = Model().cuda().eval()
+    # Values that float16 holds exactly, so the float32 bits match eager.
+    x = torch.arange(8, dtype=torch.float32, device="cuda").reshape(2, 4)
+    trt_model = torch_tensorrt.dynamo.compile(
+        torch.export.export(model, (x,)),
+        arg_inputs=[x],
+        min_block_size=1,
+        enable_autocast=True,
+        autocast_low_precision_type=torch.float16,
+        autocast_excluded_ops=excluded_ops,
+    )
+    torch.testing.assert_close(trt_model(x), model(x))
+
+
+@pytest.mark.unit
+@pytest.mark.critical
 def test_autocast_keeps_tiny_constants_nonzero():
     class Model(nn.Module):
         def __init__(self):

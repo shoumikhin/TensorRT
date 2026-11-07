@@ -243,9 +243,13 @@ def rule_based_autocast(
     }
     for node in list(gm.graph.nodes):
         if node.op == "call_function":
-            if node.target == torch.ops.higher_order.wrap_with_autocast:
-                # The region keeps its own precision and checks the dtypes of
-                # its inputs, so give it the inputs it was traced with.
+            if node.target in (
+                torch.ops.higher_order.wrap_with_autocast,
+                torch.ops.aten.view.dtype,
+            ):
+                # An autocast region keeps its own precision and checks the dtypes
+                # of its inputs, and view(dtype) reinterprets the bytes of its
+                # input, so give both the inputs they were traced with.
                 node.args = tuple(
                     (
                         _cast_all_tensor_args_to_dtype(node, a, traced_dtypes[a])
