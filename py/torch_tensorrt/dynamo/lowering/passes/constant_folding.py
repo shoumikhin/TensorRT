@@ -1,12 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-import contextlib
 import logging
-import threading
-from typing import Any, Dict, Iterator, Optional, Set, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
 import torch
+import torch.utils._pytree as pytree
 from torch_tensorrt._utils import sanitized_torch_version
 from torch_tensorrt.dynamo._settings import CompilationSettings
 from torch_tensorrt.dynamo.lowering.constant_fold_exclusions import (
@@ -57,6 +56,27 @@ _VALUE_TYPES = (
     torch.layout,
     torch.memory_format,
 )
+
+# Matrix multiplies and convolutions may use TF32 for float32 inputs on the GPU.
+_TF32_OPS: Set[torch._ops.OpOverloadPacket] = {
+    torch.ops.aten._convolution,
+    torch.ops.aten._trilinear,
+    torch.ops.aten.addbmm,
+    torch.ops.aten.addmm,
+    torch.ops.aten.baddbmm,
+    torch.ops.aten.bmm,
+    torch.ops.aten.conv1d,
+    torch.ops.aten.conv2d,
+    torch.ops.aten.conv3d,
+    torch.ops.aten.conv_transpose1d,
+    torch.ops.aten.conv_transpose2d,
+    torch.ops.aten.conv_transpose3d,
+    torch.ops.aten.convolution,
+    torch.ops.aten.einsum,
+    torch.ops.aten.linear,
+    torch.ops.aten.matmul,
+    torch.ops.aten.mm,
+}
 
 
 def _tensor_reuses_module_storage(
@@ -110,10 +130,8 @@ def constant_fold(
         if _has_offloaded_constants(gm)
         else _TorchTensorRTConstantFolder
     )
-    cf = folder(gm, skip_constructors=False)
-    # With TF32 allowed, TensorRT computes in TF32 too, so folding keeps the caller's settings.
-    with _ieee_float32() if settings.disable_tf32 else contextlib.nullcontext():
-        cf.run()
+    cf = folder(gm, skip_constructors=False, disable_tf32=settings.disable_tf32)
+    cf.run()
 
     # The constants are created on CPU to save GPU memory for TensorRT compilation.
     # For TRT INetwork construction the constants are moved to CPU in get_attr call.
@@ -181,41 +199,6 @@ def constant_fold(
     return gm
 
 
-# Two folds that overlap in time would otherwise restore each other's TF32 flags.
-_TF32_FLAGS_LOCK = threading.Lock()
-
-
-@contextlib.contextmanager
-def _ieee_float32() -> Iterator[None]:
-    """A folded value is baked into the engine as it was computed, so with disable_tf32
-    compute it in full float32. PyTorch lets cuDNN convolutions use TF32 by default, which
-    disable_tf32 does not reach. The flags are process-wide, so other threads also run
-    without TF32 while a fold holds them."""
-    matmul = torch.backends.cuda.matmul
-    with _TF32_FLAGS_LOCK:
-        if hasattr(matmul, "fp32_precision"):
-            conv = torch.backends.cudnn.conv
-            saved = conv.fp32_precision, matmul.fp32_precision
-            conv.fp32_precision = matmul.fp32_precision = "ieee"
-            try:
-                yield
-            finally:
-                conv.fp32_precision, matmul.fp32_precision = saved
-        else:
-            # PyTorch before 2.9, as on the JetPack build, has only these flags. The matmul one is
-            # kept by name: allow_tf32 reads True for both "high" and "medium".
-            cudnn = torch.backends.cudnn
-            saved_conv = cudnn.allow_tf32
-            saved_matmul = torch.get_float32_matmul_precision()
-            cudnn.allow_tf32 = False
-            torch.set_float32_matmul_precision("highest")
-            try:
-                yield
-            finally:
-                cudnn.allow_tf32 = saved_conv
-                torch.set_float32_matmul_precision(saved_matmul)
-
-
 def replace_node_with_constant(
     gm: torch.fx.GraphModule, node: torch.fx.Node, constant: torch.Tensor
 ) -> torch.fx.Node:
@@ -273,8 +256,9 @@ def _describe_args(arg: Any, repeat_of: Dict[torch.fx.Node, torch.fx.Node]) -> A
 # TODO: Delete this class when the following code is fixed in nightly:
 # https://github.com/pytorch/pytorch/blob/4b881b0da390c1290bb12850ef9daad6f6eb2cb6/torch/_inductor/constant_folding.py#L53-L63
 class _TorchTensorRTConstantFolder(ConstantFolder):  # type: ignore[misc]
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, disable_tf32: bool = False, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        self.disable_tf32 = disable_tf32
         self._first_with_key: Dict[Tuple[Any, ...], torch.fx.Node] = {}
         self._repeat_of: Dict[torch.fx.Node, torch.fx.Node] = {}
         # Quantization ops excluded from constant folding so TRT sees QDQ
@@ -333,6 +317,35 @@ class _TorchTensorRTConstantFolder(ConstantFolder):  # type: ignore[misc]
             self.quantization_ops.add(torch.ops.torchao_trt.dequantize_mxfp4.default)
         except Exception:
             pass
+
+    def call_function(
+        self, target: Any, args: Tuple[Any, ...], kwargs: Dict[str, Any]
+    ) -> Any:
+        # A folded value is baked into the engine as it was computed. With disable_tf32,
+        # TensorRT computes these ops in full float32, so fold them in float64 and round
+        # back. That needs no TF32 flags, which every thread in the process shares.
+        def on_gpu_in_float32(v: Any) -> bool:
+            return (
+                isinstance(v, torch.Tensor) and v.is_cuda and v.dtype == torch.float32
+            )
+
+        if not (
+            self.disable_tf32
+            and isinstance(target, torch._ops.OpOverload)
+            and target.overloadpacket in _TF32_OPS
+            and any(map(on_gpu_in_float32, pytree.tree_leaves((args, kwargs))))
+        ):
+            return super().call_function(target, args, kwargs)
+        args, kwargs = pytree.tree_map_only(
+            torch.Tensor,
+            lambda t: t.double() if on_gpu_in_float32(t) else t,
+            (args, kwargs),
+        )
+        return pytree.tree_map_only(
+            torch.Tensor,
+            torch.Tensor.float,
+            super().call_function(target, args, kwargs),
+        )
 
     def _deduce_value(self, node: torch.fx.Node) -> Any:
         # Readers of a constant often repeat the same op on it, such as one cast per

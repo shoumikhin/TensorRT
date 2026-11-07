@@ -2,8 +2,6 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import copy
-import threading
-import types
 import unittest
 from unittest import mock
 
@@ -16,9 +14,6 @@ from torch_tensorrt.dynamo.lowering.passes import (
     constant_folding,
 )
 from torch_tensorrt.dynamo.lowering.passes.constant_folding import constant_fold
-
-# PyTorch before 2.9, as on JetPack, has only the older allow_tf32 flags.
-_HAS_FP32_PRECISION = hasattr(torch.backends.cuda.matmul, "fp32_precision")
 
 
 class _Permute(torch.nn.Module):
@@ -136,7 +131,6 @@ class TestConstantFolding(TestCase):
         not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
         "TF32 needs an Ampere or newer GPU",
     )
-    @unittest.skipUnless(_HAS_FP32_PRECISION, "needs the fp32_precision flags")
     def test_float32_folds_follow_disable_tf32(self):
         class Model(torch.nn.Module):
             def __init__(self):
@@ -145,9 +139,17 @@ class TestConstantFolding(TestCase):
                 self.proj = torch.nn.Conv2d(64, 96, 1)
                 self.register_buffer("table", torch.randn(32, 64))
                 self.register_buffer("mix", torch.randn(64, 32))
+                self.pair = torch.nn.Bilinear(64, 64, 32)
+                self.register_buffer("left", torch.randn(1, 64))
+                self.register_buffer("right", torch.randn(1, 64))
 
             def forward(self, x):
-                return x + self.proj(self.position) + self.table @ self.mix
+                return (
+                    x
+                    + self.proj(self.position)
+                    + self.table @ self.mix
+                    + self.pair(self.left, self.right)
+                )
 
         torch.manual_seed(0)
         model = Model().cuda().eval()
@@ -158,28 +160,51 @@ class TestConstantFolding(TestCase):
             model.proj.bias.double(),
         )
         expected_matmul = model.table.double() @ model.mix.double()
-        conv, matmul = torch.backends.cudnn.conv, torch.backends.cuda.matmul
-        saved = conv.fp32_precision, matmul.fp32_precision
+        expected_bilinear = torch.nn.functional.bilinear(
+            model.left.double(),
+            model.right.double(),
+            model.pair.weight.double(),
+            model.pair.bias.double(),
+        )
+        cudnn, matmul = torch.backends.cudnn, torch.backends.cuda.matmul
+        saved = matmul.allow_tf32, getattr(matmul, "fp32_precision", None)
+        run_node = constant_folding._TorchTensorRTConstantFolder.run_node
+        flags_during_fold = set()
+
+        def record_flags(folder, node):
+            flags_during_fold.add((cudnn.allow_tf32, matmul.allow_tf32))
+            return run_node(folder, node)
+
         for disable_tf32 in (True, False):
             with self.subTest(disable_tf32=disable_tf32):
-                conv.fp32_precision = matmul.fp32_precision = "tf32"
+                matmul.allow_tf32 = True
+                flags_during_fold.clear()
                 try:
-                    with mock.patch.object(
-                        constant_folding,
-                        "_ieee_float32",
-                        wraps=constant_folding._ieee_float32,
-                    ) as ieee_float32:
+                    # The test harness lets cuDNN flags change only through flags().
+                    with (
+                        cudnn.flags(enabled=True, allow_tf32=True),
+                        mock.patch.object(
+                            constant_folding._TorchTensorRTConstantFolder,
+                            "run_node",
+                            autospec=True,
+                            side_effect=record_flags,
+                        ),
+                    ):
                         gm = constant_fold(
                             torch.export.export(model, (example_input,)).module(),
                             CompilationSettings(disable_tf32=disable_tf32),
                         )
-                    # With TF32 allowed, folding keeps the caller's settings.
-                    self.assertEqual(ieee_float32.called, disable_tf32)
-                    self.assertEqual(
-                        (conv.fp32_precision, matmul.fp32_precision), ("tf32", "tf32")
-                    )
+                        # The flags are shared by every thread, so folding never
+                        # changes them.
+                        self.assertEqual(flags_during_fold, {(True, True)})
+                        self.assertEqual(
+                            (cudnn.allow_tf32, matmul.allow_tf32), (True, True)
+                        )
                 finally:
-                    conv.fp32_precision, matmul.fp32_precision = saved
+                    matmul.allow_tf32 = saved[0]
+                    # PyTorch 2.9 and newer also check that a test leaves this flag as it was.
+                    if saved[1] is not None:
+                        matmul.fp32_precision = saved[1]
                 if not disable_tf32:
                     continue
                 folded = {
@@ -187,74 +212,29 @@ class TestConstantFolding(TestCase):
                     for n, p in gm.named_parameters()
                     if n.startswith("_frozen_param")
                 }
-                for expected in (expected_conv, expected_matmul):
+                for expected in (expected_conv, expected_matmul, expected_bilinear):
                     error = (folded[tuple(expected.shape)].double() - expected).abs()
                     self.assertLess(error.max().item(), 1e-5)
 
-    def test_float32_folding_works_without_fp32_precision(self):
-        # As before PyTorch 2.9: no fp32_precision flags, and matmul.allow_tf32 reads True for
-        # both "high" and "medium" and sets "high".
-        state = {"matmul": "medium"}
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
+    def test_float64_folds_keep_float64_with_disable_tf32(self):
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("table", torch.randn(8, 4, dtype=torch.float64))
+                self.register_buffer("mix", torch.randn(4, 8, dtype=torch.float64))
 
-        class LegacyMatmul:
-            @property
-            def allow_tf32(self):
-                return state["matmul"] != "highest"
+            def forward(self, x):
+                return x + self.table @ self.mix
 
-            @allow_tf32.setter
-            def allow_tf32(self, value):
-                state["matmul"] = "high" if value else "highest"
-
-        cudnn = types.SimpleNamespace(allow_tf32=True)
-        with (
-            mock.patch.object(torch.backends, "cudnn", cudnn),
-            mock.patch.object(torch.backends.cuda, "matmul", LegacyMatmul()),
-            mock.patch.object(
-                torch, "get_float32_matmul_precision", lambda: state["matmul"]
-            ),
-            mock.patch.object(
-                torch, "set_float32_matmul_precision", lambda p: state.update(matmul=p)
-            ),
-        ):
-            with constant_folding._ieee_float32():
-                self.assertEqual(
-                    (cudnn.allow_tf32, state["matmul"]), (False, "highest")
-                )
-        self.assertEqual((cudnn.allow_tf32, state["matmul"]), (True, "medium"))
-
-    @unittest.skipUnless(_HAS_FP32_PRECISION, "needs the fp32_precision flags")
-    def test_overlapping_float32_folds_wait_for_each_other(self):
-        conv, matmul = torch.backends.cudnn.conv, torch.backends.cuda.matmul
-        saved = conv.fp32_precision, matmul.fp32_precision
-        inside, release = threading.Event(), threading.Event()
-
-        def first():
-            with constant_folding._ieee_float32():
-                inside.set()
-                release.wait(10)
-
-        def second():
-            with constant_folding._ieee_float32():
-                pass
-
-        threads = [threading.Thread(target=first), threading.Thread(target=second)]
-        conv.fp32_precision = matmul.fp32_precision = "tf32"
-        try:
-            threads[0].start()
-            inside.wait(10)
-            threads[1].start()
-            threads[1].join(0.5)
-            # The second fold must not start while the first one holds the flags.
-            self.assertTrue(threads[1].is_alive())
-            release.set()
-            for t in threads:
-                t.join(10)
-            self.assertEqual(
-                (conv.fp32_precision, matmul.fp32_precision), ("tf32", "tf32")
-            )
-        finally:
-            release.set()
-            conv.fp32_precision, matmul.fp32_precision = saved
+        model = Model().cuda().eval()
+        example_input = torch.randn(8, 8, device="cuda", dtype=torch.float64)
+        gm = constant_fold(
+            torch.export.export(model, (example_input,)).module(),
+            CompilationSettings(disable_tf32=True),
+        )
+        folded = [p for n, p in gm.named_parameters() if n.startswith("_frozen_param")]
+        self.assertEqual([p.dtype for p in folded], [torch.float64])
 
     def test_only_converter_safe_aliased_ops_skip_install(self):
         permute_gm = self._export_and_fold(_Permute(), torch.randn(1, 513, 512))
