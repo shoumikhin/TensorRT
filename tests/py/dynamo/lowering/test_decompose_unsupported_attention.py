@@ -223,6 +223,97 @@ class TestDecomposeUnsupportedAttention(TestCase):
             trt_model(*inputs), model(*inputs), rtol=1e-2, atol=1e-2
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "builds a TensorRT engine")
+    def test_decomposed_attention_gets_its_bool_mask_in_its_own_engine(self):
+        # When the decomposed nodes carried the trace's tensor_meta, the first engine computed the
+        # float bias from the mask and passed it, with scalars, to the attention's engine.
+        import torch_tensorrt
+
+        class Attention(nn.Module):
+            def forward(self, q, k, v, mask):
+                return torch.nn.functional.scaled_dot_product_attention(
+                    (q + 1) * 2, k, v, attn_mask=mask
+                )
+
+        # K and V head dims differ, so the attention is decomposed.
+        inputs = [
+            torch.randn(1, 2, 1, 64, device="cuda", dtype=torch.float16),
+            torch.randn(1, 2, 16, 64, device="cuda", dtype=torch.float16),
+            torch.randn(1, 2, 16, 32, device="cuda", dtype=torch.float16),
+            torch.rand(1, 2, 1, 16, device="cuda") > 0.3,
+        ]
+        model = Attention()
+        trt_model = torch_tensorrt.dynamo.compile(
+            torch.export.export(model, tuple(inputs)),
+            arg_inputs=inputs,
+            min_block_size=1,
+            # Puts q + 1 in an engine before the attention.
+            torch_executed_ops={torch.ops.aten.mul.Tensor},
+            cache_built_engines=False,
+            reuse_cached_engines=False,
+        )
+        engines = []
+        for name, engine in trt_model.named_children():
+            if "_run_on_acc" in name:
+                engine.register_forward_hook(
+                    lambda _, args, out: engines.append(
+                        (
+                            [arg.dtype for arg in args],
+                            len(out) if isinstance(out, (list, tuple)) else 1,
+                        )
+                    )
+                )
+        torch.testing.assert_close(
+            trt_model(*inputs), model(*inputs), rtol=1e-2, atol=1e-2
+        )
+        self.assertEqual(
+            engines,
+            [([torch.float16], 1), ([torch.bool] + [torch.float16] * 3, 1)],
+        )
+
+    @unittest.skipIf(not torch.cuda.is_available(), "builds a TensorRT engine")
+    def test_reader_of_decomposed_attention_in_pytorch_leaves_attention_in_tensorrt(
+        self,
+    ):
+        # The decomposed nodes carry no tensor_meta. A reader of their output that runs in
+        # PyTorch must not take the attention with it.
+        import torch_tensorrt
+
+        class Attention(nn.Module):
+            def forward(self, q, k, v, mask):
+                out = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, attn_mask=mask
+                )
+                return torch.abs(out) + 1
+
+        # K and V head dims differ, so the attention is decomposed.
+        inputs = [
+            torch.randn(1, 2, 4, 64, device="cuda", dtype=torch.float16),
+            torch.randn(1, 2, 16, 64, device="cuda", dtype=torch.float16),
+            torch.randn(1, 2, 16, 32, device="cuda", dtype=torch.float16),
+            torch.rand(1, 2, 4, 16, device="cuda") > 0.3,
+        ]
+        model = Attention()
+        trt_model = torch_tensorrt.dynamo.compile(
+            torch.export.export(model, tuple(inputs)),
+            arg_inputs=inputs,
+            min_block_size=1,
+            torch_executed_ops={torch.ops.aten.abs.default},
+            cache_built_engines=False,
+            reuse_cached_engines=False,
+        )
+        in_pytorch = [
+            node.target
+            for name, sub in trt_model.named_children()
+            if "_run_on_gpu" in name
+            for node in sub.graph.nodes
+            if node.op == "call_function"
+        ]
+        self.assertEqual(in_pytorch, [torch.ops.aten.abs.default])
+        torch.testing.assert_close(
+            trt_model(*inputs), model(*inputs), rtol=1e-2, atol=1e-2
+        )
+
     def test_attention_on_inputs_cast_to_fp32_is_decomposed_where_tensorrt_fails(self):
         # TensorRT folds the casts into its attention layer and builds only when the whole layer can run in
         # one 16-bit type: all inputs folded (the query only with a given scale), no float mask, result cast back.
