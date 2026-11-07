@@ -1207,6 +1207,71 @@ def test_autocast_keeps_tiny_constants_nonzero():
 @pytest.mark.unit
 @pytest.mark.critical
 @pytest.mark.parametrize(
+    "divide",
+    [
+        lambda x, n: x / (n + 1e-12),
+        lambda x, n: x / (n - -1e-12),
+        lambda x, n: x / (1e-12 - -n),
+        lambda x, n: x / n.clamp(1e-12, 1e4),
+        lambda x, n: x / -(-n).clamp(-1e4, -1e-12),
+        lambda x, n: x / -(-n).clamp_max(-1e-12),
+    ],
+    ids=["add", "sub", "rsub", "clamp_min_bound", "clamp_max_bound", "clamp_max"],
+)
+def test_autocast_keeps_tiny_epsilons_nonzero(divide):
+    class Model(nn.Module):
+        def forward(self, x):
+            return divide(x, x.abs().sum(-1, keepdim=True))
+
+    model = Model().cuda().eval()
+    x = torch.randn(4, 16, device="cuda")
+    x[0] = 0
+    trt_model = torch_tensorrt.dynamo.compile(
+        torch.export.export(model, (x,)),
+        arg_inputs=[x],
+        min_block_size=1,
+        enable_autocast=True,
+        autocast_low_precision_type=torch.float16,
+        autocast_calibration_dataloader=torch.utils.data.DataLoader(
+            [(x,)], batch_size=None
+        ),
+    )
+    torch.testing.assert_close(trt_model(x).float(), model(x), rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.unit
+@pytest.mark.critical
+@pytest.mark.parametrize("calibrate", [True, False], ids=["calib", "no_calib"])
+def test_autocast_leaves_tiny_constants_alone_in_float32(calibrate):
+    class Model(nn.Module):
+        def forward(self, x, mask):
+            # mask + 1e-12 stays float32, so the comparison must still see 1e-12.
+            return x * ((mask + 1e-12) > 1e-10).float()
+
+    model = Model().cuda().eval()
+    inputs = (
+        torch.ones(4, device="cuda"),
+        torch.tensor([False, True, False, True], device="cuda"),
+    )
+    settings = {}
+    if calibrate:
+        settings["autocast_calibration_dataloader"] = torch.utils.data.DataLoader(
+            [inputs], batch_size=None
+        )
+    trt_model = torch_tensorrt.dynamo.compile(
+        torch.export.export(model, inputs),
+        arg_inputs=list(inputs),
+        min_block_size=1,
+        enable_autocast=True,
+        autocast_low_precision_type=torch.float16,
+        **settings,
+    )
+    torch.testing.assert_close(trt_model(*inputs).float(), model(*inputs))
+
+
+@pytest.mark.unit
+@pytest.mark.critical
+@pytest.mark.parametrize(
     "scale",
     [lambda y: y * 1e-12, lambda y: y / 1e12],
     ids=["mul", "div"],

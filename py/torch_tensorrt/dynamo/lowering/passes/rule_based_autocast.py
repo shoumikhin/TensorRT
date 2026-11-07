@@ -285,14 +285,14 @@ def rule_based_autocast(
             else:
                 continue
             _cast_tensor_args_to_dtype(node, target_dtype)
-            if target_dtype == autocast_low_precision_type:
-                _keep_tiny_constants_nonzero(node, target_dtype)
             if any(
                 getattr(n.meta.get("val"), "dtype", None) == target_dtype
                 for n in node.all_input_nodes
             ):
                 # With only bool inputs, mask * 0.5 still makes float32.
                 node.meta["val"] = _retype_tensors(node.meta["val"], target_dtype)
+                if target_dtype == autocast_low_precision_type:
+                    _keep_tiny_constants_nonzero(node, target_dtype)
 
     gm = clean_up_graph_after_modifications(gm)
     logger.debug("Graph after Autocast based on the rules:\n%s", gm.graph)
