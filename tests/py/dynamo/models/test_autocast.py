@@ -574,6 +574,26 @@ def test_autocast_calibrates_a_cpu_program_with_a_bool_mask():
 
 
 @pytest.mark.unit
+def test_autocast_calibrates_a_list_output_on_two_devices():
+    class Model(nn.Module):
+        def forward(self, x, y):
+            a, b = torch._foreach_add([x, y], 2.0)
+            return a * 3.0, b * 3.0
+
+    # One tensor of the list is on the GPU, the other on the CPU.
+    inputs = (torch.randn(2, 4, device="cuda"), torch.randn(2, 4))
+    settings = CompilationSettings(
+        enable_autocast=True,
+        autocast_low_precision_type=torch.float16,
+        autocast_calibration_dataloader=torch.utils.data.DataLoader(
+            [inputs], batch_size=None
+        ),
+    )
+    pre_export_lowering(torch.export.export(Model().eval(), inputs), settings)
+    assert settings._autocast_calibrated_high_precision_nodes is not None
+
+
+@pytest.mark.unit
 def test_autocast_depth_of_reduction_reads_a_recorded_convolution_weight():
     class Model(nn.Module):
         def __init__(self):
