@@ -250,7 +250,18 @@ def batch_norm(
                 input_dtype
             )
             if fixed_weights:
-                normalize_in_float32 = not (
+                # Rounding the scale adds |x - mean| * |scale error| to the output. An
+                # input at 0 or within 6 standard deviations of the mean is at most
+                # |mean| + 6 * std from it. A normal float16 scale keeps that error below
+                # a float16 step of the output there, a subnormal one may not.
+                finfo = torch.finfo(input_dtype)
+                spread = running_mean.float().abs() + 6 * running_var.float().sqrt()
+                scale_error = spread * (input_scale.float() - adjusted_scale).abs()
+                step = torch.clamp(
+                    finfo.eps * (spread * adjusted_scale.abs() + bias.float().abs()),
+                    min=finfo.tiny * finfo.eps,
+                )
+                normalize_in_float32 = bool((scale_error > step).any()) or not (
                     input_scale.isfinite().all() and input_bias.isfinite().all()
                 )
             else:
