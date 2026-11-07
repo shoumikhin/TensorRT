@@ -90,28 +90,22 @@ inline constexpr char kSharedEnginesKey[] = "use_shared_engines";
  * b"0", overrides the process default, which is false unless set. Any other
  * compile spec value, or the key twice, fails the load. Engines with aliased
  * outputs, GPUs without stream-ordered memory, and drivers older than CUDA 12.5
- * keep ordinary enqueueV3. An engine on the shared activation scratch pool drops
- * its recorded graph whenever the pool hands it a different buffer. Caller
- * streams in the current ordinary context can replay, as can a call with no
- * caller stream. A green context stream of the engine's device records and
- * replays in its own context while no regular context other than the device's
- * primary one is current. Kernels that TensorRT runs on auxiliary streams it
- * creates itself can still run outside the green context; an engine built with
- * max_aux_streams=0 has none. Up to 4 green contexts keep a graph each, until the
- * engine is destroyed or a newer green context takes the place of the one
- * called longest ago. A green context may be destroyed first: its graph is then
- * only freed, never replayed. A stream of another device
- * fails, and so does one of another regular context, unless that context is
- * current and a graph recorded in the engine's own context replays on it. On
- * other buffers than that graph's, the engine records again in its own context,
- * on buffers of its own; when that recording cannot go ahead, the call fails and
- * the engine keeps the graph of its own calls, unless the call brought new
- * shapes. An engine on the shared activation scratch pool fails on a stream of
- * another device or of another regular context before it sets its shapes or
- * claims the pool, since the pool belongs to the engine's device and context.
- * Other streams take the
- * ordinary path, and the graphs are kept unless the scratch buffer, the shapes,
- * or the optimization profile changed.
+ * keep ordinary enqueueV3. A replay reads and writes the buffers it was recorded
+ * on, so keep each input and output in the same device buffer from call to call,
+ * and replays copy nothing. When the buffers move, that call records again on
+ * the new ones. When they move a second time for the same shapes, the engine
+ * records on buffers of its own and copies the inputs in and the outputs out on
+ * every call, until the shapes or the optimization profile change. Host buffers
+ * on a GPU that does not read host memory directly, buffers off a 256-byte
+ * boundary, and inputs that are not row-major are still copied on every call.
+ * An engine on the shared activation scratch pool records again whenever the
+ * pool hands it a different buffer. Streams of the current regular context,
+ * green context streams of the engine's device, and calls with no caller stream
+ * replay; the backend README covers the green context and other regular context
+ * cases. A stream of another device fails. An engine on the shared activation
+ * scratch pool also fails on a stream of another regular context, before it sets
+ * its shapes or claims the pool, since the pool belongs to the engine's device
+ * and context.
  */
 inline constexpr char kCudaGraphsKey[] = "use_cuda_graphs";
 
