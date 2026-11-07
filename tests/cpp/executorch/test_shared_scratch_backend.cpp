@@ -1914,8 +1914,8 @@ TEST_F(SharedScratchBackendTest, ARefusedPooledCallLeavesTheCallersPendingCudaEr
 //
 // The first run leaves the pool holding a buffer with an enqueue recorded against
 // it, so the handoff wait the refusal protects is one the run below would really
-// have made. That wait is a cudaStreamWaitEvent on an event recorded outside the
-// capture, which invalidates it under every capture mode.
+// have made. That wait includes a cudaStreamWaitEvent on an event recorded outside
+// the capture, which invalidates it under every capture mode.
 TEST_F(SharedScratchBackendTest, APooledEngineRefusesACaptureBeforeAnythingCanInvalidateIt) {
   ASSERT_EQ(set_shared_scratch(backend_, true), Error::Ok);
 
