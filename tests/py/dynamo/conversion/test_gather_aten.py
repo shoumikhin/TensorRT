@@ -76,6 +76,23 @@ class TestGatherValueConverter(DispatchTestCase):
         inputs = [input, index]
         self.run_test(TestModule(), inputs)
 
+    def test_gather_of_0d_tensor(self):
+        # x[0, 0] * 1.0 and i[0, 0] * 0 are 0-d, and so is the gathered element.
+        class TestModule(torch.nn.Module):
+            def forward(self, x, i):
+                def first(t):
+                    return torch.ops.aten.select.int(
+                        torch.ops.aten.select.int(t, 0, 0), 0, 0
+                    )
+
+                value = torch.ops.aten.mul.Tensor(first(x), 1.0)
+                index = torch.ops.aten.mul.Tensor(first(i), 0)
+                return torch.ops.aten.gather.default(value, 0, index)
+
+        self.run_test(
+            TestModule(), [torch.randn(2, 3), torch.zeros(1, 1, dtype=torch.int64)]
+        )
+
     @parameterized.expand(
         [
             ("positive_dim", 1),

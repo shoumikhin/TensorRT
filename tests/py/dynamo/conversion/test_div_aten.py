@@ -298,6 +298,27 @@ class TestDivConverter(DispatchTestCase):
         inputs = [torch.randint(0, 256, (2, 8), dtype=torch.int32)]
         self.run_test(HalfScale(), inputs, use_dynamo_tracer=True, enable_passes=True)
 
+    @parameterized.expand(
+        [
+            (
+                "trunc_div",
+                lambda x: torch.ops.aten.div.Tensor_mode(x, 2.0, rounding_mode="trunc"),
+            ),
+            ("fmod", lambda x: torch.ops.aten.fmod.Scalar(x, 2.0)),
+            ("remainder", lambda x: torch.ops.aten.remainder.Scalar(x, 2.0)),
+        ]
+    )
+    def test_trunc_division_of_0d_tensor_by_scalar_stays_0d(self, _, compute):
+        # fmod and remainder use the same truncating division as rounding_mode="trunc".
+        class Div(nn.Module):
+            def forward(self, x):
+                return compute(torch.ops.aten.select.int(x, 0, 0))
+
+        self.run_test(
+            Div(),
+            [torch.randn(4) * 10],
+        )
+
 
 if __name__ == "__main__":
     run_tests()

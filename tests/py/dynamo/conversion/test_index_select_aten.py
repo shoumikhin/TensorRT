@@ -137,6 +137,18 @@ class TestIndexSelectConverter(DispatchTestCase):
                     check_dtype=True,
                 )
 
+    def test_index_select_with_0d_index(self):
+        # i[0] + 1 is 0-d, and PyTorch keeps the selected dim with size 1.
+        class TestIndexSelect(nn.Module):
+            def forward(self, y, i):
+                index = torch.ops.aten.add.Tensor(torch.ops.aten.select.int(i, 0, 0), 1)
+                return torch.ops.aten.index_select.default(y, 0, index)
+
+        self.run_test(
+            TestIndexSelect(),
+            [torch.randn(8, 3), torch.tensor([2, 5], dtype=torch.int32)],
+        )
+
 
 if __name__ == "__main__":
     run_tests()

@@ -533,6 +533,12 @@ def index_select(
 ) -> ITensor:
     # The axis parameter specifies the dimension along which to index.
     dim = get_positive_dim(dim, len(input.shape))
+    # PyTorch reads a 0-d index as one element and keeps the dim, which a 0-d gather
+    # index would drop.
+    if len(index.shape) == 0:
+        index = impl.shuffle.reshape(
+            ctx, target, source_ir, f"{name}_index_1d", index, (1,)
+        )
     gather_layer = ctx.net.add_gather(input, index, axis=dim)
 
     set_layer_name(gather_layer, target, f"{name}_gather_layer_default", source_ir)
@@ -612,10 +618,22 @@ def gather(
     # Note: TensorRT's Gather layer supports both int32 and int64 indices
     # https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/c-api/classnvinfer1_1_1_i_gather_layer.html
     index = get_trt_tensor(ctx, index, name + "_index_tensor")
+    index_shape = tuple(index.shape)
+    # TensorRT gathers elements only from a tensor of rank 1 or more.
+    scalar_input = len(input_shape) == 0
+    if scalar_input:
+        input = impl.shuffle.reshape(ctx, target, source_ir, f"{name}_1d", input, (1,))
+        index = impl.shuffle.reshape(
+            ctx, target, source_ir, f"{name}_index_1d", index, (1,)
+        )
     gather_layer = ctx.net.add_gather(input, index, axis=dim)
     gather_layer.mode = trt.GatherMode.ELEMENT
     set_layer_name(gather_layer, target, name + "_gather_layer_element", source_ir)
     out = gather_layer.get_output(0)
+    if scalar_input:
+        out = impl.shuffle.reshape(
+            ctx, target, source_ir, f"{name}_output", out, index_shape
+        )
     return out
 
 

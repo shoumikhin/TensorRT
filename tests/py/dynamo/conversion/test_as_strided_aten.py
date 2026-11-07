@@ -87,6 +87,17 @@ class TestAsStridedConverter(DispatchTestCase):
             inputs,
         )
 
+    def test_as_strided_of_0d_tensor(self):
+        class TestModule(torch.nn.Module):
+            def forward(self, x):
+                y = torch.ops.aten.mul.Tensor(torch.ops.aten.select.int(x, 0, 0), 2.0)
+                return torch.ops.aten.as_strided.default(y, (1,), (1,))
+
+        self.run_test(
+            TestModule(),
+            [torch.randn(4)],
+        )
+
 
 if __name__ == "__main__":
     run_tests()

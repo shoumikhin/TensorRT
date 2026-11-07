@@ -71,15 +71,17 @@ def trunc_div(
         prod_output,
     )
 
-    # Convert constant input into ITensor for UnaryOperation
+    # Convert constant input into ITensor for UnaryOperation. A scalar stays 0-d, so a 0-d
+    # tensor does not gain a dim.
     if not isinstance(input, trt.tensorrt.ITensor):
-        input = get_trt_tensor(ctx, input, f"{name}_input")
+        input = get_trt_tensor(ctx, input, f"{name}_input", min_rank=0)
     if not isinstance(other, trt.tensorrt.ITensor):
         other = get_trt_tensor(
             ctx,
             other,
             f"{name}_other",
             dtype=_enums.dtype._from(input.dtype).to(torch.dtype),
+            min_rank=0,
         )
 
     abs_input_output = convert_unary(
@@ -269,8 +271,6 @@ def atan2(
 
     trt_promoted_type = promoted_type.to(trt.DataType)
 
-    pi_tensor = get_trt_tensor(ctx, pi_value, f"{name}_pi", dtype=trt_promoted_type)
-
     if input.dtype != trt_promoted_type:
         input = cast_trt_tensor(ctx, input, trt_promoted_type, f"{name}_input_casted")
     if other.dtype != trt_promoted_type:
@@ -296,14 +296,10 @@ def atan2(
     atan_val = atan(ctx, target, source_ir, f"{name}_atan", input_div_other)
 
     # atan(x/y)+π if x≥0 and y<0,
-    atan_add_pi = add(
-        ctx, target, source_ir, f"{name}_atan_add_pi", atan_val, pi_tensor
-    )
+    atan_add_pi = add(ctx, target, source_ir, f"{name}_atan_add_pi", atan_val, pi_value)
 
     # atan(x/y)-π if x<0 and y<0,
-    atan_sub_pi = sub(
-        ctx, target, source_ir, f"{name}_atan_sub_pi", atan_val, pi_tensor
-    )
+    atan_sub_pi = sub(ctx, target, source_ir, f"{name}_atan_sub_pi", atan_val, pi_value)
 
     # atan(x/y)+π if x≥0 and y<0,
     atan_corrected = impl.condition.select(

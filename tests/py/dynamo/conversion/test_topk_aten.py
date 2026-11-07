@@ -40,6 +40,18 @@ class TestSortConverter(DispatchTestCase):
             enable_passes=True,
         )
 
+    def test_topk_of_0d_tensor(self):
+        # x[0] * 2.0 is 0-d, and so are its top value and its index.
+        class Topk(nn.Module):
+            def forward(self, x):
+                y = torch.ops.aten.mul.Tensor(torch.ops.aten.select.int(x, 0, 0), 2.0)
+                return torch.ops.aten.topk.default(y, 1)
+
+        self.run_test(
+            Topk(),
+            [torch.randn(4)],
+        )
+
 
 if __name__ == "__main__":
     run_tests()
