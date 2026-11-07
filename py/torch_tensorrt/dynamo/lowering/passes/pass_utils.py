@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Sequence, Tuple
 
 import torch
 from torch_tensorrt.dynamo.utils import COMPLEX_DTYPES
@@ -154,11 +154,19 @@ def is_node_complex(node: Any, complexNodes: Dict[str, bool]) -> bool:
     return False
 
 
+def _largest_magnitude(value: torch.Tensor) -> float:
+    # A bool mask cannot leave the low precision range, and abs() has no CPU kernel
+    # for bool.
+    if value.dtype == torch.bool or value.numel() == 0:
+        return float("-inf")
+    return float(value.abs().nan_to_num(nan=0.0).amax())
+
+
 def trace_intermediate_node_outputs(
     gm: torch.fx.GraphModule,
     calibration_dataloader: torch.utils.data.DataLoader,
     excluded_ops: Sequence[torch.fx.node.Target] = [],
-) -> Dict[str, torch.Tensor]:
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Size]]:
     """Trace the intermediate node outputs of a graph module.
 
     Args:
@@ -167,10 +175,12 @@ def trace_intermediate_node_outputs(
         excluded_ops (Set[torch.fx.node.Target]): The set of ATen ops that should be excluded from the trace. For example, `{torch.ops.higher_order.wrap_with_autocast}`. Default is an empty set.
 
     Returns:
-        Dict[str, torch.Tensor]: A dictionary of intermediate node outputs. The key is the node name and the value is its output, joined across batches along the first dim. A list output is one flat tensor of its floating-point values, and a 0-dim output has one element per batch.
+        Tuple[Dict[str, torch.Tensor], Dict[str, torch.Size]]: Two dictionaries keyed by node name. The first holds the node's output for the calibration batch with the largest absolute value. A list output is one flat tensor of its floating-point values. The second holds the largest size each dim of the output had in any batch.
     """
 
     intermediate_node_outputs: Dict[str, torch.Tensor] = {}
+    largest_magnitudes: Dict[str, float] = {}
+    largest_shapes: Dict[str, torch.Size] = {}
 
     class IntermediateNodeTracer(torch.fx.Interpreter):  # type: ignore[misc]
         def run_node(self, n: torch.fx.Node) -> Any:
@@ -192,19 +202,21 @@ def trace_intermediate_node_outputs(
                     )
                 if not isinstance(value, torch.Tensor):
                     return out
-                # Batches are joined along the first dim, which a 0-dim value lacks.
-                if value.dim() == 0:
-                    value = value.reshape(1)
-                if n.name in intermediate_node_outputs:
-                    intermediate_node_outputs[n.name] = torch.cat(
-                        [intermediate_node_outputs[n.name], value], dim=0
-                    )
-                else:
+                # The range rule needs the batch with the largest value, and the depth
+                # rule the largest reduction, which another batch may have.
+                magnitude = _largest_magnitude(value)
+                if (
+                    n.name not in largest_magnitudes
+                    or magnitude > largest_magnitudes[n.name]
+                ):
                     intermediate_node_outputs[n.name] = value
+                    largest_magnitudes[n.name] = magnitude
+                shape = largest_shapes.get(n.name, value.shape)
+                largest_shapes[n.name] = torch.Size(map(max, shape, value.shape))
             return out
 
     if calibration_dataloader is not None:
         tracer = IntermediateNodeTracer(gm)
         for batch in calibration_dataloader:
             tracer.run(tuple(batch))
-    return intermediate_node_outputs
+    return intermediate_node_outputs, largest_shapes

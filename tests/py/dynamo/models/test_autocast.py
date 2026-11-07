@@ -524,7 +524,7 @@ def test_autocast_names_torch_cond_as_unsupported(calibrate):
 
 
 @pytest.mark.unit
-def test_autocast_calibration_joins_0_dim_values_across_batches():
+def test_autocast_calibrates_0_dim_values_across_batches():
     class Model(nn.Module):
         def __init__(self):
             super().__init__()
@@ -548,6 +548,99 @@ def test_autocast_calibration_joins_0_dim_values_across_batches():
         ),
     )
     torch.testing.assert_close(trt_model(x).float(), model(x), rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.unit
+def test_autocast_calibration_batches_may_differ_in_shape():
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(8, 4))
+
+        def forward(self, x):
+            # The length, dim 1 of x, varies between batches, and so does the shape
+            # of the max values. The matmul always reduces over 8 values.
+            peak = torch.max(x, dim=2).values
+            return peak, (x.amax(dim=(0, 1)) * 1e-3) @ self.weight
+
+    a, b = torch.randn(2, 3, 8, device="cuda"), torch.randn(2, 5, 8, device="cuda")
+    b[0, 0, 0] = 1000.0
+    settings = CompilationSettings(
+        enable_autocast=True,
+        autocast_low_precision_type=torch.float16,
+        autocast_max_depth_of_reduction=10,
+        autocast_calibration_dataloader=torch.utils.data.DataLoader(
+            [(a,), (a,), (b,)], batch_size=None
+        ),
+    )
+    exported = torch.export.export(
+        Model().cuda().eval(),
+        (a,),
+        dynamic_shapes=({1: torch.export.Dim("length", min=2, max=16)},),
+    )
+    pre_export_lowering(exported, settings)
+    high_precision_nodes = settings._autocast_calibrated_high_precision_nodes
+    assert "matmul" not in high_precision_nodes
+    # FX names the first max node max_1. Only the last batch holds a value out of
+    # the float16 range.
+    assert "max_1" in high_precision_nodes
+
+
+@pytest.mark.unit
+def test_autocast_depth_rule_reads_one_calibration_batch():
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(8, 4))
+
+        def forward(self, x):
+            # The matmul reduces over 8 values, whatever the number of batches.
+            return (x.amax(dim=(0, 1)) * 1e-3) @ self.weight
+
+    x = torch.randn(2, 3, 8, device="cuda")
+    settings = CompilationSettings(
+        enable_autocast=True,
+        autocast_low_precision_type=torch.float16,
+        autocast_max_depth_of_reduction=10,
+        autocast_calibration_dataloader=torch.utils.data.DataLoader(
+            [(x,), (x,)], batch_size=None
+        ),
+    )
+    pre_export_lowering(torch.export.export(Model().cuda().eval(), (x,)), settings)
+    assert "matmul" not in settings._autocast_calibrated_high_precision_nodes
+
+
+@pytest.mark.unit
+def test_autocast_depth_rule_sees_the_longest_calibration_batch():
+    class Attention(nn.Module):
+        def forward(self, q, k, v):
+            # The second matmul reduces over the sequence length.
+            return torch.softmax(q @ k.transpose(-1, -2), dim=-1) @ v
+
+    def batch(length, scale):
+        q = torch.randn(1, length, 8, device="cuda") * scale
+        return q, torch.randn(1, length, 8, device="cuda"), torch.randn_like(q)
+
+    # The short batch has the larger probabilities, the long one the deeper reduction.
+    short, long = batch(4, 3.0), batch(32, 0.01)
+    settings = CompilationSettings(
+        enable_autocast=True,
+        autocast_low_precision_type=torch.float16,
+        autocast_max_depth_of_reduction=16,
+        autocast_calibration_dataloader=torch.utils.data.DataLoader(
+            [long, short], batch_size=None
+        ),
+    )
+    length = torch.export.Dim("length", min=2, max=64)
+    exported = torch.export.export(
+        Attention().cuda().eval(),
+        short,
+        dynamic_shapes=({1: length}, {1: length}, {1: length}),
+    )
+    pre_export_lowering(exported, settings)
+    high_precision_nodes = settings._autocast_calibrated_high_precision_nodes
+    assert "matmul" not in high_precision_nodes
+    assert "matmul_1" in high_precision_nodes
 
 
 @pytest.mark.unit

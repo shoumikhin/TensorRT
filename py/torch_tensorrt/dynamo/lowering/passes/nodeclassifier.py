@@ -168,22 +168,20 @@ class DepthOfReductionRule(NodeRuleBase):
     Reduction ops are those that aggregate data across one or more axes, decreasing the dimensionality of the input tensor, such as convolution, gemm, etc.
     """
 
-    def __init__(self, max_depth_of_reduction, reference_data):
+    def __init__(self, max_depth_of_reduction, reference_shapes):
         """Initialize the rule.
 
         Args:
             max_depth_of_reduction: Maximum depth of reduction allowed in low precision.
-            reference_data: Reference data for checking I/O ranges.
+            reference_shapes: Largest size of each dim of each tensor in the reference data.
         """
         self.max_depth_of_reduction = max_depth_of_reduction
-        self.reference_data = reference_data
+        self.reference_shapes = reference_shapes
         self.reduction_depth = 0
 
     def _get_tensor_shape(self, tensor_name):
         """Get tensor shape from reference data."""
-        if tensor_name in self.reference_data:
-            return self.reference_data[tensor_name].shape
-        return None
+        return self.reference_shapes.get(tensor_name)
 
     def _log_skipped(self, node, **kwargs):
         """Log information about skipped nodes with depth of reduction violations."""
@@ -279,11 +277,12 @@ class NodeClassifier:
         self.max_output_threshold = max_output_threshold
         self.max_depth_of_reduction = max_depth_of_reduction
 
-    def _gen_block_node_rules(self, reference_data):
+    def _gen_block_node_rules(self, reference_data, reference_shapes):
         """Generate list of rules for blocking nodes from precision conversion.
 
         Args:
             reference_data: Reference data for checking I/O ranges.
+            reference_shapes: Largest size of each dim of each tensor in the reference data.
 
         Returns:
             list[NodeRuleBase]: List of rules to apply.
@@ -301,7 +300,7 @@ class NodeClassifier:
             block_node_rules.append(
                 DepthOfReductionRule(
                     self.max_depth_of_reduction,
-                    reference_data,
+                    reference_shapes,
                 )
             )
         if self.custom_rule:
@@ -309,17 +308,22 @@ class NodeClassifier:
         return block_node_rules
 
     def run(
-        self, ref_outputs_dict: Optional[dict[str, torch.Tensor]] = None
+        self,
+        ref_outputs_dict: Optional[dict[str, torch.Tensor]] = None,
+        ref_shapes_dict: Optional[dict[str, torch.Size]] = None,
     ) -> tuple[list[str], list[str]]:
         """Run node classification.
 
         Args:
             ref_outputs_dict: Optional tensors' reference data.
+            ref_shapes_dict: Optional largest size of each dim of each reference tensor.
 
         Returns:
             tuple: Lists of node names (low_precision_nodes, high_precision_nodes).
         """
-        block_node_rules = self._gen_block_node_rules(ref_outputs_dict)
+        block_node_rules = self._gen_block_node_rules(
+            ref_outputs_dict, ref_shapes_dict or {}
+        )
         low_precision_nodes = []
         high_precision_nodes = []
         for node in self.nodes:

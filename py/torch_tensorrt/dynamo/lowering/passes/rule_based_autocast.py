@@ -130,8 +130,10 @@ def rule_based_autocast(
     autocast_max_output_threshold = settings.autocast_max_output_threshold
     autocast_max_depth_of_reduction = settings.autocast_max_depth_of_reduction
     # pre_export_lowering sets this on the settings; a caller that skips it has none.
-    reference_data: dict[str, torch.Tensor] = vars(settings).pop(
-        "autocast_intermediate_node_outputs", {}
+    reference_data: dict[str, torch.Tensor]
+    reference_shapes: dict[str, torch.Size]
+    reference_data, reference_shapes = vars(settings).pop(
+        "autocast_calibration_trace", ({}, {})
     )
     recorded_nodes = settings._autocast_calibrated_high_precision_nodes
     replay_rule = None
@@ -165,7 +167,9 @@ def rule_based_autocast(
         max_depth_of_reduction=autocast_max_depth_of_reduction,
         custom_rule=replay_rule,
     )
-    low_precision_nodes, high_precision_nodes = node_classifier.run(reference_data)
+    low_precision_nodes, high_precision_nodes = node_classifier.run(
+        reference_data, reference_shapes
+    )
     if reference_data:
         # A saved program drops the calibration data, so refit reuses this.
         settings._autocast_calibrated_high_precision_nodes = frozenset(
