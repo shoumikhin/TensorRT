@@ -17,6 +17,7 @@
 #include "torch_tensorrt/executorch/TensorRTBackend.h"
 
 #include <NvInfer.h>
+#include <cuda.h>
 
 #include <cstdint>
 #include <memory>
@@ -78,6 +79,9 @@ struct EngineHandle {
   std::vector<bool> input_is_alias_target;
   size_t num_aliased_outputs = 0;
   int device_id = 0;
+  // The regular CUDA context current when exec_ctx was created, which is where TensorRT runs this engine.
+  // The buffers execute() keeps across calls are allocated in it.
+  CUcontext context = nullptr;
   // Whether this device can reach pageable host memory through shared host page tables, which is the
   // question the uses of this flag ask. A discrete card answers no: it can reach pageable memory, but
   // only by faulting pages in one at a time, so it takes the staged-copy path instead.

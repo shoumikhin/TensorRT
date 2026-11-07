@@ -634,6 +634,10 @@ Error initialize_engine_io(EngineHandle& handle) {
   if (handle.exec_ctx == nullptr) {
     return report_load_error("create TensorRT execution context");
   }
+  static const auto get_current = driver_entry_point<PFN_cuCtxGetCurrent_v4000>("cuCtxGetCurrent", 4000);
+  if (get_current == nullptr || get_current(&handle.context) != CUDA_SUCCESS) {
+    handle.context = nullptr;
+  }
 
   if (handle.shared_scratch) {
     // Gated so a handle loaded with the option off pays no TensorRT call for a
@@ -789,6 +793,27 @@ constexpr uintptr_t kTensorAddressAlignment = 256;
 
 bool is_tensor_address_aligned(const void* ptr) {
   return reinterpret_cast<uintptr_t>(ptr) % kTensorAddressAlignment == 0;
+}
+
+// Grows one of the buffers execute() keeps across calls to at least `bytes`. It is allocated in the
+// engine's context: one allocated while a call from another regular context had that context current
+// would go away with that context and leave the engine's later calls copying into freed memory.
+cudaError_t grow_kept_buffer(const EngineHandle& engine, void*& buffer, size_t& capacity, size_t bytes) {
+  ContextScope scope(engine.context, engine.context != nullptr);
+  if (!scope.ok()) {
+    return cudaErrorDeviceUninitialized;
+  }
+  if (buffer != nullptr) {
+    cudaFree(buffer);
+  }
+  const cudaError_t error = cudaMalloc(&buffer, bytes);
+  if (error != cudaSuccess) {
+    buffer = nullptr;
+    capacity = 0;
+    return error;
+  }
+  capacity = bytes;
+  return cudaSuccess;
 }
 
 // Size-1 dims are skipped, since they move no element, and a tensor built without strides is row-major.
@@ -2045,12 +2070,9 @@ Error TensorRTBackend::execute(BackendExecutionContext& context, DelegateHandle*
 
     void* bind_ptr = nullptr;
     if (et_in.nbytes() == 0) {
-      if (engine->cached_input_sizes[i] == 0) {
-        cuda_err = cudaMalloc(&engine->cached_input_ptrs[i], 1);
-        if (cuda_err != cudaSuccess) {
-          return Error::MemoryAllocationFailed;
-        }
-        engine->cached_input_sizes[i] = 1;
+      if (engine->cached_input_sizes[i] == 0 &&
+          grow_kept_buffer(*engine, engine->cached_input_ptrs[i], engine->cached_input_sizes[i], 1) != cudaSuccess) {
+        return Error::MemoryAllocationFailed;
       }
       bind_ptr = engine->cached_input_ptrs[i];
     } else if (device_reachable && row_major && is_tensor_address_aligned(et_in.const_data_ptr())) {
@@ -2067,17 +2089,10 @@ Error TensorRTBackend::execute(BackendExecutionContext& context, DelegateHandle*
             name.c_str());
       }
       const size_t needed = et_in.nbytes();
-      if (needed > engine->cached_input_sizes[i]) {
-        if (engine->cached_input_ptrs[i] != nullptr) {
-          cudaFree(engine->cached_input_ptrs[i]);
-        }
-        cuda_err = cudaMalloc(&engine->cached_input_ptrs[i], needed);
-        if (cuda_err != cudaSuccess) {
-          engine->cached_input_ptrs[i] = nullptr;
-          engine->cached_input_sizes[i] = 0;
-          return Error::MemoryAllocationFailed;
-        }
-        engine->cached_input_sizes[i] = needed;
+      if (needed > engine->cached_input_sizes[i] &&
+          grow_kept_buffer(*engine, engine->cached_input_ptrs[i], engine->cached_input_sizes[i], needed) !=
+              cudaSuccess) {
+        return Error::MemoryAllocationFailed;
       }
       bind_ptr = engine->cached_input_ptrs[i];
       cuda_err = row_major ? cudaMemcpyAsync(bind_ptr, et_in.const_data_ptr(), needed, cudaMemcpyDefault, stream)
@@ -2272,12 +2287,9 @@ Error TensorRTBackend::execute(BackendExecutionContext& context, DelegateHandle*
     const bool device_reachable =
         et_out.nbytes() > 0 && (engine->pageable_host_access || output_placement.cuda_accessible);
     if (et_out.nbytes() == 0) {
-      if (engine->cached_output_sizes[o] == 0) {
-        cuda_err = cudaMalloc(&engine->cached_output_ptrs[o], 1);
-        if (cuda_err != cudaSuccess) {
-          return Error::MemoryAllocationFailed;
-        }
-        engine->cached_output_sizes[o] = 1;
+      if (engine->cached_output_sizes[o] == 0 &&
+          grow_kept_buffer(*engine, engine->cached_output_ptrs[o], engine->cached_output_sizes[o], 1) != cudaSuccess) {
+        return Error::MemoryAllocationFailed;
       }
       bind_ptr = engine->cached_output_ptrs[o];
     } else if (device_reachable && is_tensor_address_aligned(et_out.const_data_ptr())) {
@@ -2287,17 +2299,10 @@ Error TensorRTBackend::execute(BackendExecutionContext& context, DelegateHandle*
         report_unaligned(name, et_out.const_data_ptr());
       }
       const size_t needed = et_out.nbytes();
-      if (needed > engine->cached_output_sizes[o]) {
-        if (engine->cached_output_ptrs[o] != nullptr) {
-          cudaFree(engine->cached_output_ptrs[o]);
-        }
-        cuda_err = cudaMalloc(&engine->cached_output_ptrs[o], needed);
-        if (cuda_err != cudaSuccess) {
-          engine->cached_output_ptrs[o] = nullptr;
-          engine->cached_output_sizes[o] = 0;
-          return Error::MemoryAllocationFailed;
-        }
-        engine->cached_output_sizes[o] = needed;
+      if (needed > engine->cached_output_sizes[o] &&
+          grow_kept_buffer(*engine, engine->cached_output_ptrs[o], engine->cached_output_sizes[o], needed) !=
+              cudaSuccess) {
+        return Error::MemoryAllocationFailed;
       }
       bind_ptr = engine->cached_output_ptrs[o];
       outputs_needing_copy.push_back({arg_i, bind_ptr});

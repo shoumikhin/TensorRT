@@ -1676,6 +1676,85 @@ TEST_F(ExecutionGraphReplayTest, FailedRecordingsFromAnotherRegularContextLeaveT
   EXPECT_EQ(back.launches, std::vector<cudaStream_t>(3, streams_[0]));
 }
 
+// The delegate keeps the buffer it copies an unaligned input through for later calls, so it allocates it
+// in the engine's context even when a call from another regular context grows it. The engine's own
+// calls then keep working after that other context is destroyed.
+TEST_F(ExecutionGraphReplayTest, ABufferGrownByAnotherContextsCallOutlivesThatContext) {
+  const auto create_context = driver_entry<PFN_cuCtxCreate_v3020>("cuCtxCreate", 3020);
+  const auto destroy_context = driver_entry<PFN_cuCtxDestroy_v4000>("cuCtxDestroy", 4000);
+  const auto get_current = driver_entry<PFN_cuCtxGetCurrent_v4000>("cuCtxGetCurrent", 4000);
+  const auto set_current = driver_entry<PFN_cuCtxSetCurrent_v4000>("cuCtxSetCurrent", 4000);
+  const auto get_attribute = driver_entry<PFN_cuPointerGetAttribute_v4000>("cuPointerGetAttribute", 4000);
+  ASSERT_NE(create_context, nullptr);
+  ASSERT_NE(destroy_context, nullptr);
+  ASSERT_NE(get_current, nullptr);
+  ASSERT_NE(set_current, nullptr);
+  ASSERT_NE(get_attribute, nullptr);
+  int device = 0;
+  ASSERT_EQ(cudaGetDevice(&device), cudaSuccess);
+  CUcontext primary = nullptr;
+  CUcontext other = nullptr;
+  ASSERT_EQ(get_current(&primary), CUDA_SUCCESS);
+  ASSERT_EQ(create_context(&other, 0, device), CUDA_SUCCESS);
+  bool other_destroyed = false;
+  // Puts the primary context back and destroys the other one even when an assertion returns early.
+  std::unique_ptr<void, std::function<void(void*)>> restore(&primary, [&](void*) {
+    set_current(primary);
+    if (!other_destroyed) {
+      destroy_context(other);
+    }
+  });
+  cudaStream_t other_stream = nullptr;
+  ASSERT_EQ(cudaStreamCreate(&other_stream), cudaSuccess);
+  ASSERT_EQ(set_current(primary), CUDA_SUCCESS);
+  LoadedGraphEngine plain, graph;
+  ASSERT_NO_FATAL_FAILURE(load_pair(plain, graph));
+  for (int i = 0; i < 2; ++i) {
+    ASSERT_NO_FATAL_FAILURE(compare(plain, graph, 0, 2, 8, i, streams_[0]));
+  }
+  ASSERT_TRUE(graph.is_captured());
+  ASSERT_EQ(graph.handle()->cached_input_ptrs[0], nullptr);
+
+  // One float past a 256-byte boundary, so the delegate copies the input through a buffer of its own.
+  const size_t count = 16;
+  float* const unaligned = static_cast<float*>(inputs_[1]) + 1;
+  std::vector<float> input(count), actual(count);
+  for (size_t i = 0; i < count; ++i) {
+    input[i] = static_cast<float>(i);
+  }
+  ASSERT_EQ(cudaMemcpy(unaligned, input.data(), count * sizeof(float), cudaMemcpyHostToDevice), cudaSuccess);
+  ASSERT_EQ(set_current(other), CUDA_SUCCESS);
+  ASSERT_EQ(graph.run(unaligned, outputs_[1], 2, 8, other_stream), Error::Ok);
+  ASSERT_EQ(cudaStreamSynchronize(other_stream), cudaSuccess);
+  ASSERT_EQ(cudaStreamDestroy(other_stream), cudaSuccess);
+  void* const kept = graph.handle()->cached_input_ptrs[0];
+  ASSERT_NE(kept, nullptr);
+  CUcontext owner = nullptr;
+  ASSERT_EQ(get_attribute(&owner, CU_POINTER_ATTRIBUTE_CONTEXT, reinterpret_cast<CUdeviceptr>(kept)), CUDA_SUCCESS);
+  EXPECT_EQ(owner, primary) << "the kept input buffer belongs to the context of the call that grew it";
+  ASSERT_EQ(set_current(primary), CUDA_SUCCESS);
+  if (owner != primary) {
+    return;
+  }
+  ASSERT_EQ(destroy_context(other), CUDA_SUCCESS);
+  other_destroyed = true;
+
+  for (int i = 0; i < 2; ++i) {
+    for (size_t j = 0; j < count; ++j) {
+      input[j] = static_cast<float>(j + 100 * i);
+    }
+    ASSERT_EQ(cudaMemcpy(unaligned, input.data(), count * sizeof(float), cudaMemcpyHostToDevice), cudaSuccess);
+    ASSERT_EQ(cudaMemset(outputs_[1], 0xff, count * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(graph.run(unaligned, outputs_[1], 2, 8, streams_[0]), Error::Ok);
+    ASSERT_EQ(cudaStreamSynchronize(streams_[0]), cudaSuccess);
+    ASSERT_EQ(graph.handle()->cached_input_ptrs[0], kept);
+    ASSERT_EQ(cudaMemcpy(actual.data(), outputs_[1], count * sizeof(float), cudaMemcpyDeviceToHost), cudaSuccess);
+    for (size_t j = 0; j < count; ++j) {
+      ASSERT_FLOAT_EQ(actual[j], input[j] * 2.0f + 1.0f) << "call " << i << " element " << j;
+    }
+  }
+}
+
 // The shared scratch's completion event belongs to the engine's context, so a pooled engine refuses a
 // stream of another regular context before it runs, whether or not another thread holds the capture
 // lock, and the engine's own calls keep replaying their graph with no copies.
