@@ -51,6 +51,22 @@ _TORCH_FOLD_OPS: Dict[TRTElementWiseOp, Callable[[Any, Any], Any]] = {
     trt.ElementWiseOperation.XOR: torch.logical_xor,
 }
 
+# These ops make an int8 result only by adding, subtracting and multiplying, so their
+# result taken modulo 256 is exact even when it was computed in int32.
+_INT8_WRAPPING_OPS = {
+    torch.ops.aten.add,
+    torch.ops.aten.mul,
+    torch.ops.aten.sub,
+}
+
+
+def _is_int8_arithmetic(node: Any) -> bool:
+    return (
+        isinstance(node, torch.fx.Node)
+        and getattr(node.meta.get("val"), "dtype", None) == torch.int8
+        and getattr(node.target, "overloadpacket", None) in _INT8_WRAPPING_OPS
+    )
+
 
 def _fold_constants(
     trt_op: TRTElementWiseOp,
@@ -132,22 +148,6 @@ def convert_binary_elementwise(
         )
         return _fold_constants(op_type, lhs_val, rhs_val)
 
-    # TensorRT takes an INT8 constant only as quantized data, so int8 constants (and
-    # Python ints next to an int8 tensor) become int32 ones, and an int8 result made
-    # from one does not wrap around as in PyTorch until it is cast back to int8 at a
-    # graph output.
-    output = getattr(ctx.current_node, "meta", {}).get("val")
-    if getattr(output, "dtype", None) == torch.int8 and any(
-        (isinstance(v, torch.Tensor) and v.dtype == torch.int8)
-        or (isinstance(v, int) and not isinstance(v, bool))
-        for v in (lhs_val, rhs_val)
-    ):
-        logger.warning(
-            f"{name} computes an int8 result from an int8 constant in int32, so int8 "
-            "overflow does not wrap around as it does in PyTorch when the result feeds "
-            "other ops in the engine. An int8 graph output is cast back to int8 and wraps."
-        )
-
     # Wrap Python scalars using PyTorch's weak scalar-promotion rules. This
     # preserves low-precision floating-point tensors while allowing mixed
     # integer/float and bool/numeric expressions to promote when required.
@@ -189,6 +189,13 @@ def convert_binary_elementwise(
         )
     )
     trt_promoted_type = promoted_type.to(trt.DataType)
+
+    # Many TensorRT layers that read the result have no INT8 form, so int8 arithmetic
+    # runs in int32 and is wrapped to the int8 range below.
+    node = ctx.current_node
+    int8_arithmetic = _is_int8_arithmetic(node)
+    if int8_arithmetic and trt_promoted_type == trt.DataType.INT8:
+        trt_promoted_type = trt.DataType.INT32
 
     # TensorRT's elementwise layer only accepts bool operands for genuine
     # boolean logic ops (AND/OR/XOR). Two bool operands (e.g. mask * mask)
@@ -249,6 +256,34 @@ def convert_binary_elementwise(
         output = cast_trt_tensor(
             ctx, output, trt_promoted_type, f"{name}_cast_output", target, source_ir
         )
+
+    # Wrap the int32 result to the int8 range, as v - 256 * floor((v + 128) / 256), so
+    # other ops read PyTorch's value. A chain of int8 arithmetic stays exact modulo 256
+    # even when int32 overflows, so only the value that leaves the chain is wrapped.
+    if (
+        int8_arithmetic
+        and output.dtype == trt.DataType.INT32
+        and not (node.users and all(map(_is_int8_arithmetic, node.users)))
+    ):
+        ones = [1] * len(output.shape)
+        c128 = get_trt_tensor(
+            ctx, torch.full(ones, 128, dtype=torch.int32), f"{name}_128"
+        )
+        c256 = get_trt_tensor(
+            ctx, torch.full(ones, 256, dtype=torch.int32), f"{name}_256"
+        )
+
+        def wrap_step(
+            lhs: TRTTensor, rhs: TRTTensor, op: TRTElementWiseOp, step: str
+        ) -> TRTTensor:
+            layer = ctx.net.add_elementwise(lhs, rhs, op)
+            set_layer_name(layer, target, f"{name}_wrap_{step}", source_ir)
+            return layer.get_output(0)
+
+        shifted = wrap_step(output, c128, trt.ElementWiseOperation.SUM, "shift")
+        laps = wrap_step(shifted, c256, trt.ElementWiseOperation.FLOOR_DIV, "laps")
+        excess = wrap_step(laps, c256, trt.ElementWiseOperation.PROD, "excess")
+        output = wrap_step(output, excess, trt.ElementWiseOperation.SUB, "int8")
     kind: str = str(target.__name__) if callable(target) else target
     output.name = output.name + "_" + kind
     return output
