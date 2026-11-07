@@ -791,6 +791,134 @@ class TestIndexPutConverter(DispatchTestCase):
                 )
                 torch.testing.assert_close(compiled(*inputs), model(*inputs))
 
+    def test_0d_mask_fills_everything_or_nothing(self):
+        # PyTorch runs index_put with a 0-d mask as masked_fill, so the value goes to every
+        # element when the mask is True and to none when it is False.
+        if ENABLED_FEATURES.tensorrt_rtx:
+            pytest.skip("Skipped on tensorrt_rtx due to nonzero not supported")
+
+        class Put(torch.nn.Module):
+            def forward(self, data, mask):
+                return torch.ops.aten.index_put.default(data, [mask], torch.tensor(7.0))
+
+        class PutWhenPositive(torch.nn.Module):
+            def forward(self, data, index):
+                return torch.ops.aten.index_put.default(
+                    data, [None, index > 0], torch.tensor(7.0)
+                )
+
+        # PyTorch fails inside index_put for values of more than one element, so these
+        # compare with input[mask] = values.
+        class PutRow(torch.nn.Module):
+            def forward(self, data, index, values):
+                return torch.ops.aten.index_put.default(data, [index > 0], values)
+
+        data = torch.arange(6.0, device="cuda").reshape(2, 3)
+        row = torch.arange(10.0, 13.0, device="cuda")
+        positive, negative = (torch.tensor(i, device="cuda") for i in (1, -1))
+        cases = [
+            (Put(), (data, torch.tensor(True, device="cuda")), None),
+            (Put(), (data, torch.tensor(False, device="cuda")), None),
+            (PutWhenPositive(), (data, positive), None),
+            (PutWhenPositive(), (data, negative), None),
+            (PutRow(), (data, positive, row), row.expand(2, 3)),
+            (PutRow(), (data, negative, row), data),
+        ]
+        for model, inputs, expected in cases:
+            with self.subTest(f"{type(model).__name__}_{inputs[1].item()}"):
+                compiled = torchtrt.dynamo.compile(
+                    torch.export.export(model, inputs),
+                    arg_inputs=inputs,
+                    min_block_size=1,
+                    pass_through_build_failures=True,
+                )
+                if expected is None:
+                    expected = model(*inputs)
+                torch.testing.assert_close(compiled(*inputs), expected)
+
+        # Values that do not broadcast to the input shape are rejected, as PyTorch does.
+        for case, inputs in {
+            "more_dims": (data, positive, torch.zeros(1, 2, 3, device="cuda")),
+            "more_rows": (data[:1], positive, torch.zeros(2, 3, device="cuda")),
+            "longer_row": (data[:, :1], positive, row),
+        }.items():
+            with self.subTest(case):
+                with self.assertRaises(ValueError):
+                    torchtrt.dynamo.compile(
+                        torch.export.export(PutRow(), inputs),
+                        arg_inputs=inputs,
+                        min_block_size=1,
+                        pass_through_build_failures=True,
+                    )
+
+        # int64 values stay exact, also when the mask is False.
+        big = torch.tensor([2**40, 2**40 + 3], device="cuda")
+        for mask, expected in ((True, torch.full_like(big, 5)), (False, big)):
+            with self.subTest(f"int64_{mask}"):
+
+                class PutFive(torch.nn.Module):
+                    def forward(self, data, mask):
+                        return torch.ops.aten.index_put.default(
+                            data, [mask], torch.tensor(5)
+                        )
+
+                inputs = (big, torch.tensor(mask, device="cuda"))
+                compiled = torchtrt.dynamo.compile(
+                    torch.export.export(PutFive(), inputs),
+                    arg_inputs=inputs,
+                    min_block_size=1,
+                    pass_through_build_failures=True,
+                )
+                torch.testing.assert_close(compiled(*inputs), expected)
+
+        # Values with the input's dynamic batch dim fit the input.
+        class PutScaled(torch.nn.Module):
+            def forward(self, data, index):
+                return torch.ops.aten.index_put.default(data, [index > 0], data * 10)
+
+        batch = torch.export.Dim("batch", min=1, max=8)
+        for index in (positive, negative):
+            with self.subTest(f"dynamic_{index.item()}"):
+                compiled = torchtrt.dynamo.compile(
+                    torch.export.export(
+                        PutScaled(), (data, index), dynamic_shapes=({0: batch}, None)
+                    ),
+                    arg_inputs=[
+                        torchtrt.Input(
+                            min_shape=(1, 3),
+                            opt_shape=(2, 3),
+                            max_shape=(8, 3),
+                            dtype=torch.float32,
+                        ),
+                        index,
+                    ],
+                    min_block_size=1,
+                    pass_through_build_failures=True,
+                )
+                for rows in (2, 5):
+                    x = torch.arange(3.0 * rows, device="cuda").reshape(rows, 3)
+                    expected = x * 10 if index.item() > 0 else x
+                    torch.testing.assert_close(compiled(x, index), expected)
+
+        # PyTorch ignores a 0-d mask next to another index, so that index_put runs there.
+        class PutAtRows(torch.nn.Module):
+            def forward(self, data, index, rows):
+                return torch.ops.aten.index_put.default(
+                    data, [index > 0, rows], torch.tensor(7.0)
+                )
+
+        rows = torch.tensor([1], device="cuda")
+        for index in (positive, negative):
+            with self.subTest(f"PutAtRows_{index.item()}"):
+                inputs = (data, index, rows)
+                compiled = torchtrt.dynamo.compile(
+                    torch.export.export(PutAtRows(), inputs),
+                    arg_inputs=inputs,
+                    min_block_size=1,
+                    pass_through_build_failures=True,
+                )
+                torch.testing.assert_close(compiled(*inputs), PutAtRows()(*inputs))
+
     def test_shapes_that_do_not_broadcast_raise(self):
         # torch.export accepts these, so the converter has to reject them as PyTorch does.
         class Put(torch.nn.Module):
