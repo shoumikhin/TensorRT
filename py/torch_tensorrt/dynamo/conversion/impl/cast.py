@@ -17,6 +17,7 @@ from torch_tensorrt.dynamo.conversion._ConverterRegistry import ConverterRegistr
 from torch_tensorrt.dynamo.conversion.converter_utils import (
     cast_trt_tensor,
     get_trt_tensor,
+    wrap_to_uint8,
 )
 
 LOGGER: logging.Logger = logging.getLogger(__name__)
@@ -47,6 +48,18 @@ def to_copy(
 ) -> TRTTensor:
     if not isinstance(input, TRTTensor):
         input = get_trt_tensor(ctx, input, f"{name}_copy_tensor")
+
+    # TensorRT allows uint8 only at engine inputs and outputs, so the result is the
+    # widened int32 value. PyTorch converts through int64, truncating toward zero,
+    # and the TensorRT cast to int64 truncates the same way.
+    if _enums.dtype._from(dtype) == _enums.dtype.u8 and input.dtype != trt.uint8:
+        value = cast_trt_tensor(
+            ctx, input, trt.int64, f"{name}_int64", target, source_ir
+        )
+        value = wrap_to_uint8(ctx, target, value, name)
+        return cast_trt_tensor(
+            ctx, value, trt.int32, f"{name}_int32", target, source_ir
+        )
 
     # TensorRT has no float64. With truncate_double the caller accepts float32.
     if (
