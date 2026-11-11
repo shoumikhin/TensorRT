@@ -98,6 +98,9 @@ class BaseEngineCache(ABC):
                         (node.args, node.kwargs), lambda n: f"%{positions[n]}"
                     )
                     canonical = f"{node.op}_{node.target}{arguments}"
+                    # The stable sort converter builds its engine for this many key values.
+                    if "_num_sort_keys" in node.meta:
+                        canonical += f"[{node.meta['_num_sort_keys']}]"
                     if node.op == "get_attr":
                         attr = functools.reduce(
                             lambda obj, name: getattr(obj, name, None),

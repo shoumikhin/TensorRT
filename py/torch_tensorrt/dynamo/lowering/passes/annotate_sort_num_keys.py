@@ -53,16 +53,20 @@ def _num_index_values(node: Argument) -> Optional[int]:
     if node.target is operator.getitem and node.args[1] == 1:
         source = node.args[0]
         if source.target == torch.ops.aten.topk.default:
-            dim = source.args[2] if len(source.args) > 2 else -1
+            dim = (
+                source.args[2] if len(source.args) > 2 else source.kwargs.get("dim", -1)
+            )
         elif source.target == torch.ops.aten.sort.default:
-            dim = source.args[1] if len(source.args) > 1 else -1
+            dim = (
+                source.args[1] if len(source.args) > 1 else source.kwargs.get("dim", -1)
+            )
         elif source.target == torch.ops.aten.sort.stable:
             dim = source.kwargs.get("dim", -1)
         else:
             return None
     elif node.target in (torch.ops.aten.argmax.default, torch.ops.aten.argmin.default):
         source = node
-        dim = node.args[1] if len(node.args) > 1 else None
+        dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim")
     else:
         return None
 
