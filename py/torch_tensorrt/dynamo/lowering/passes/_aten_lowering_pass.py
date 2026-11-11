@@ -23,6 +23,7 @@ from torch_tensorrt.dynamo.lowering.passes.pass_utils import (
 from torch_tensorrt.dynamo.tools.weight_mapping import raise_if_mapped_files_changed
 
 from .annotate_fp8_sdpa import annotate_fp8_sdpa
+from .annotate_sort_num_keys import annotate_sort_num_keys
 from .batch_cheap_fx_cleanups import batch_cheap_fx_cleanups
 from .collapse_high_rank_permutes import collapse_high_rank_permutes
 from .complex_decomposition_adapter import (
@@ -101,6 +102,8 @@ post_lowering_pass_list = [
     annotate_fp8_sdpa,
     decompose_dynamic_slice_scatter,
     collapse_high_rank_permutes,
+    # Last, so it sees the final graph the partitioner and the sort converter see.
+    annotate_sort_num_keys,
 ]
 
 if not is_tegra_platform():
