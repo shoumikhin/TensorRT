@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-from typing import Literal, Optional, Sequence, Tuple
+from typing import Any, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -86,37 +86,56 @@ def _antialias_taps(
     align_corners: bool,
     scale: Optional[float],
     mode: Literal["bilinear", "bicubic"],
-) -> Tuple[npt.NDArray[np.int64], npt.NDArray[np.float64], npt.NDArray[np.bool_]]:
+) -> Tuple[npt.NDArray[np.int64], npt.NDArray[np.float32], npt.NDArray[np.bool_]]:
     """Returns ATen's antialiased resize on one axis as (output_size, taps) arrays: the
     input index of each tap, its weight, and whether it is inside the output's window.
     """
+    # Every step rounds to float32 as ATen's CUDA kernel does, including the fused
+    # multiply-adds its compiler emits, so a following round to uint8 agrees with PyTorch.
+    f32 = np.float32
+
+    def fma(a: Any, b: Any, c: Any) -> Any:
+        # float64 holds the product of two float32 values exactly: one rounding, as an FMA.
+        return (np.float64(a) * b + c).astype(f32)
+
     if align_corners:
-        scale = (input_size - 1) / (output_size - 1) if output_size > 1 else 0.0
+        ratio = (
+            f32(input_size - 1) / f32(output_size - 1) if output_size > 1 else f32(0)
+        )
     elif scale is not None and scale > 0:
-        scale = 1.0 / scale
+        ratio = f32(1.0 / scale)
     else:
-        scale = input_size / output_size
+        ratio = f32(input_size) / f32(output_size)
     # A downscale stretches the filter over every input pixel it covers.
-    stretch = max(scale, 1.0)
-    support = (1.0 if mode == "bilinear" else 2.0) * stretch
-    center = scale * (np.arange(output_size) + 0.5)
-    start = np.maximum((center - support + 0.5).astype(np.int64), 0)
-    count = np.minimum((center + support + 0.5).astype(np.int64), input_size) - start
+    stretch = ratio >= 1.0
+    support = f32(1.0 if mode == "bilinear" else 2.0) * (ratio if stretch else f32(1))
+    invscale = f32(1.0 / float(ratio)) if stretch else f32(1)
+    half = np.arange(output_size, dtype=f32) + f32(0.5)
+    start = np.maximum((fma(ratio, half, -support) + f32(0.5)).astype(np.int64), 0)
+    end = np.minimum(
+        (fma(ratio, half, support) + f32(0.5)).astype(np.int64), input_size
+    )
+    count = end - start
     taps = np.arange(count.max())
     in_window = taps < count[:, None]
     indices = np.minimum(start[:, None] + taps, input_size - 1)
-    x = np.abs(indices + 0.5 - center[:, None]) / stretch
+    start_minus_center = fma(-ratio, half, start)[:, None]
+    x = np.abs((taps.astype(f32) + start_minus_center + f32(0.5)) * invscale)
     if mode == "bilinear":
-        weights = np.maximum(1.0 - x, 0.0)
+        weights = np.maximum(f32(1) - x, f32(0))
     else:
-        a = -0.5
+        a = f32(-0.5)
         weights = np.where(
-            x < 1.0,
-            ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0,
-            np.where(x < 2.0, (((x - 5.0) * x + 8.0) * x - 4.0) * a, 0.0),
+            x < 1,
+            fma(fma(a + 2, x, -(a + 3)) * x, x, f32(1)),
+            np.where(x < 2, fma(fma(x - 5, x, f32(8)), x, f32(-4)) * a, f32(0)),
         )
     weights *= in_window
-    return indices, weights / weights.sum(axis=1, keepdims=True), in_window
+    # Summed tap by tap, in order, like the kernel (numpy's sum is pairwise).
+    total = weights[:, 0].copy()
+    for tap in range(1, weights.shape[1]):
+        total += weights[:, tap]
+    return indices, weights / total[:, None], in_window
 
 
 def upsample_antialias(
@@ -154,25 +173,28 @@ def upsample_antialias(
         set_layer_name(gather, target, f"{name}_gather_{axis}", source_ir)
         # The gather swaps the resized axis for the (output, taps) axes of the indices.
         shape = (1,) * axis + weights.shape + (1,) * (3 - axis)
+        taps = gather.get_output(0)
+        if not in_window.all():
+            # A tap past a window's end must add nothing, even for an infinite pixel.
+            # Masking the pixel rather than the product lets the multiply and the sum
+            # fuse, as they do in PyTorch's kernel.
+            taps = impl.condition.where(
+                ctx,
+                target,
+                source_ir,
+                f"{name}_in_window_{axis}",
+                taps,
+                np.zeros((1,) * 5, dtype=np.float32),
+                in_window.reshape(shape),
+            )
         weighted = impl.elementwise.mul(
             ctx,
             target,
             source_ir,
             f"{name}_weighted_{axis}",
-            gather.get_output(0),
+            taps,
             weights.reshape(shape).astype(np.float32),
         )
-        if not in_window.all():
-            # A tap past a window's end must add nothing, even for an infinite pixel.
-            weighted = impl.condition.where(
-                ctx,
-                target,
-                source_ir,
-                f"{name}_in_window_{axis}",
-                weighted,
-                np.zeros((1,) * 5, dtype=np.float32),
-                in_window.reshape(shape),
-            )
         output = impl.reduce.sum(
             ctx, target, source_ir, f"{name}_sum_{axis}", weighted, axis + 1, False
         )
