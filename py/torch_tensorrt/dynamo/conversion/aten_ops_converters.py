@@ -5050,6 +5050,82 @@ def aten_ops_histc(
     )
 
 
+def grouped_mm_kernel_validator(
+    node: Node, settings: Optional[CompilationSettings] = None
+) -> bool:
+    """The (rows, K) x (groups, K, N) form in bfloat16 or float16 with int32 offsets.
+
+    Only the number of rows may be dynamic: K, N and the number of groups are compiled
+    into the kernel.
+    """
+    if not ENABLED_FEATURES.qdp_plugin:
+        return False
+    # The kernel is compiled for the GPU that builds the engine.
+    if settings is not None and settings.hardware_compatible:
+        return False
+    if _arg_or_kwarg(node.args, node.kwargs, 3, "bias") is not None:
+        return False
+    offs = _arg_or_kwarg(node.args, node.kwargs, 2, "offs")
+    if not isinstance(offs, Node):
+        return False
+    mat1, mat2, offs = (arg.meta.get("val") for arg in (*node.args[:2], offs))
+    if not all(isinstance(val, torch.Tensor) for val in (mat1, mat2, offs)):
+        return False
+    if (
+        mat1.dtype not in (torch.bfloat16, torch.float16)
+        or mat2.dtype != mat1.dtype
+        or offs.dtype != torch.int32
+        or _arg_or_kwarg(node.args, node.kwargs, 4, "out_dtype")
+        not in (None, mat1.dtype)
+    ):
+        return False
+    if mat1.dim() != 2 or mat2.dim() != 3:
+        return False
+    if not all(isinstance(dim, int) for dim in (mat1.shape[1], *mat2.shape)):
+        return False
+    gpu = settings.device.gpu_id if settings is not None else None
+    if torch.cuda.get_device_capability(gpu) < (8, 0):
+        _LOGGER.debug(
+            "%s: the grouped GEMM kernel needs compute capability 8.0 or newer, "
+            "using the dense aten._grouped_mm lowering rules",
+            node.name,
+        )
+        return False
+    if not impl.moe.grouped_mm_kernel_available():
+        _LOGGER.debug(
+            "%s: the grouped GEMM kernel needs Triton when the engine is built, "
+            "using the dense aten._grouped_mm lowering rules",
+            node.name,
+        )
+        return False
+    return True
+
+
+@dynamo_tensorrt_converter(
+    torch.ops.aten._grouped_mm.default,
+    capability_validator=grouped_mm_kernel_validator,
+    priority=ConverterPriority.HIGH,
+    supports_dynamic_shapes=True,
+)
+@enforce_tensor_types({0: (TRTTensor,), 1: (TRTTensor,)})
+def aten_ops_grouped_mm_kernel(
+    ctx: ConversionContext,
+    target: Target,
+    args: Tuple[Argument, ...],
+    kwargs: Dict[str, Argument],
+    name: str,
+) -> Union[TRTTensor, Sequence[TRTTensor]]:
+    return impl.moe.grouped_mm_kernel(
+        ctx,
+        target,
+        SourceIR.ATEN,
+        name,
+        args[0],
+        args[1],
+        _arg_or_kwarg(args, kwargs, 2, "offs"),
+    )
+
+
 def grouped_mm_validator(
     node: Node, settings: Optional[CompilationSettings] = None
 ) -> bool:

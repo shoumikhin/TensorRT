@@ -441,6 +441,8 @@ Graph Partitioning
        layers, to PyTorch when its TensorRT lowering would do more than this many
        multiply-adds (groups * rows * K * N). That lowering multiplies every row by
        every group's weight, while PyTorch computes only each row's own group.
+       It applies only where the grouped GEMM kernel cannot take the op, such as
+       float32 or a hardware-compatible engine.
        ``None`` turns the limit off. The limit does not apply to an op with one group,
        under ``require_full_compilation=True``, or in
        ``convert_exported_program_to_serialized_trt_engine``, which cannot leave an
