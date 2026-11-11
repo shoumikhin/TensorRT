@@ -5,10 +5,8 @@ import torch
 import torch.nn as nn
 import torch_tensorrt
 from parameterized import parameterized
-from torch.fx.passes.shape_prop import ShapeProp
 from torch.testing._internal.common_utils import run_tests
 from torch_tensorrt import Input
-from torch_tensorrt.dynamo.conversion.aten_ops_converters import select_validator
 
 from .harness import DispatchTestCase
 
@@ -166,32 +164,40 @@ class TestSelectConverterOne(DispatchTestCase):
                 check_dtype=False,
             )
 
-    def test_select_uint8_input_compiles(self):
-        # The uint8 select would fail the engine build, so it must stay in PyTorch.
+    @parameterized.expand([("fast", True), ("global", False)])
+    def test_select_uint8_input_compiles(self, _, use_fast_partitioner):
+        # The interpreter widens the uint8 input to int32, so the select stays in the
+        # engine, and a uint8 output is cast back to uint8.
         class SelectThenCast(nn.Module):
             def forward(self, frames):
                 return frames[1].float() / 255
 
-        frames = torch.randint(0, 256, (2, 8, 8, 3), dtype=torch.uint8, device="cuda")
-        model = SelectThenCast()
-        compiled = torch_tensorrt.dynamo.compile(
-            torch.export.export(model, (frames,)),
-            arg_inputs=[frames],
-            min_block_size=1,
-            pass_through_build_failures=True,
-        )
-        torch.testing.assert_close(compiled(frames), model(frames))
-
-    def test_select_validator_reads_tensor_meta(self):
-        class Select(nn.Module):
+        class SelectOnly(nn.Module):
             def forward(self, frames):
-                return torch.ops.aten.select.int(frames, 0, 1)
+                return frames[:, 1]
 
-        graph_module = torch.fx.symbolic_trace(Select())
-        ShapeProp(graph_module).propagate(torch.zeros(2, 4, dtype=torch.uint8))
-        node = next(n for n in graph_module.graph.nodes if n.op == "call_function")
-        self.assertNotIn("val", node.args[0].meta)
-        self.assertFalse(select_validator(node))
+        frames = torch.randint(0, 256, (2, 8, 8, 3), dtype=torch.uint8, device="cuda")
+        for model in (SelectThenCast(), SelectOnly()):
+            with self.subTest(type(model).__name__):
+                compiled = torch_tensorrt.dynamo.compile(
+                    torch.export.export(model, (frames,)),
+                    arg_inputs=[frames],
+                    min_block_size=1,
+                    pass_through_build_failures=True,
+                    use_fast_partitioner=use_fast_partitioner,
+                )
+                targets = {
+                    node.target
+                    for module in compiled.modules()
+                    if isinstance(module, torch.fx.GraphModule)
+                    for node in module.graph.nodes
+                }
+                self.assertNotIn(torch.ops.aten.select.int, targets)
+                self.assertEqual(
+                    sum("_run_on_acc" in name for name, _ in compiled.named_children()),
+                    1,
+                )
+                torch.testing.assert_close(compiled(frames), model(frames))
 
 
 if __name__ == "__main__":
