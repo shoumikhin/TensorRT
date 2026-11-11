@@ -22,10 +22,12 @@ class ExpertsBetweenReLUs(torch.nn.Module):
 class TestGroupedMMEngineOnlyExport(TestCase):
     def test_engine_only_export_keeps_large_grouped_mm(self):
         # Just above the default grouped_mm_dense_max_macs with few groups, so the engine stays small.
-        experts, rows, k = 2, 4097, 5800
-        model = ExpertsBetweenReLUs(experts, k, k).half().eval().cuda()
+        # float32 takes the dense lowering; float16 would take the grouped GEMM kernel.
+        # k * 4 bytes must be a multiple of 16 for PyTorch.
+        experts, rows, k = 2, 4097, 5792
+        model = ExpertsBetweenReLUs(experts, k, k).eval().cuda()
         offs = torch.linspace(rows // experts, rows, experts).to(torch.int32).cuda()
-        x = torch.randn(rows, k, dtype=torch.float16).cuda()
+        x = torch.randn(rows, k).cuda()
         ep = torch.export.export(model, (x, offs))
         engine = (
             torch_tensorrt.dynamo.convert_exported_program_to_serialized_trt_engine(
