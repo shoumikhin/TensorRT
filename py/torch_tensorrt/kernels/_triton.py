@@ -593,6 +593,24 @@ def _triton_import() -> Any:
     return triton
 
 
+def _pointer_divisibility_attrs(
+    kernel: Any, signature: Dict[str, str]
+) -> Dict[Tuple[int], Any]:
+    """Mark every pointer argument as 16-byte aligned.
+
+    A normal Triton launch adds this hint for each aligned pointer it is given.
+    An ahead-of-time compile sees no pointers, so without the hint it emits only
+    scalar memory accesses. TensorRT requires 256-byte aligned tensor addresses,
+    so the hint holds for every buffer it binds. Keys index the full kernel
+    declaration, constexprs included.
+    """
+    return {
+        (kernel.arg_names.index(name),): [["tt.divisibility", 16]]
+        for name, type_str in signature.items()
+        if type_str.strip().startswith("*")
+    }
+
+
 def _compile_within_driver_isa(
     triton: Any,
     kernel: Any,
@@ -613,11 +631,14 @@ def _compile_within_driver_isa(
     ``ptxas`` can assemble fails the compile outright.
     """
 
+    attrs = _pointer_divisibility_attrs(kernel, signature)
+
     def _compile(ptx_version: Optional[int] = None) -> Any:
         src = triton.compiler.ASTSource(
             fn=kernel,
             signature=dict(signature),
             constexprs=dict(constexprs),
+            attrs=attrs,
         )
         opts = dict(options)
         if ptx_version is not None:

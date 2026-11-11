@@ -385,6 +385,7 @@ def test_untested_pointer_dtype_rejected():
 
 # FAKE_PTX declares .version 9.3 and 5 entry params for this 3-param signature.
 CAPPING_SIG = {"a": "*fp32", "b": "i32", "c": "*fp32"}
+CAPPING_KERNEL = _FakeKernel(CAPPING_SIG)
 
 
 def _stub_triton(monkeypatch, requested, omitted_metadata=(), **extra_metadata):
@@ -472,7 +473,7 @@ def test_ptx_isa_capped_to_driver(monkeypatch, driver_max, default_isa, expected
     requested = []
     compiled_results = _stub_triton(monkeypatch, requested)
 
-    artifact = _triton.compile_triton_to_ptx(object(), CAPPING_SIG, {})
+    artifact = _triton.compile_triton_to_ptx(CAPPING_KERNEL, CAPPING_SIG, {})
 
     assert requested == expected
     assert artifact.ptx == compiled_results[-1].asm["ptx"].encode("utf-8")
@@ -503,7 +504,7 @@ def test_unsupported_launch_metadata(monkeypatch, metadata, match):
     monkeypatch.setattr(_triton, "_triton_default_ptx_version", lambda: None)
     _stub_triton(monkeypatch, [], **metadata)
     with pytest.raises(RuntimeError, match=match):
-        _triton.compile_triton_to_ptx(object(), CAPPING_SIG, {})
+        _triton.compile_triton_to_ptx(CAPPING_KERNEL, CAPPING_SIG, {})
 
 
 def test_missing_launch_metadata_fails_closed(monkeypatch):
@@ -512,7 +513,19 @@ def test_missing_launch_metadata_fails_closed(monkeypatch):
     monkeypatch.setattr(_triton, "_driver_max_ptx_version", lambda: None)
     _stub_triton(monkeypatch, [], omitted_metadata=("global_scratch_size",))
     with pytest.raises(RuntimeError, match="missing.*global_scratch_size"):
-        _triton.compile_triton_to_ptx(object(), CAPPING_SIG, {})
+        _triton.compile_triton_to_ptx(CAPPING_KERNEL, CAPPING_SIG, {})
+
+
+def test_alignment_hint_covers_only_pointers_by_declaration_index():
+    from torch_tensorrt.kernels._triton import _pointer_divisibility_attrs
+
+    kernel = _FakeKernel(["x", "BLOCK", "n", "y"], constexpr_names=["BLOCK"])
+    signature = {"x": "*fp32", "n": "i32", "y": "*fp32"}
+
+    assert _pointer_divisibility_attrs(kernel, signature) == {
+        (0,): [["tt.divisibility", 16]],
+        (3,): [["tt.divisibility", 16]],
+    }
 
 
 @skip_no_qdp
@@ -630,6 +643,11 @@ try:
         off = pid * BLOCK + tl.arange(0, BLOCK)
         mask = off < n
         tl.store(y_ptr + off, tl.load(x_ptr + off, mask=mask) + 1, mask=mask)
+
+    @triton.jit
+    def _ttk_copy_kernel(x_ptr, y_ptr, BLOCK: tl.constexpr):
+        off = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        tl.store(y_ptr + off, tl.load(x_ptr + off))
 
 except ImportError:
     triton = None
@@ -946,6 +964,24 @@ def test_multi_input_output_reduction_dynamic():
         expected = x.float() + y.float()
         torch.testing.assert_close(added, expected.to(dtype))
         torch.testing.assert_close(reduced, expected.sum(-1), atol=1e-4, rtol=1e-4)
+
+
+@skip_no_cuda
+@skip_no_triton
+def test_compiled_kernel_uses_vectorized_memory_access():
+    from torch_tensorrt.kernels import _triton
+
+    artifact = _triton.compile_triton_to_ptx(
+        _ttk_copy_kernel,
+        {"x_ptr": "*fp32", "y_ptr": "*fp32"},
+        {"BLOCK": 1024},
+        num_warps=4,
+    )
+    ptx = artifact.ptx.decode()
+    assert "ld.global.v4." in ptx and "st.global.v4." in ptx, (
+        "the ahead-of-time compile lost Triton's pointer alignment hint and "
+        "fell back to scalar memory accesses"
+    )
 
 
 def test_conversion_and_aot_reject_target_mismatch(captured_registration, monkeypatch):
