@@ -205,6 +205,49 @@ class TestToCopyConverter(DispatchTestCase):
                 torch.testing.assert_close(out, expected)
                 self.assertEqual(out.stride(), expected.stride())
 
+    def test_to_copy_uint8_stays_in_one_engine(self):
+        # Video frames are often rounded to uint8 levels, then moved and cast back to float.
+        class RoundFrames(nn.Module):
+            def forward(self, left, right):
+                tiles = [
+                    frames.round()
+                    .clamp(0, 255)
+                    .to(torch.uint8)[..., 1:7, :]
+                    .contiguous()
+                    for frames in (left, right)
+                ]
+                return torch.cat(tiles, dim=-1).float()
+
+        # PyTorch truncates toward zero, then wraps modulo 256. On CUDA, infinity
+        # saturates to 255, and -infinity and NaN give 0.
+        class ToUint8(nn.Module):
+            def forward(self, x):
+                return x.to(torch.uint8), x.to(torch.uint8).float() * 2
+
+        values = [0, 0.5, 254.9, 255, 255.9, 256.7, 300.7, -0.5, -1, -1.5, -255.9]
+        extremes = [3e9, -3e9, 1e12, torch.inf, -torch.inf, torch.nan]
+        cases = (
+            (RoundFrames(), tuple(torch.rand(2, 3, 8, 6) * 300 - 20 for _ in range(2))),
+            (ToUint8(), (torch.tensor(values + extremes),)),
+            (ToUint8(), (torch.tensor(values, dtype=torch.float16),)),
+            (ToUint8(), (torch.tensor(values, dtype=torch.bfloat16),)),
+            (ToUint8(), (torch.tensor([0, 255, 256, 300, -1, -256, 70000]),)),
+            (ToUint8(), (torch.tensor([0, 255, 256, -1, 70000], dtype=torch.int32),)),
+        )
+        for model, inputs in cases:
+            with self.subTest(type(model).__name__, dtype=inputs[0].dtype):
+                inputs = [x.cuda() for x in inputs]
+                compiled = torch_tensorrt.dynamo.compile(
+                    torch.export.export(model, tuple(inputs)),
+                    arg_inputs=inputs,
+                    min_block_size=1,
+                )
+                names = [name for name, _ in compiled.named_children()]
+                self.assertEqual(names, ["_run_on_acc_0"])
+                torch.testing.assert_close(
+                    compiled(*inputs), model(*inputs), rtol=0, atol=0
+                )
+
     def test_to_copy_multiple_returns(self):
         class ToCopyReturns(nn.Module):
             def forward(self, x):

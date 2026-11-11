@@ -2331,6 +2331,7 @@ def to_copy_dtype_validator(
             torch.int64,
             torch.bool,
             torch.int8,
+            torch.uint8,
             torch.float16,
             torch.bfloat16,
         }
