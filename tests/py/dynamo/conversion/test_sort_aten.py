@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
+import operator
 import unittest
 
 import torch
@@ -9,13 +10,15 @@ import torch_tensorrt
 from parameterized import parameterized
 from torch.testing._internal.common_utils import TestCase, run_tests
 from torch_tensorrt import Input
+from torch_tensorrt.dynamo._engine_cache import BaseEngineCache
 from torch_tensorrt.dynamo._settings import CompilationSettings
 from torch_tensorrt.dynamo.conversion.aten_ops_converters import (
     sort_stable_validator,
     sort_validator,
 )
+from torch_tensorrt.dynamo.lowering import get_decompositions, post_lowering
 from torch_tensorrt.dynamo.lowering.passes.annotate_sort_num_keys import (
-    annotate_sort_num_keys,
+    _num_index_values,
 )
 
 from .harness import DispatchTestCase
@@ -256,8 +259,9 @@ class TestSortStableValidator(unittest.TestCase):
 
         # Partitioning sees the graph after decompositions and lowering passes.
         ep = torch.export.export(Mod(), (x,), dynamic_shapes=dynamic_shapes)
-        gm = annotate_sort_num_keys(
-            ep.run_decompositions().module(), CompilationSettings()
+        gm = post_lowering(
+            ep.run_decompositions(get_decompositions(False)).module(),
+            CompilationSettings(),
         )
         return next(
             n
@@ -304,16 +308,54 @@ class TestSortStableValidator(unittest.TestCase):
             lambda x: torch.sort(torch.topk(x, 2)[1].float(), stable=True),
             torch.randn(4, 8),
         )
-        self.assertFalse(sort_stable_validator(node))
+        with self.assertLogs(_CONVERTERS_LOGGER, level="DEBUG") as logs:
+            self.assertFalse(sort_stable_validator(node))
+        self.assertIn("int32 or int64", logs.output[0])
+
+    def test_unbounded_length(self):
+        node = self._sort_node(
+            lambda x: torch.sort(torch.topk(x, 2)[1].reshape(-1), stable=True),
+            torch.randn(4, 8),
+            dynamic_shapes={"x": {0: torch.export.Dim("tokens", min=2)}},
+        )
+        with self.assertLogs(_CONVERTERS_LOGGER, level="DEBUG") as logs:
+            self.assertFalse(sort_stable_validator(node))
+        self.assertIn("no upper bound", logs.output[0])
+
+    def test_topk_dim_keyword(self):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        x.meta["val"] = torch.empty(4, 8)
+        topk = graph.call_function(torch.ops.aten.topk.default, (x, 2), {"dim": 0})
+        ids = graph.call_function(operator.getitem, (topk, 1))
+        self.assertEqual(_num_index_values(ids), 4)
+
+    def test_key_range_in_engine_cache_key(self):
+        node = self._sort_node(
+            lambda x: torch.sort(torch.topk(x, 2)[1].reshape(-1), stable=True),
+            torch.randn(4, 8),
+        )
+        gm, inputs = node.graph.owning_module, [Input(shape=(4, 8))]
+        before = BaseEngineCache.get_hash(gm, inputs, CompilationSettings())
+        node.meta["_num_sort_keys"] = 16
+        after = BaseEngineCache.get_hash(gm, inputs, CompilationSettings())
+        self.assertNotEqual(before, after)
 
     def test_many_rows(self):
         node = self._sort_node(
             lambda x: torch.sort(torch.topk(x, 8)[1], stable=True),
             torch.randn(4, 300),
         )
-        with self.assertLogs(_CONVERTERS_LOGGER, level="WARNING") as logs:
+        with self.assertLogs(_CONVERTERS_LOGGER, level="DEBUG") as logs:
             self.assertFalse(sort_stable_validator(node))
         self.assertIn("more than one row", logs.output[0])
+
+    def test_data_dependent_rows(self):
+        node = self._sort_node(
+            lambda x: torch.sort(torch.topk(x[x[:, 0] > 0], 2)[1], stable=True),
+            torch.randn(4, 8),
+        )
+        self.assertFalse(sort_stable_validator(node))
 
     def test_too_many_counts(self):
         # 27,784 keys with 1024 values each.
@@ -321,7 +363,7 @@ class TestSortStableValidator(unittest.TestCase):
             lambda x: torch.sort(torch.topk(x, 8)[1].reshape(-1), stable=True),
             torch.randn(3473, 1024),
         )
-        with self.assertLogs(_CONVERTERS_LOGGER, level="WARNING") as logs:
+        with self.assertLogs(_CONVERTERS_LOGGER, level="DEBUG") as logs:
             self.assertFalse(sort_stable_validator(node))
         self.assertIn("counts", logs.output[0])
 

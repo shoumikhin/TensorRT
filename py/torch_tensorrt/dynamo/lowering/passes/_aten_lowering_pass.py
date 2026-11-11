@@ -102,8 +102,6 @@ post_lowering_pass_list = [
     annotate_fp8_sdpa,
     decompose_dynamic_slice_scatter,
     collapse_high_rank_permutes,
-    # Last, so it sees the final graph the partitioner and the sort converter see.
-    annotate_sort_num_keys,
 ]
 
 if not is_tegra_platform():
@@ -209,6 +207,9 @@ def post_lowering(
         set_defer_graph_cleanup(False)
     if fake_mode is not None:
         fake_tensor_updater.incremental_update(fake_mode)
+    # After every pass, including registered ones, and with fresh meta: the sort converter
+    # trusts this range for correctness.
+    gm = annotate_sort_num_keys(gm, settings)
 
     # A branch shared by several cond nodes is lowered once.
     for branch in dict.fromkeys(iter_cond_subgraphs(gm)):

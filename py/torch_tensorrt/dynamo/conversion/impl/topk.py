@@ -307,13 +307,9 @@ def counting_sort(
         )
     else:
         pad = -length % tile
-    # TensorRT 11.1 to 11.4 can fail to build a fill-mode slice that pads by zero.
-    padded = (
-        keys
-        if isinstance(pad, int) and pad == 0
-        else impl.pad.constant_padNd(
-            ctx, target, source_ir, f"{name}_pad", keys, [0, pad], num_keys
-        )
+    # A static pad is an int, so a pad by zero adds no fill-mode slice there.
+    padded = impl.pad.constant_padNd(
+        ctx, target, source_ir, f"{name}_pad", keys, [0, pad], num_keys
     )
     tiles = impl.shuffle.reshape(
         ctx, target, source_ir, f"{name}_tiles", padded, [0] * (rank - 1) + [-1, tile]

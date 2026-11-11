@@ -5002,9 +5002,9 @@ def aten_ops_sort(
     )
 
 
-# Measured on H100: a PyTorch stable sort of up to 131k keys takes 60 to 70 us, the counting sort
-# about 18 us plus 5.3 us per million counts. At this many counts it is about 40 us slower, less
-# than the engine split it removes.
+# Measured on H100: the counting sort takes about 18 us plus 5.3 us per million counts, so about
+# 105 us at this cap. A PyTorch stable sort of one row takes 10 to 70 us, and the engine split
+# it saves cost about 100 us in a mixture-of-experts layer.
 _MAX_SORT_COUNTS = 2**24
 
 
@@ -5028,6 +5028,19 @@ def sort_stable_validator(
             "or more; aten.sort.stable will run in PyTorch."
         )
         return False
+    dim = get_positive_dim(node.kwargs.get("dim", -1), data.dim())
+    # PyTorch sorts many short rows at once in 10 to 30 us, where counting is 15 to 170 times
+    # slower, so only a single row is converted.
+    if not all(
+        statically_known_true(size == 1)
+        for d, size in enumerate(data.shape)
+        if d != dim
+    ):
+        _LOGGER.debug(
+            f"[sort.stable validator] {node.name} may sort more than one row, which PyTorch "
+            "does faster; aten.sort.stable will run in PyTorch."
+        )
+        return False
     num_keys = node.meta.get("_num_sort_keys")
     if num_keys is None:
         _LOGGER.warning(
@@ -5036,22 +5049,13 @@ def sort_stable_validator(
             "aten.sort.stable will run in PyTorch."
         )
         return False
-    dim = get_positive_dim(node.kwargs.get("dim", -1), data.dim())
-    # PyTorch sorts many short rows at once in 10 to 30 us, where counting is 15 to 170 times
-    # slower, so only a single row is converted.
-    if any(size != 1 for d, size in enumerate(data.shape) if d != dim):
-        _LOGGER.warning(
-            f"[sort.stable validator] {node.name} sorts more than one row, which PyTorch does "
-            "faster; aten.sort.stable will run in PyTorch."
-        )
-        return False
     length = data.shape[dim]
     # A dynamic length is judged at its upper bound, where the cost matters.
     if not isinstance(length, int):
         length = extract_var_range_info(length)["max"]
     tile = impl.topk._COUNTING_SORT_TILE
     if length is None or -(-length // tile) * tile * num_keys > _MAX_SORT_COUNTS:
-        _LOGGER.warning(
+        _LOGGER.debug(
             f"[sort.stable validator] {node.name} needs more than {_MAX_SORT_COUNTS} counts, "
             "or its length has no upper bound, and PyTorch sorts it faster; aten.sort.stable "
             "will run in PyTorch."
