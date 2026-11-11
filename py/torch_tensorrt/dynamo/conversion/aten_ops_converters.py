@@ -4856,10 +4856,15 @@ def aten_ops_upsample_bicubic2d(
 def antialiased_upsample_validator(
     node: Node, settings: Optional[CompilationSettings] = None
 ) -> bool:
-    # Opt-in: PyTorch's kernel is correct too, and faster for some sizes.
-    if settings is None or not settings.convert_antialiased_resize:
+    # Bilinear matches PyTorch's CUDA kernel. Bicubic can differ by a few float32
+    # roundings, which can flip a later rounding to integers, so it is opt-in.
+    if settings is None or (
+        node.target == torch.ops.aten._upsample_bicubic2d_aa.default
+        and not settings.convert_antialiased_resize
+    ):
         _LOGGER.debug(
-            "antialiased resize runs in PyTorch unless convert_antialiased_resize=True"
+            "antialiased bicubic resize runs in PyTorch unless "
+            "convert_antialiased_resize=True"
         )
         return False
     meta = node.args[0].meta

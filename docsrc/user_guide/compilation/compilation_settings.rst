@@ -431,9 +431,14 @@ Graph Partitioning
        need much more time and memory to build and to run, so measure it.
    * - ``convert_antialiased_resize``
      - ``False``
-     - Run antialiased bilinear and bicubic resize (``F.interpolate`` with
-       ``antialias=True``) in TensorRT instead of PyTorch, so it does not split the
-       graph. Only static input and output heights and widths and floating-point
+     - Also run antialiased bicubic resize (``F.interpolate`` with
+       ``mode="bicubic"`` and ``antialias=True``) in TensorRT instead of PyTorch, so
+       it does not split the graph. Its output can differ from PyTorch's by a few
+       float32 roundings, which can change a value that is rounded to an integer
+       afterwards. Antialiased bilinear resize runs in TensorRT without this
+       setting, since its output matches PyTorch's CUDA kernel; list
+       ``aten._upsample_bilinear2d_aa`` in ``torch_executed_ops`` to keep it in
+       PyTorch. Only static input and output heights and widths and floating-point
        inputs are converted. Some sizes run slower than in PyTorch, so measure it.
    * - ``grouped_mm_dense_max_macs``
      - ``2**38``
