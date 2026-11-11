@@ -154,7 +154,7 @@ def _aot_impl(
             num_warps=_NUM_WARPS,
             num_stages=num_stages,
         )
-        if artifact.shared_mem <= _common.AOT_MAX_DYNAMIC_SHARED_MEM:
+        if artifact.shared_mem <= 48 * 1024:
             break
 
     def grid(inputs: Tuple[trtp.TensorDesc, ...], _: object) -> object:
@@ -163,17 +163,18 @@ def _aot_impl(
         rows = inputs[0].shape_expr[0]
         return (trtp.cdiv(rows, _BLOCK_M) + groups) * triton.cdiv(n, _BLOCK_N)
 
-    launch = _common.make_pointer_aot_fn(
-        PLUGIN_NAME,
-        _triton.analyze_signature(signature, (3, 1)),
-        grid,
-        (artifact.num_warps * 32, 1, 1),
-        artifact.shared_mem,
-        lambda inputs, _: [trtp.SymInt32(inputs[0].shape_expr[0])],
-        lambda: None,
-        frontend="aten._grouped_mm",
+    # release/2.15 has no _common.make_pointer_aot_fn; same launch, built directly.
+    params = trtp.KernelLaunchParams(
+        grid_x=grid([mat1, mat2, offs], outputs),
+        grid_y=1,
+        grid_z=1,
+        block_x=artifact.num_warps * 32,
+        block_y=1,
+        block_z=1,
+        shared_mem=artifact.shared_mem,
     )
-    params, extra_args = launch([mat1, mat2, offs], outputs, tactic)
+    extra_args = trtp.SymIntExprs(1)
+    extra_args[0] = trtp.SymInt32(mat1.shape_expr[0])
     return artifact.kernel_name, artifact.ptx, params, extra_args
 
 
