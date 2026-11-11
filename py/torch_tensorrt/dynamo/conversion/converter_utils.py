@@ -169,6 +169,7 @@ UINT8_DATA_MOVEMENT_OPS = {
     torch.ops.aten.squeeze.dim,
     torch.ops.aten.squeeze.dims,
     torch.ops.aten.expand.default,
+    torch.ops.aten.select.int,
     torch.ops.aten.slice.Tensor,
     torch.ops.aten.cat.default,
     torch.ops.aten.split.Tensor,
