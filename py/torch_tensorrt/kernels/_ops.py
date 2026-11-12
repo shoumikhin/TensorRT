@@ -318,10 +318,11 @@ def triton_op(
     # TensorRT launches AOT plugin kernels without opting them in to more than
     # CUDA's default 48 KiB of dynamic shared memory, so a larger launch fails when
     # the engine runs, and TensorRT reports no reason.
-    if artifact.shared_mem > 48 * 1024:
+    if artifact.shared_mem > _common.AOT_MAX_DYNAMIC_SHARED_MEM:
         raise ValueError(
             f"triton_op '{op_name}' needs {artifact.shared_mem} bytes of dynamic shared "
-            "memory, but TensorRT launches AOT plugin kernels with at most 49152 bytes, "
+            "memory, but TensorRT launches AOT plugin kernels with at most "
+            f"{_common.AOT_MAX_DYNAMIC_SHARED_MEM} bytes, "
             "so the engine would fail at run time. Use a kernel configuration that needs "
             "less, for example fewer pipeline stages or smaller tiles."
         )
