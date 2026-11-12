@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import unittest
+from unittest import mock
 
 import torch
 import torch_tensorrt
@@ -35,6 +36,23 @@ def _offsets(counts):
     "The grouped GEMM kernel is a TensorRT plugin",
 )
 class TestGroupedMMKernel(TestCase):
+    def test_blackwell_kernel_needs_no_tensor_memory(self):
+        # Compiles for sm_100 on whatever GPU runs the test. Without sm_80
+        # instructions there, Triton's kernel would need tensor memory, which
+        # the plugin launch refuses.
+        import triton
+        from torch_tensorrt.dynamo.conversion.impl import _grouped_mm_kernel
+        from triton.backends.compiler import GPUTarget
+
+        with mock.patch.object(
+            triton.runtime.driver.active,
+            "get_current_target",
+            return_value=GPUTarget("cuda", 100, 32),
+        ):
+            artifact = _grouped_mm_kernel._compile("*bf16", 16, 128, 256)
+        self.assertEqual(artifact.target.arch, 100)
+        self.assertNotIn(b"tcgen05", artifact.ptx)
+
     @parameterized.expand([("bfloat16", torch.bfloat16), ("float16", torch.float16)])
     def test_dynamic_rows_stay_in_one_engine(self, _, dtype):
         experts, k, n = 16, 128, 256
