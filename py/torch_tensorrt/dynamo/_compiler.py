@@ -1591,6 +1591,11 @@ def compile_module(
             if weight_releaser.release_unread_storages():
                 release_host_and_device_memory()
             read = set(weight_storages(gm))
+        release = (
+            weight_releaser.release_once_built(read, "_run_on_acc_0")
+            if weight_releaser is not None
+            else None
+        )
         with report_released_weights_on_failure(weight_releaser, "_run_on_acc_0"):
             trt_module = convert_module(
                 gm,
@@ -1598,11 +1603,9 @@ def compile_module(
                 settings=settings,
                 name="_run_on_acc_0",
                 engine_cache=engine_cache,
+                release_weights=release,
             )
-        if (
-            weight_releaser is not None
-            and weight_releaser.release_storages_after_build(read, "_run_on_acc_0")
-        ):
+        if release is not None and release():
             release_host_and_device_memory()
         if set_up_deferred_engines:
             trt_module.setup_engine()
@@ -1849,6 +1852,11 @@ def compile_module(
                 if weight_releaser is not None
                 else set()
             )
+            release = (
+                weight_releaser.release_once_built(read, name)
+                if weight_releaser is not None
+                else None
+            )
             with report_released_weights_on_failure(weight_releaser, name):
                 trt_module = convert_module(
                     submodule,
@@ -1856,6 +1864,7 @@ def compile_module(
                     settings=settings,
                     name=name,
                     engine_cache=engine_cache,
+                    release_weights=release,
                 )
 
             if (
@@ -1869,10 +1878,7 @@ def compile_module(
                 # Profiling and layer info need the engine.
                 trt_module.setup_engine()
             trt_modules[name] = trt_module
-            if (
-                weight_releaser is not None
-                and weight_releaser.release_storages_after_build(read, name)
-            ):
+            if release is not None and release():
                 release_host_and_device_memory()
 
             if _debugger_config:
