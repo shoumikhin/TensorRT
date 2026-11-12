@@ -23,7 +23,7 @@ def _inputs(experts, rows, k):
     counts[::3] = rows // len(counts[::3])
     counts[0] += rows - counts.sum()
     offs = torch.cumsum(counts, 0).to(torch.int32).cuda()
-    return torch.randn(rows, k).cuda(), offs
+    return torch.randn(rows, k, dtype=torch.float16).cuda(), offs
 
 
 def _grouped_mm_in_pytorch(compiled):
@@ -38,13 +38,11 @@ def _grouped_mm_in_pytorch(compiled):
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
 class TestGroupedMMLeftToPyTorch(TestCase):
-    # float32 keeps the op on the dense lowering; bfloat16 and float16 take the grouped
-    # GEMM kernel, which does no wasted work.
     # 8 * 256 * 64 * 64 multiply-adds, above this limit.
     small_limit = 2**20
 
     def setUp(self):
-        self.model = ExpertsBetweenReLUs(8, 64, 64).eval().cuda()
+        self.model = ExpertsBetweenReLUs(8, 64, 64).half().eval().cuda()
         self.x, self.offs = _inputs(8, 256, 64)
 
     def test_grouped_mm_over_limit_runs_in_pytorch(self):

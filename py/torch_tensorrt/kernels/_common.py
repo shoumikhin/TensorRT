@@ -12,6 +12,10 @@ import torch
 
 _LOGGER = logging.getLogger(__name__)
 
+# TensorRT launches AOT plugin kernels without opting them in to more than CUDA's
+# default 48 KiB of dynamic shared memory.
+AOT_MAX_DYNAMIC_SHARED_MEM = 48 * 1024
+
 
 def to_trt_dtype(value: torch.dtype) -> Any:
     """Require an exact TensorRT representation for a compiled pointer dtype."""

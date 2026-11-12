@@ -594,20 +594,28 @@ def _triton_import() -> Any:
 
 
 def _pointer_divisibility_attrs(
-    kernel: Any, signature: Dict[str, str]
+    kernel: Any,
+    signature: Dict[str, str],
+    pointer_alignment: Optional[Mapping[str, int]] = None,
 ) -> Dict[Tuple[int], Any]:
-    """Mark every pointer argument as 16-byte aligned.
+    """Mark pointer arguments as aligned: every pointer by default, else those named.
 
     A normal Triton launch adds this hint for each aligned pointer it is given.
     An ahead-of-time compile sees no pointers, so without the hint it emits only
     scalar memory accesses. TensorRT requires 256-byte aligned tensor addresses,
-    so the hint holds for every buffer it binds. Keys index the full kernel
-    declaration, constexprs included.
+    so the default 16-byte hint holds for every buffer it binds. Keys index the
+    full kernel declaration, constexprs included.
     """
+    if pointer_alignment is None:
+        pointer_alignment = {
+            name: 16
+            for name, type_str in signature.items()
+            if type_str.strip().startswith("*")
+        }
     return {
-        (kernel.arg_names.index(name),): [["tt.divisibility", 16]]
-        for name, type_str in signature.items()
-        if type_str.strip().startswith("*")
+        (kernel.arg_names.index(name),): [["tt.divisibility", min(alignment, 16)]]
+        for name, alignment in pointer_alignment.items()
+        if alignment > 1
     }
 
 
@@ -618,6 +626,7 @@ def _compile_within_driver_isa(
     constexprs: Dict[str, Any],
     options: Dict[str, Any],
     target: Any,
+    pointer_alignment: Optional[Mapping[str, int]] = None,
 ) -> Any:
     """Compile ``kernel``, holding the PTX ISA to what the driver can load.
 
@@ -631,7 +640,7 @@ def _compile_within_driver_isa(
     ``ptxas`` can assemble fails the compile outright.
     """
 
-    attrs = _pointer_divisibility_attrs(kernel, signature)
+    attrs = _pointer_divisibility_attrs(kernel, signature, pointer_alignment)
 
     def _compile(ptx_version: Optional[int] = None) -> Any:
         src = triton.compiler.ASTSource(
@@ -837,6 +846,7 @@ def compile_triton_to_ptx(
     num_warps: Optional[int] = None,
     num_stages: Optional[int] = None,
     arch: Optional[int] = None,
+    pointer_alignment: Optional[Mapping[str, int]] = None,
 ) -> CompiledTritonArtifact:
     """Compile a ``@triton.jit`` kernel to PTX ahead of time.
 
@@ -858,6 +868,9 @@ def compile_triton_to_ptx(
         arch: the compute capability whose instructions Triton uses, for
             example 80 for ``mma.sync``. Defaults to the device's. The PTX still
             targets the device.
+        pointer_alignment: byte alignment the kernel may assume, by pointer
+            name. Pointers not named get no hint. Defaults to 16 bytes for every
+            pointer.
 
     Returns:
         An immutable artifact containing unmodified PTX, the entry symbol,
@@ -880,7 +893,7 @@ def compile_triton_to_ptx(
         options["num_stages"] = num_stages
 
     compiled = _compile_within_driver_isa(
-        triton, kernel, signature, constexprs, options, target
+        triton, kernel, signature, constexprs, options, target, pointer_alignment
     )
     # Read back from metadata rather than trusting the request: Triton clamps
     # num_warps to what the kernel can actually use.

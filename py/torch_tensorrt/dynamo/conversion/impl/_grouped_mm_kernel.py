@@ -8,8 +8,10 @@ compiled ahead of time and its PTX is stored in the engine, so running the engin
 needs neither Triton nor PyTorch. Importing this module needs Triton.
 """
 
+import functools
+import logging
 import threading
-from typing import Any, Dict, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import tensorrt as trt
 import tensorrt.plugin as trtp
@@ -18,6 +20,8 @@ import triton.language as tl
 from torch_tensorrt.kernels import _common, _triton
 
 PLUGIN_NAME = "torch_tensorrt::grouped_mm"
+
+_LOGGER = logging.getLogger(__name__)
 
 # With 3 pipeline stages these tiles need up to 48 KiB of shared memory for 16-bit
 # types, the most TensorRT gives a plugin kernel.
@@ -77,7 +81,7 @@ def _grouped_mm_kernel(  # type: ignore[no-untyped-def]
         tl.store(
             c_ptr + rows.to(tl.int64)[:, None] * N + cols[None, :],
             tl.zeros((BLOCK_M, BLOCK_N), dtype=c_ptr.dtype.element_ty),
-            mask=(rows < M)[:, None] & col_mask[None, :],
+            mask=((rows >= 0) & (rows < M))[:, None] & col_mask[None, :],
         )
         return
     group = tl.sum((tiles_through <= tile).to(tl.int32), axis=0)
@@ -87,7 +91,8 @@ def _grouped_mm_kernel(  # type: ignore[no-untyped-def]
     row_end = tl.sum(tl.where(selected, ends, 0), axis=0)
 
     rows = row_start + (tile - first_tile) * BLOCK_M + tl.arange(0, BLOCK_M)
-    row_mask = rows < row_end
+    # Offsets that count rows outside mat1 must not reach outside it or the output.
+    row_mask = (rows >= 0) & (rows < tl.minimum(row_end, M))
     ks = tl.arange(0, BLOCK_K)
 
     a_ptrs = a_ptr + rows.to(tl.int64)[:, None] * K + ks[None, :]
@@ -128,7 +133,42 @@ def _signature(pointer: str) -> Dict[str, str]:
 
 
 def _compile(pointer: str, groups: int, k: int, n: int) -> Any:
-    """The kernel's PTX for the current GPU, with the deepest pipeline that fits."""
+    """The kernel's PTX for the current GPU, with the deepest pipeline that fits.
+
+    Raises when the kernel cannot be built for a plugin launch. The converter's
+    validator compiles it first, so a failure declines the op instead of failing
+    the engine build, and the build reuses the cached result.
+    """
+    capability = triton.runtime.driver.active.get_current_target().arch
+    artifact = _compile_for(pointer, groups, k, n, capability)
+    if artifact is None:
+        raise RuntimeError("the grouped GEMM kernel does not build for this shape")
+    return artifact
+
+
+# Failures are cached too, because the converter registry runs validators on every lookup.
+@functools.lru_cache(maxsize=None)
+def _compile_for(
+    pointer: str, groups: int, k: int, n: int, capability: int
+) -> Optional[Any]:
+    try:
+        return _build(pointer, groups, k, n, capability)
+    except Exception as exc:
+        _LOGGER.warning(
+            "The grouped GEMM kernel does not build for %s with %d groups, K=%d and N=%d "
+            "on sm_%d (%s). aten._grouped_mm ops of this shape follow the dense "
+            "lowering's rules instead: the dense converter, or PyTorch where it declines.",
+            pointer[1:],
+            groups,
+            k,
+            n,
+            capability,
+            exc,
+        )
+        return None
+
+
+def _build(pointer: str, groups: int, k: int, n: int, capability: int) -> Any:
     constexprs = {
         "N": n,
         "K": k,
@@ -140,7 +180,6 @@ def _compile(pointer: str, groups: int, k: int, n: int) -> Any:
     }
     # From sm_100 on, Triton's tl.dot uses tensor memory, which a TensorRT
     # plugin launch cannot set up. sm_80's mma.sync runs on every later GPU.
-    capability = triton.runtime.driver.active.get_current_target().arch
     arch = 80 if capability >= 100 else None
     for num_stages in _NUM_STAGES:
         artifact = _triton.compile_triton_to_ptx(
@@ -149,11 +188,18 @@ def _compile(pointer: str, groups: int, k: int, n: int) -> Any:
             constexprs,
             num_warps=_NUM_WARPS,
             num_stages=num_stages,
+            # TensorRT allocates its tensors 256-byte aligned and requires the same
+            # of engine inputs and outputs. offs gets no hint: a load of a few
+            # offsets gains nothing from one.
+            pointer_alignment=dict.fromkeys(("a_ptr", "b_ptr", "c_ptr"), 16),
             arch=arch,
         )
-        if artifact.shared_mem <= 48 * 1024:
-            break
-    return artifact
+        if artifact.shared_mem <= _common.AOT_MAX_DYNAMIC_SHARED_MEM:
+            return artifact
+    raise RuntimeError(
+        f"the grouped GEMM kernel needs {artifact.shared_mem} bytes of shared memory, "
+        f"more than the {_common.AOT_MAX_DYNAMIC_SHARED_MEM} a TensorRT plugin kernel gets"
+    )
 
 
 def _aot_impl(

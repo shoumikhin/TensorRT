@@ -6,6 +6,7 @@ import unittest
 import torch
 import torch_tensorrt
 from torch.testing._internal.common_utils import TestCase, run_tests
+from torch_tensorrt.dynamo._defaults import GROUPED_MM_DENSE_MAX_MACS
 
 
 class ExpertsBetweenReLUs(torch.nn.Module):
@@ -21,13 +22,12 @@ class ExpertsBetweenReLUs(torch.nn.Module):
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
 class TestGroupedMMEngineOnlyExport(TestCase):
     def test_engine_only_export_keeps_large_grouped_mm(self):
-        # Just above the default grouped_mm_dense_max_macs with few groups, so the engine stays small.
-        # float32 takes the dense lowering; float16 would take the grouped GEMM kernel.
-        # k * 4 bytes must be a multiple of 16 for PyTorch.
-        experts, rows, k = 2, 4097, 5792
-        model = ExpertsBetweenReLUs(experts, k, k).eval().cuda()
+        # Few groups keep the engine small.
+        experts, rows, k = 2, 4097, 5800
+        self.assertGreater(experts * rows * k * k, GROUPED_MM_DENSE_MAX_MACS)
+        model = ExpertsBetweenReLUs(experts, k, k).half().eval().cuda()
         offs = torch.linspace(rows // experts, rows, experts).to(torch.int32).cuda()
-        x = torch.randn(rows, k).cuda()
+        x = torch.randn(rows, k, dtype=torch.float16).cuda()
         ep = torch.export.export(model, (x, offs))
         engine = (
             torch_tensorrt.dynamo.convert_exported_program_to_serialized_trt_engine(

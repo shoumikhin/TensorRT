@@ -156,17 +156,6 @@ def grouped_mm(
     return out
 
 
-def grouped_mm_kernel_available() -> bool:
-    """Whether a supported Triton is installed to build the grouped_mm_kernel plugin."""
-    from torch_tensorrt.kernels._triton import _triton_import
-
-    try:
-        _triton_import()
-    except ImportError:
-        return False
-    return True
-
-
 def grouped_mm_kernel(
     ctx: ConversionContext,
     target: Target,
