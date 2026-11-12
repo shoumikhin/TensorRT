@@ -9,7 +9,7 @@ needs neither Triton nor PyTorch. Importing this module needs Triton.
 """
 
 import threading
-from typing import Any, Tuple, Union
+from typing import Any, Dict, Tuple, Union
 
 import tensorrt as trt
 import tensorrt.plugin as trtp
@@ -117,6 +117,45 @@ def _describe(
     )
 
 
+def _signature(pointer: str) -> Dict[str, str]:
+    return {
+        "a_ptr": pointer,
+        "b_ptr": pointer,
+        "offs_ptr": "*i32",
+        "M": "i32",
+        "c_ptr": pointer,
+    }
+
+
+def _compile(pointer: str, groups: int, k: int, n: int) -> Any:
+    """The kernel's PTX for the current GPU, with the deepest pipeline that fits."""
+    constexprs = {
+        "N": n,
+        "K": k,
+        "GROUPS": groups,
+        "GROUPS_POW2": triton.next_power_of_2(groups),
+        "BLOCK_M": _BLOCK_M,
+        "BLOCK_N": _BLOCK_N,
+        "BLOCK_K": _BLOCK_K,
+    }
+    # From sm_100 on, Triton's tl.dot uses tensor memory, which a TensorRT
+    # plugin launch cannot set up. sm_80's mma.sync runs on every later GPU.
+    capability = triton.runtime.driver.active.get_current_target().arch
+    arch = 80 if capability >= 100 else None
+    for num_stages in _NUM_STAGES:
+        artifact = _triton.compile_triton_to_ptx(
+            _grouped_mm_kernel,
+            _signature(pointer),
+            constexprs,
+            num_warps=_NUM_WARPS,
+            num_stages=num_stages,
+            arch=arch,
+        )
+        if artifact.shared_mem <= 48 * 1024:
+            break
+    return artifact
+
+
 def _aot_impl(
     mat1: trtp.TensorDesc,
     mat2: trtp.TensorDesc,
@@ -128,34 +167,7 @@ def _aot_impl(
 ]:
     groups, k, n = (_common.constant_int(dim) for dim in mat2.shape_expr)
     pointer = "*" + _TRITON_DTYPES[mat1.dtype]
-    signature = {
-        "a_ptr": pointer,
-        "b_ptr": pointer,
-        "offs_ptr": "*i32",
-        "M": "i32",
-        "c_ptr": pointer,
-    }
-    constexprs = {
-        "N": n,
-        "K": k,
-        "GROUPS": groups,
-        "GROUPS_POW2": triton.next_power_of_2(groups),
-        "BLOCK_M": _BLOCK_M,
-        "BLOCK_N": _BLOCK_N,
-        "BLOCK_K": _BLOCK_K,
-    }
-    # The deepest pipeline that fits: on some GPUs, such as sm_100 and sm_110,
-    # Triton needs a few bytes more than 48 KiB for 3 stages.
-    for num_stages in _NUM_STAGES:
-        artifact = _triton.compile_triton_to_ptx(
-            _grouped_mm_kernel,
-            signature,
-            constexprs,
-            num_warps=_NUM_WARPS,
-            num_stages=num_stages,
-        )
-        if artifact.shared_mem <= 48 * 1024:
-            break
+    artifact = _compile(pointer, groups, k, n)
 
     def grid(inputs: Tuple[trtp.TensorDesc, ...], _: object) -> object:
         # Each group and the rows past the last offset can end in a partial row

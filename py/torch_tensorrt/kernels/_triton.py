@@ -836,6 +836,7 @@ def compile_triton_to_ptx(
     constexprs: Dict[str, Any],
     num_warps: Optional[int] = None,
     num_stages: Optional[int] = None,
+    arch: Optional[int] = None,
 ) -> CompiledTritonArtifact:
     """Compile a ``@triton.jit`` kernel to PTX ahead of time.
 
@@ -854,6 +855,9 @@ def compile_triton_to_ptx(
             Triton's own choice. Also sets the launch's threads-per-block.
         num_stages: software pipelining depth, forwarded to ``triton.compile``.
             Defaults to Triton's own choice.
+        arch: the compute capability whose instructions Triton uses, for
+            example 80 for ``mma.sync``. Defaults to the device's. The PTX still
+            targets the device.
 
     Returns:
         An immutable artifact containing unmodified PTX, the entry symbol,
@@ -869,7 +873,7 @@ def compile_triton_to_ptx(
 
     # Bind compilation to the recorded device, including when an environment
     # override would otherwise select a different architecture.
-    options: Dict[str, Any] = {"arch": f"sm{target.arch}"}
+    options: Dict[str, Any] = {"arch": f"sm{arch or target.arch}"}
     if num_warps is not None:
         options["num_warps"] = num_warps
     if num_stages is not None:
