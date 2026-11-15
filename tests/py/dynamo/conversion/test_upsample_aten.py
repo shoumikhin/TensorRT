@@ -494,6 +494,28 @@ class TestUpsampleConverter(DispatchTestCase):
         )
         self.assertEqual(antialiased_upsample_validator(node, settings), expected)
 
+    @parameterized.expand(
+        [
+            ("bilinear", torch.ops.aten._upsample_bilinear2d_aa.default, False, True),
+            ("bicubic", torch.ops.aten._upsample_bicubic2d_aa.default, False, False),
+            (
+                "bicubic_opt_in",
+                torch.ops.aten._upsample_bicubic2d_aa.default,
+                True,
+                True,
+            ),
+        ]
+    )
+    def test_antialias2d_validator_default(self, _, op, convert, expected):
+        class TestModule(torch.nn.Module):
+            def forward(self, x):
+                return op(x, [4, 4], False, None, None)
+
+        exported = torch.export.export(TestModule(), (torch.zeros(1, 3, 8, 8),))
+        (node,) = (n for n in exported.graph.nodes if n.target == op)
+        settings = CompilationSettings(convert_antialiased_resize=convert)
+        self.assertEqual(antialiased_upsample_validator(node, settings), expected)
+
     def test_antialias2d_dynamic_batch_and_channels(self):
         class TestModule(torch.nn.Module):
             def forward(self, x):
