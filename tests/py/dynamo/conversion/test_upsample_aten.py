@@ -424,6 +424,29 @@ class TestUpsampleConverter(DispatchTestCase):
             convert_antialiased_resize=True,
         )
 
+    @parameterized.expand(
+        [
+            ("bilinear", torch.ops.aten._upsample_bilinear2d_aa.default),
+            ("bicubic", torch.ops.aten._upsample_bicubic2d_aa.default),
+        ]
+    )
+    def test_antialias2d_matches_pytorch_closely(self, _, op):
+        # Images are often rounded to uint8 after the resize, and at this 16/13 downscale
+        # many exact results end in .5, so this needs far less than one rounding level.
+        # The weights match PyTorch's; only the float32 rounding of the sums may differ.
+        class TestModule(torch.nn.Module):
+            def forward(self, x):
+                return op(x, [234, 416], False, None, None)
+
+        self.run_test(
+            TestModule(),
+            [torch.randint(0, 256, (2, 3, 288, 512)).float()],
+            rtol=0,
+            atol=1e-4,
+            use_dynamo_tracer=True,
+            convert_antialiased_resize=True,
+        )
+
     def test_antialias2d_non_finite_pixels(self):
         class TestModule(torch.nn.Module):
             def forward(self, x):
