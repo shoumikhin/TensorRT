@@ -2824,7 +2824,9 @@ def test_lift_keeps_parameter_for_any_dtype(dtype, requires_grad):
 # next to the .pte.
 
 
-def _patch_executorch_lowering(monkeypatch, captured):
+def _patch_executorch_lowering(
+    monkeypatch, captured, log=None, etrecord_error=None, can_consume=True
+):
     """Spy the seams _save_as_executorch delegates to after #4440, without running a
     real TRT lowering. Records the kwargs forwarded into
     torch_tensorrt.executorch.export() (captured["export_kwargs"]); lets the real
@@ -2832,22 +2834,44 @@ def _patch_executorch_lowering(monkeypatch, captured):
     ExecuTorch lowering, so the kwargs export() finally hands that lowering --
     including the get_edge_compile_config() it substitutes for an omitted
     compile_config -- land in `captured`; and records backend_config from
-    to_executorch(). Fills `captured`; returns nothing."""
+    to_executorch(). Fills `captured`; returns nothing. With `log`, records the order of
+    the ETRecord, program and .ptd writes, and whether each write consumes;
+    `etrecord_error` makes the ETRecord save raise; `can_consume=False` stands in for
+    an ExecuTorch whose writes can only copy."""
     import executorch.exir as exir
     import torch_tensorrt._compile as tc
     import torch_tensorrt.executorch as tte
 
     class _FakeETRecord:
         def save(self, path):
+            if log is not None:
+                log.append("etrecord")
+            if etrecord_error is not None:
+                raise etrecord_error
             with open(path, "wb") as fh:
                 fh.write(b"etrecord")
 
     class _FakeExec:
-        def write_to_file(self, f):
+        _tensor_data = {"model": b""}
+
+        def write_to_file(self, f, consume=False):
+            if log is not None:
+                log.append(("program", consume))
             f.write(b"")
+
+        def write_tensor_data_to_file(self, outdir, consume=False):
+            if log is not None:
+                log.append(("ptd", consume))
 
         def get_etrecord(self):
             return _FakeETRecord()
+
+    class _CopyOnlyExec(_FakeExec):
+        def write_to_file(self, f):
+            super().write_to_file(f)
+
+        def write_tensor_data_to_file(self, outdir):
+            super().write_tensor_data_to_file(outdir)
 
     class _FakeEdge:
         # export() reorders each method's mutations after lowering, over every
@@ -2856,7 +2880,7 @@ def _patch_executorch_lowering(monkeypatch, captured):
 
         def to_executorch(self, config=None):
             captured["backend_config"] = config
-            return _FakeExec()
+            return _FakeExec() if can_consume else _CopyOnlyExec()
 
     # Innermost real lowering seam, called inside export(): capture the kwargs it
     # receives, notably compile_config already resolved to its default when omitted.
@@ -2875,7 +2899,6 @@ def _patch_executorch_lowering(monkeypatch, captured):
         return real_export(source, **kw)
 
     monkeypatch.setattr(tte, "export", _spy_export)
-    monkeypatch.setattr(tc, "_write_external_tensor_data", lambda prog, path: None)
     # ENABLED_FEATURES is an immutable namedtuple; swap the whole module attribute.
     monkeypatch.setattr(
         tc, "ENABLED_FEATURES", types.SimpleNamespace(torch_tensorrt_runtime=True)
@@ -2931,6 +2954,66 @@ def test_save_executorch_forwards_lowering_kwargs(monkeypatch, tmp_path):
     assert ExecutorchBackendConfig().memory_planning_pass.alignment == default_alignment
     # ETRecord persisted next to the .pte per ET's "<base>_etrecord.bin" convention.
     assert (tmp_path / "model_etrecord.bin").exists()
+
+
+@pytest.mark.unit
+def test_save_executorch_keeps_the_program_when_the_etrecord_fails(
+    monkeypatch, tmp_path
+):
+    pytest.importorskip("executorch.exir")
+    import torch_tensorrt._compile as tc
+
+    log = []
+    _patch_executorch_lowering(
+        monkeypatch, {}, log=log, etrecord_error=RuntimeError("cannot serialize")
+    )
+    out = tmp_path / "model.pte"
+    ep = torch.export.export(_AddOne(), (torch.randn(2, 2),))
+    with pytest.raises(RuntimeError, match="cannot serialize"):
+        tc._save_as_executorch(ep, str(out), generate_etrecord=True)
+
+    assert log == [("program", False), ("ptd", False), "etrecord"]
+    assert out.exists()
+
+
+@pytest.mark.unit
+def test_compile_and_save_saves_the_etrecord_before_the_engines_move(
+    monkeypatch, tmp_path
+):
+    pytest.importorskip("executorch.exir")
+    import torch_tensorrt._compile as tc
+    from torch_tensorrt.dynamo.runtime._offloaded_engines import (
+        offload_engines_to_disk,
+    )
+
+    log = []
+    _patch_executorch_lowering(monkeypatch, {}, log=log)
+    ep = torch.export.export(_AddOne(), (torch.randn(2, 2),))
+    # The block compile_and_save runs its save in, where writing the program moves the engines out
+    # of the files the ETRecord reads.
+    with offload_engines_to_disk():
+        tc._save_as_executorch(ep, str(tmp_path / "model.pte"), generate_etrecord=True)
+
+    assert log == ["etrecord", ("program", True), ("ptd", True)]
+
+
+@pytest.mark.unit
+def test_compile_and_save_copies_with_an_executorch_that_cannot_consume(
+    monkeypatch, tmp_path
+):
+    pytest.importorskip("executorch.exir")
+    import torch_tensorrt._compile as tc
+    from torch_tensorrt.dynamo.runtime._offloaded_engines import (
+        offload_engines_to_disk,
+    )
+
+    log = []
+    _patch_executorch_lowering(monkeypatch, {}, log=log, can_consume=False)
+    ep = torch.export.export(_AddOne(), (torch.randn(2, 2),))
+    with offload_engines_to_disk():
+        tc._save_as_executorch(ep, str(tmp_path / "model.pte"), generate_etrecord=True)
+
+    assert log == [("program", False), ("ptd", False), "etrecord"]
 
 
 @pytest.mark.unit

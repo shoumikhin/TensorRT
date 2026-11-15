@@ -77,6 +77,7 @@ if ENABLED_FEATURES.dynamo_frontend:
     from torch_tensorrt.dynamo._tracer import trace as dynamo_trace
     from torch_tensorrt.dynamo.runtime import TorchTensorRTModule
     from torch_tensorrt.dynamo.runtime._offloaded_engines import (
+        defer_engine_setup_to_load,
         offload_engines_to_disk,
     )
     from torch_tensorrt.dynamo.utils import get_torch_inputs
@@ -1550,6 +1551,9 @@ def compile_and_save(
     but each engine is written to a file as soon as it is built, so no built engine is held on the GPU
     or in host memory while the next ones build. With ``output_format="executorch"`` no engine is ever
     loaded: the save streams each file into the ``.pte`` (or the ``.ptd`` with ``external_engine_data``).
+    When ExecuTorch can consume file-backed data on a write, and the temporary directory (``TMPDIR``) is
+    on the same file system as ``file_path``, the save moves each file there instead, so no engine is on
+    disk twice.
     The other formats save each engine from a loaded one, so their engines are loaded once all of them
     are built, and their save needs as much memory as after ``compile``.
 
@@ -1600,7 +1604,9 @@ def compile_and_save(
         save(trt_gm, os.fspath(file_path), output_format=output_format, **save_kwargs)
 
 
-def _write_external_tensor_data(executorch_program: Any, file_path: str) -> None:
+def _write_external_tensor_data(
+    executorch_program: Any, file_path: str, consume: bool = False
+) -> None:
     """Write an ExecuTorch program's external named tensor data (``.ptd``) next to the ``.pte``.
 
     The CUDA (AOTInductor) backend emits its weights as external named data
@@ -1616,7 +1622,10 @@ def _write_external_tensor_data(executorch_program: Any, file_path: str) -> None
     # Direct attribute access (no getattr default) so a future rename fails loud.
     if executorch_program._tensor_data:
         out_dir = os.path.dirname(os.path.abspath(file_path))
-        executorch_program.write_tensor_data_to_file(out_dir)
+        if consume:
+            executorch_program.write_tensor_data_to_file(out_dir, consume=True)
+        else:
+            executorch_program.write_tensor_data_to_file(out_dir)
         # write_tensor_data_to_file adds .ptd unless the name already ends with it.
         paths = [
             os.path.join(out_dir, name if name.endswith(".ptd") else f"{name}.ptd")
@@ -1752,13 +1761,26 @@ def _lower_and_write_executorch(
         # the same call is the caller's to make, because finalization happens on
         # ExecuTorch's own manager and out of this library's sight.
         check_zero_copy_kv(executorch_program)
+    # Follows ExecuTorch's example convention (e.g. examples/cuda/scripts/export.py):
+    # persist the ETRecord as "<pte_base>_etrecord.bin" next to the .pte.
+    etrecord_path = os.path.splitext(file_path)[0] + "_etrecord.bin"
+    # Inside compile_and_save the engines are in files deleted after this save, so the writes move
+    # them into the program instead of copying them, when ExecuTorch can. The ETRecord reads the
+    # engines, so then it is saved first. Elsewhere it is saved last, so the program is kept even
+    # when the ETRecord can't be saved.
+    consume = (
+        defer_engine_setup_to_load()
+        and "consume" in inspect.signature(executorch_program.write_to_file).parameters
+    )
+    if generate_etrecord and consume:
+        executorch_program.get_etrecord().save(etrecord_path)
     with open(file_path, "wb") as f:
-        executorch_program.write_to_file(f)
-    _write_external_tensor_data(executorch_program, file_path)
-    if generate_etrecord:
-        # Follows ExecuTorch's example convention (e.g. examples/cuda/scripts/export.py):
-        # persist the ETRecord as "<pte_base>_etrecord.bin" next to the .pte.
-        etrecord_path = os.path.splitext(file_path)[0] + "_etrecord.bin"
+        if consume:
+            executorch_program.write_to_file(f, consume=True)
+        else:
+            executorch_program.write_to_file(f)
+    _write_external_tensor_data(executorch_program, file_path, consume)
+    if generate_etrecord and not consume:
         executorch_program.get_etrecord().save(etrecord_path)
 
 

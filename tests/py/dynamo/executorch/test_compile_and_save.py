@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import glob
+import inspect
 import os
 import tempfile
 
@@ -74,3 +75,49 @@ def test_engines_stream_from_their_files_into_the_program(tmp_path, monkeypatch)
     assert all(pte.find(engine) >= 0 for engine in streamed.values())
     # The files are gone once the program is saved.
     assert not glob.glob(str(tmp_path / "**" / "*.engine"), recursive=True)
+
+
+@pytest.mark.unit
+def test_engines_move_into_the_program_without_a_second_copy(tmp_path, monkeypatch):
+    if "consume" not in inspect.signature(FileBackedData.write_to_file).parameters:
+        pytest.skip("This ExecuTorch can only copy file-backed data")
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    left = []
+    real_write = FileBackedData.write_to_file
+
+    def recording_write(self, outfile, **kwargs):
+        real_write(self, outfile, **kwargs)
+        left.append(os.path.getsize(self._path))
+
+    monkeypatch.setattr(FileBackedData, "write_to_file", recording_write)
+    torch.manual_seed(0)
+    x = torch.randn(4, 64, device="cuda")
+    torch_tensorrt.compile_and_save(
+        torch.export.export(_TwoEngines().eval().cuda(), (x,)),
+        tmp_path / "model.pte",
+        output_format="executorch",
+        arg_inputs=[x],
+        min_block_size=1,
+        torch_executed_ops={torch.ops.aten.sin.default},
+    )
+    # Each engine file was emptied as it was written, so no engine was ever on disk twice.
+    assert left == [0, 0]
+
+
+@pytest.mark.unit
+def test_an_etrecord_is_saved_from_the_engines_before_they_move(tmp_path, monkeypatch):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    torch.manual_seed(0)
+    x = torch.randn(4, 64, device="cuda")
+    pte_path = tmp_path / "model.pte"
+    torch_tensorrt.compile_and_save(
+        torch.export.export(_TwoEngines().eval().cuda(), (x,)),
+        pte_path,
+        output_format="executorch",
+        arg_inputs=[x],
+        min_block_size=1,
+        torch_executed_ops={torch.ops.aten.sin.default},
+        save_options={"generate_etrecord": True},
+    )
+    assert pte_path.stat().st_size > 0
+    assert (tmp_path / "model_etrecord.bin").stat().st_size > 0

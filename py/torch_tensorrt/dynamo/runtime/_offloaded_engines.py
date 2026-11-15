@@ -8,6 +8,7 @@ directory as soon as it is built, and gives its ``TorchTensorRTModule`` the file
 engines built so far are then held neither on the GPU nor in host memory while the next ones build.
 ``compile_module`` leaves them in their files: an ExecuTorch save streams each file into the program, and
 ``compile_and_save`` loads them before any other save. The files are deleted when the block ends.
+A file the save moved stays mapped, empty, until then, so nothing may read its engine after the save.
 """
 
 import contextlib
