@@ -1576,6 +1576,7 @@ def _index_copy_kv_eligible(
     * dim argument is exactly 2.
     * Source tensor has rank 4 with shape[2] == 1 (single-position
       write; matches HF's per-step StaticCache.update call).
+    * This TensorRT has IKVCacheUpdateLayer (10.15 and later).
     * Batch is 1 (avoids writeIndices broadcasting; trivially extensible
       to larger batches when needed).
 
@@ -1593,6 +1594,8 @@ def _index_copy_kv_eligible(
     # index_copy leaves its input alone. The classifier passes input_node while it
     # decides.
     if input_node is None and not node.meta.get("_trt_kv_alias"):
+        return False
+    if not impl.slice_scatter.kv_cache_update_supported():
         return False
     if len(node.args) < 4:
         return False

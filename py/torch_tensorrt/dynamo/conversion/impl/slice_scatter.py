@@ -52,6 +52,12 @@ from torch_tensorrt.dynamo.utils import DYNAMIC_DIM
 logger = logging.getLogger(__name__)
 
 
+def kv_cache_update_supported() -> bool:
+    """Whether this TensorRT has IKVCacheUpdateLayer. It came in 10.15, and the
+    JetPack build of Torch-TensorRT uses TensorRT 10.3."""
+    return hasattr(trt.INetworkDefinition, "add_kv_cache_update")
+
+
 def _kv_eligible(
     cache_shape: Tuple[int, ...],
     dim: int,
@@ -63,6 +69,8 @@ def _kv_eligible(
 
     Returns (eligible, reason). The reason is non-empty in both cases for logs.
     """
+    if not kv_cache_update_supported():
+        return False, "this TensorRT has no IKVCacheUpdateLayer"
     if any(not isinstance(s, int) or s < 0 for s in cache_shape):
         return False, f"cache shape is dynamic ({cache_shape}); s_max must be static"
     if len(cache_shape) != 4:

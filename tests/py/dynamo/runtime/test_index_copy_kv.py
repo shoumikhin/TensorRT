@@ -1407,5 +1407,73 @@ class TestEngineCacheNamesTheAliasedInput(TestCase):
         self.assertEqual(key(True), key(None))
 
 
+class TestWithoutTheKVCacheLayer(TestCase):
+    """TensorRT 10.3, used for JetPack, has no IKVCacheUpdateLayer, so a cache write
+    is copied back there instead of updated in place."""
+
+    def test_cache_writes_are_copied_back(self):
+        from unittest import mock
+
+        from torch_tensorrt.dynamo.conversion.impl import slice_scatter
+
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("cache", torch.zeros(1, 4, 16, 8, device="cuda"))
+                self.register_buffer("other", torch.zeros(1, 4, 16, 8, device="cuda"))
+
+            def forward(self, x, pos):
+                self.cache.index_copy_(2, pos, x)
+                self.other[:, :, 5:6, :] = x
+                return self.cache.sum(2) + self.other.sum(2)
+
+        model = M().cuda()
+        eager = copy.deepcopy(model)
+        args = (torch.ones(1, 4, 1, 8, device="cuda"), torch.tensor([2], device="cuda"))
+        with mock.patch.object(
+            slice_scatter, "kv_cache_update_supported", return_value=False
+        ):
+            compiled = _compile(model, args)
+        self.assertEqual(_aliased_io(compiled), {})
+        self.assertEqual(
+            sorted(compiled.meta.get("_copyback_mutation_buffers")), ["cache", "other"]
+        )
+        for step in range(3):
+            x = torch.full((1, 4, 1, 8), float(step + 1), device="cuda")
+            pos = torch.tensor([step], device="cuda")
+            out = compiled(x, pos)
+            out = out[0] if isinstance(out, (tuple, list)) else out
+            torch.testing.assert_close(out, eager(x, pos))
+            torch.testing.assert_close(compiled.cache, eager.cache)
+
+    def test_a_caller_cache_write_is_written_back(self):
+        """The write is not done in place, so its write-back stores it in the
+        caller's tensor."""
+        from unittest import mock
+
+        from torch_tensorrt.dynamo.conversion.impl import slice_scatter
+
+        class M(torch.nn.Module):
+            def forward(self, cache, x, pos):
+                cache.index_copy_(2, pos, x)
+                return cache.sum(2)
+
+        args = (
+            torch.zeros(1, 4, 16, 8, device="cuda"),
+            torch.ones(1, 4, 1, 8, device="cuda"),
+            torch.tensor([2], device="cuda"),
+        )
+        with mock.patch.object(
+            slice_scatter, "kv_cache_update_supported", return_value=False
+        ):
+            compiled = _compile(M(), [a.clone() for a in args])
+        self.assertEqual(_aliased_io(compiled), {})
+        given, expected = [a.clone() for a in args], [a.clone() for a in args]
+        out = compiled(*given)
+        out = out[0] if isinstance(out, (tuple, list)) else out
+        torch.testing.assert_close(out, M()(*expected))
+        torch.testing.assert_close(given[0], expected[0])
+
+
 if __name__ == "__main__":
     run_tests()
