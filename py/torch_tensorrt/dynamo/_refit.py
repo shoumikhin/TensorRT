@@ -34,6 +34,10 @@ from torch_tensorrt.dynamo.lowering import (
     pre_export_lowering,
     remove_alias_from_exported_program,
 )
+from torch_tensorrt.dynamo.lowering._buffer_lifting import (
+    buffers_restored,
+    copy_into_lifted_buffers,
+)
 from torch_tensorrt.dynamo.runtime._serialized_engine_layout import (
     ENGINE_IDX,
     SERIALIZED_METADATA_IDX,
@@ -496,12 +500,20 @@ def refit_module_weights(
     if verify_output and arg_inputs is not None:
         new_gm.to(to_torch_device(settings.device))  # move to device for inference
         _restore_complex_io(new_gm)
-        outputs_match = check_module_output(
-            new_module=new_gm,
-            refitted_module=compiled_module,
-            arg_inputs=torch_inputs,
-            kwarg_inputs=torch_kwarg_inputs,
-        )
+        # The check calls the module, which must keep the buffers it had before. A
+        # model's outputs depend on its buffers, so both start from the new model's.
+        with buffers_restored(compiled_module):
+            copy_into_lifted_buffers(
+                compiled_module,
+                {**new_weight_module.state_dict, **new_weight_module.constants},
+                new_weight_module.graph_signature.buffers_to_mutate.values(),
+            )
+            outputs_match = check_module_output(
+                new_module=new_gm,
+                refitted_module=compiled_module,
+                arg_inputs=torch_inputs,
+                kwarg_inputs=torch_kwarg_inputs,
+            )
         if outputs_match:
             logger.info("Refitting Succeed!")
         else:

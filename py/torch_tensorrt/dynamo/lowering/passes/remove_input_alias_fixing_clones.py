@@ -30,6 +30,9 @@ def remove_input_alias_fixing_clones(
     update the classifier in the same change. ``compile()`` cross-checks the
     prediction against the built engine either way, so the failure surfaces as an
     error rather than as a broken module.
+
+    The clone of a buffer filed copy-back stays: it holds the buffer's old value,
+    and the compiled module writes the new value into the buffer before it returns.
     """
     modified_graph = False
 
@@ -39,6 +42,7 @@ def remove_input_alias_fixing_clones(
         # needs to be undone
         if (
             node.op == "placeholder"
+            and not node.meta.get("_copyback_buffer")
             and len(node.users) == 1
             and list(node.users)[0].target == torch.ops.aten.clone.default
         ):

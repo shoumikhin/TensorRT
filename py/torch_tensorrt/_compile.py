@@ -75,6 +75,7 @@ if ENABLED_FEATURES.dynamo_frontend:
         get_dynamic_shapes_kwargs,
     )
     from torch_tensorrt.dynamo._tracer import trace as dynamo_trace
+    from torch_tensorrt.dynamo.lowering._buffer_lifting import buffers_restored
     from torch_tensorrt.dynamo.runtime import TorchTensorRTModule
     from torch_tensorrt.dynamo.runtime._offloaded_engines import (
         offload_engines_to_disk,
@@ -1267,9 +1268,12 @@ def save(
     elif module_type == _ModuleType.fx:
         # The module type is torch.fx.GraphModule
         if output_format == "torchscript":
-            module_ts = torch.jit.trace(
-                module, arg_inputs, example_kwarg_inputs=kwarg_inputs
-            )
+            # Tracing calls the module, and the saved module must start from the
+            # buffers it had before the save.
+            with buffers_restored(module):
+                module_ts = torch.jit.trace(
+                    module, arg_inputs, example_kwarg_inputs=kwarg_inputs
+                )
             function_overload_with_kwargs(
                 torch.jit.save,
                 module_ts,
