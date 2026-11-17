@@ -237,7 +237,12 @@ def _kv_write_will_alias(
         # OK is the only status that resolves all three bounds to Python ints.
         assert start is not None and end is not None and step is not None
         eligible, _reason = _kv_eligible(
-            tuple(cache_shape), dim, start, end - start, step
+            tuple(cache_shape),
+            dim,
+            start,
+            end - start,
+            step,
+            cache_input.meta["val"].dtype,
         )
         return bool(eligible)
 

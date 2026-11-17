@@ -670,6 +670,20 @@ class TestSliceScatterDerivationIsShared(TestCase):
         self.assertFalse(self._classify((2, 4, 16, 8), (2, 4, 4, 8), 2, 0, 8, 2))
         self.assertFalse(self._classify((2, 4, 16, 8), (2, 4, 3, 8), 2, 0, 8, 3))
 
+    def test_an_integer_cache_is_not_kv_eligible(self):
+        """IKVCacheUpdateLayer takes floating-point caches only."""
+        from torch_tensorrt.dynamo.lowering._buffer_lifting import _kv_write_will_alias
+
+        graph = torch.fx.Graph()
+        cache = graph.placeholder("cache")
+        cache.meta["val"] = torch.empty((2, 4, 16, 8), dtype=torch.int32, device="meta")
+        src = graph.placeholder("src")
+        src.meta["val"] = torch.empty((2, 4, 1, 8), dtype=torch.int32, device="meta")
+        node = graph.call_function(
+            torch.ops.aten.slice_scatter.default, args=(cache, src, 2, 3, 4)
+        )
+        self.assertFalse(_kv_write_will_alias(node, (2, 4, 16, 8)))
+
     def test_resolve_reports_the_converter_early_exits(self):
         """Each status comes back with the bounds its contract promises, since a
         caller reads the bounds on the strength of the status alone."""

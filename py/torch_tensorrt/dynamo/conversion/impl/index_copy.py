@@ -8,8 +8,8 @@ gated by a validator (declared in ``aten_ops_converters.py``) and there
 are two registered converters for the same op:
 
 * ``aten_ops_index_copy_kv`` — HIGH priority, validator-gated. Fires only
-  when the input is a 4-D static cache, ``dim=2``, and the source has
-  ``shape[2] == 1`` (single-position write — the common
+  when the input is a 4-D static floating-point cache, ``dim=2``, and the
+  source has ``shape[2] == 1`` (single-position write, the common
   streaming-decoder pattern). Emits ``IKVCacheUpdateLayer`` whose output
   is aliased to the cache input.
 

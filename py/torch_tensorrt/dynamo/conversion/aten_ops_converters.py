@@ -1577,6 +1577,8 @@ def _index_copy_kv_eligible(
     * Source tensor has rank 4 with shape[2] == 1 (single-position
       write; matches HF's per-step StaticCache.update call).
     * This TensorRT has IKVCacheUpdateLayer (10.15 and later).
+    * The cache is float32, float16 or bfloat16, the types
+      IKVCacheUpdateLayer accepts.
     * Batch is 1 (avoids writeIndices broadcasting; trivially extensible
       to larger batches when needed).
 
@@ -1607,6 +1609,8 @@ def _index_copy_kv_eligible(
         return False
     input_val = input_node.meta.get("val")
     if input_val is None:
+        return False
+    if input_val.dtype not in impl.slice_scatter.KV_CACHE_DTYPES:
         return False
     input_shape = tuple(input_val.shape)
     if len(input_shape) != 4:

@@ -209,6 +209,64 @@ class TestIndexCopyFallback(TestCase):
         eager = torch.ops.aten.index_copy.default(x.clone(), -1, index, update)
         torch.testing.assert_close(out, eager)
 
+    def test_integer_cache_buffer_uses_fallback(self):
+        """The KV layer takes floating-point caches only, so a one-token write into an
+        integer cache buffer, by index_copy or by slice assignment, takes the
+        fallback and is copied back."""
+
+        class M(torch.nn.Module):
+            def __init__(self, dtype):
+                super().__init__()
+                self.register_buffer("cache", torch.zeros(1, 4, 16, 8, dtype=dtype))
+                self.register_buffer("other", torch.zeros(1, 4, 16, 8, dtype=dtype))
+
+            def forward(self, x, input_pos):
+                self.cache.index_copy_(2, input_pos, x)
+                self.other[:, :, 5:6, :] = x
+                return self.cache.sum(2) + self.other.sum(2)
+
+        for dtype in (torch.int32, torch.int64):
+            with self.subTest(dtype=dtype):
+
+                def step(i):
+                    x = torch.full((1, 4, 1, 8), i + 1, device="cuda").to(dtype)
+                    return x, torch.tensor([2 + i], device="cuda")
+
+                eager = M(dtype).cuda()
+                compiled = _compile(M(dtype).cuda(), step(0))
+                self.assertEqual(_aliased_io(compiled), {})
+                self.assertEqual(
+                    sorted(compiled.meta.get("_copyback_mutation_buffers")),
+                    ["cache", "other"],
+                )
+                for i in range(3):
+                    out = compiled(*step(i))
+                    out = out[0] if isinstance(out, tuple) else out
+                    torch.testing.assert_close(out, eager(*step(i)))
+                    torch.testing.assert_close(compiled.cache, eager.cache)
+                    torch.testing.assert_close(compiled.other, eager.other)
+
+    def test_integer_caller_cache_is_written_back(self):
+        """The fallback is not in place, so its write-back stores the write in the
+        caller's tensor."""
+
+        class M(torch.nn.Module):
+            def forward(self, cache, x, input_pos):
+                cache.index_copy_(2, input_pos, x)
+                return cache.sum(2)
+
+        args = (
+            torch.zeros(1, 4, 16, 8, dtype=torch.int32, device="cuda"),
+            torch.ones(1, 4, 1, 8, dtype=torch.int32, device="cuda"),
+            torch.tensor([2], device="cuda"),
+        )
+        compiled = _compile(M(), [a.clone() for a in args])
+        given, expected = [a.clone() for a in args], [a.clone() for a in args]
+        out = compiled(*given)
+        out = out[0] if isinstance(out, (tuple, list)) else out
+        torch.testing.assert_close(out, M()(*expected))
+        torch.testing.assert_close(given[0], expected[0])
+
 
 class _Scale(torch.nn.Module):
     """A submodule a test can name in ``torch_executed_modules``."""
