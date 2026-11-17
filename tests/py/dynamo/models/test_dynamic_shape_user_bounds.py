@@ -701,5 +701,26 @@ def test_construct_dynamic_input_preserves_zero_minimum():
     assert input_spec.shape["max_shape"] == (4, 1)
 
 
+@pytest.mark.unit
+def test_an_input_spec_that_rules_out_the_traced_size():
+    """The program is traced with 4 rows, and the ``Input`` spec starts at 8."""
+
+    class M(torch.nn.Module):
+        def forward(self, x):
+            return x * 2 + 1
+
+    b = torch.export.Dim("b", min=1, max=8)
+    for name, rows in (("plain", b), ("computed", 2 * b)):
+        x = torch.randn(4, 4, device="cuda")
+        ep = torch.export.export(M().cuda(), (x,), dynamic_shapes={"x": {0: rows}})
+        trt = torchtrt.dynamo.compile(
+            ep,
+            inputs=[Input(min_shape=(8, 4), opt_shape=(8, 4), max_shape=(8, 4))],
+            min_block_size=1,
+        )
+        y = torch.randn(8, 4, device="cuda")
+        torch.testing.assert_close(trt(y), M()(y), msg=name)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

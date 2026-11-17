@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import collections.abc
+import copy
 import logging
 import operator
 import os
@@ -18,6 +19,7 @@ from torch.export.graph_signature import InputKind
 from torch.fx.graph import _PyTreeCodeGen, _PyTreeInfo
 from torch.fx.node import Target
 from torch.utils._sympy.numbers import int_oo
+from torch.utils._sympy.value_ranges import bound_sympy
 from torch_tensorrt._Device import Device
 from torch_tensorrt._enums import EngineCapability, dtype
 from torch_tensorrt._features import ENABLED_FEATURES, needs_cross_compile
@@ -77,6 +79,7 @@ from torch_tensorrt.dynamo.runtime._offloaded_engines import (
 from torch_tensorrt.dynamo.tools.weight_mapping import has_mapped_weights
 from torch_tensorrt.dynamo.utils import (
     deallocate_module,
+    extract_var_range_info,
     get_cpu_memory_usage,
     get_flat_args_with_check,
     get_output_metadata,
@@ -454,6 +457,9 @@ def cross_compile_for_windows(
     exported_program = remove_alias_from_exported_program(exported_program)
 
     gm = exported_program.module()
+    _mark_index_copies_engines_cannot_size(
+        gm, exported_program.range_constraints, settings, lift_buffers=False
+    )
     logger.debug("Input graph: " + str(gm.graph))
 
     # Buffers stay engine constants here, but a write into a caller's tensor is
@@ -490,6 +496,7 @@ def cross_compile_for_windows(
         trt_kwarg_inputs,
         settings,
         graph_signature=exported_program.graph_signature,
+        range_constraints=exported_program.range_constraints,
     )
     assert_predicted_kv_aliased(
         aliased_input_bindings(
@@ -966,6 +973,9 @@ def compile(
     exported_program = remove_alias_from_exported_program(exported_program)
 
     gm = exported_program.module()
+    _mark_index_copies_engines_cannot_size(
+        gm, exported_program.range_constraints, settings
+    )
     # Move the weights in the state_dict to CPU
     logger.debug("Input graph: " + str(gm.graph))
 
@@ -1021,6 +1031,7 @@ def compile(
         settings,
         engine_cache,
         graph_signature=exported_program.graph_signature,
+        range_constraints=exported_program.range_constraints,
     )
     if _copyback_mutation_buffers:
         trt_gm.meta["_copyback_mutation_buffers"] = _copyback_mutation_buffers
@@ -1062,6 +1073,116 @@ def compile(
     if _copyback_mutation_buffers:
         hide_copyback_outputs(trt_gm, trt_gm.meta["_copyback_mutation_buffers"])
     return trt_gm
+
+
+def _mark_index_copies_engines_cannot_size(
+    gm: torch.fx.GraphModule,
+    range_constraints: Dict[sympy.Symbol, Any],
+    settings: CompilationSettings,
+    *,
+    lift_buffers: bool = True,
+    host_inputs_copied: bool = True,
+) -> None:
+    """Mark each ``index_copy`` to run in PyTorch when that lets a size of 0 work.
+
+    The write's converter cannot take a size of 0: an engine profile for a ``Dim``
+    starts at 1, and a data-dependent size, whose profile starts at 0, fails in the
+    write's own slice. The program's ``range_constraints`` say which sizes can be 0.
+    ``Input`` specs only shape the profiles: refit sees the program alone and has to
+    split it the same way. Keeping the write in PyTorch helps only if no engine takes
+    that size as an input whose profile starts at 1, and which ops share an engine is
+    the partitioner's call (``min_block_size``, ``torch_executed_ops``, constant
+    folding). So every such write is marked, a copy of the graph is lifted, lowered
+    and partitioned as compilation does it, and a write whose every size of 0 also
+    reaches such an engine input is unmarked: a call of size 0 fails in that engine
+    anyway, and the write is done in place. The converters' validators, which see
+    the node alone, read the mark.
+    """
+    CONVERTERS.set_compilation_settings(settings)
+
+    def sizes_that_can_be_zero(
+        node: Any, profile_starts_at_1: bool = False
+    ) -> Set[sympy.Expr]:
+        if not isinstance(node, torch.fx.Node) or not isinstance(
+            node.meta.get("val"), torch.Tensor
+        ):
+            return set()
+        sizes = set()
+        for size in node.meta["val"].shape:
+            if not isinstance(size, torch.SymInt):
+                continue
+            expr = size.node.expr
+            if expr in range_constraints:
+                lower = range_constraints[expr].lower
+            elif expr.free_symbols <= range_constraints.keys():
+                bounds = {s: range_constraints[s] for s in expr.free_symbols}
+                lower = bound_sympy(expr, bounds).lower
+            else:
+                continue
+            if lower > 0:
+                continue
+            if profile_starts_at_1:
+                profile = extract_var_range_info(
+                    size, range_constraints=range_constraints
+                )
+                if profile["min"] is None or profile["min"] < 1:
+                    continue
+            sizes.add(expr)
+        return sizes
+
+    writes = {
+        node: set().union(*(sizes_that_can_be_zero(node.args[i]) for i in (0, 2, 3)))
+        for node in gm.graph.nodes
+        if node.target is torch.ops.aten.index_copy.default and len(node.args) >= 4
+    }
+    writes = {write: sizes for write, sizes in writes.items() if sizes}
+    if not writes:
+        return
+    for write in writes:
+        write.meta["_trt_size_outside_profile"] = True
+
+    # Lifting reads the mark and erases nodes, so the trial runs on a copy that
+    # shares the weights.
+    shared = [*gm.parameters(), *gm.buffers()] + [
+        value
+        for module in gm.modules()
+        for value in vars(module).values()
+        if isinstance(value, torch.Tensor)
+    ]
+    trial = copy.deepcopy(gm, {id(tensor): tensor for tensor in shared})
+    trial, _ = lift_mutated_buffers(
+        trial,
+        settings,
+        lift_buffers=lift_buffers,
+        host_inputs_copied=host_inputs_copied,
+    )
+    trial = post_lowering(trial, settings)
+    partition_args = dict(
+        min_block_size=settings.min_block_size,
+        torch_executed_ops=settings.torch_executed_ops,
+        torch_executed_modules=settings.torch_executed_modules,
+    )
+    partitioned = None
+    if settings.use_fast_partitioner:
+        try:
+            partitioned, _ = partitioning.fast_partition(trial, **partition_args)
+        except torch.fx.passes.splitter_base.FxNetSplitterInternalError:
+            pass  # compile_module falls back to the global partitioner too
+    if partitioned is None:
+        partitioned, _ = partitioning.global_partition(trial, **partition_args)
+    sizes_engines_need_above_0 = set().union(
+        *(
+            sizes_that_can_be_zero(placeholder, profile_starts_at_1=True)
+            for node in partitioned.graph.nodes
+            if node.op == "call_module" and "_run_on_acc" in str(node.target)
+            for placeholder in partitioned.get_submodule(node.target).graph.find_nodes(
+                op="placeholder"
+            )
+        )
+    )
+    for write, sizes in writes.items():
+        if sizes <= sizes_engines_need_above_0:
+            del write.meta["_trt_size_outside_profile"]
 
 
 def _insert_complex_io_adapters(
@@ -1425,6 +1546,7 @@ def compile_module(
     engine_cache: Optional[BaseEngineCache] = None,
     *,
     graph_signature: Optional[torch.export.graph_signature.ExportGraphSignature] = None,
+    range_constraints: Optional[Dict[sympy.Expr, Any]] = None,
     _debugger_config: Optional[DebuggerConfig] = None,
 ) -> torch.fx.GraphModule:
     """Compile a traced FX module
@@ -1603,6 +1725,7 @@ def compile_module(
             gm,
             user_symbol_bounds=user_symbol_bounds,
             example_tensors=False,
+            range_constraints=range_constraints,
         )
         read: Set[int] = set()
         if weight_releaser is not None:
@@ -1833,6 +1956,7 @@ def compile_module(
             num_profiles=num_profiles,
             user_symbol_bounds=user_symbol_bounds,
             example_tensors=False,
+            range_constraints=range_constraints,
         )
 
         assert submodule_inputs is not None
@@ -2530,6 +2654,13 @@ def convert_exported_program_to_serialized_trt_engine(
     exported_program = remove_alias_from_exported_program(exported_program)
 
     gm = exported_program.module()
+    _mark_index_copies_engines_cannot_size(
+        gm,
+        exported_program.range_constraints,
+        settings,
+        lift_buffers=lift_mutable_buffers,
+        host_inputs_copied=False,
+    )
     # Move the weights in the state_dict to CPU
     logger.debug("Input graph: " + str(gm.graph))
 

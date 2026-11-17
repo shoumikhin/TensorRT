@@ -200,13 +200,22 @@ def _kv_write_will_alias(
     if value_node.target is torch.ops.aten.index_copy.default:
         from torch_tensorrt.dynamo.conversion.aten_ops_converters import (
             _index_copy_kv_eligible,
+            _index_is_consecutive_run,
         )
 
         # The validator applies its own placeholder check to args[0], and here that
         # can still be the clone lowering is about to erase. Point it at what the
         # converter will be handed instead; the partitioner, running after lowering,
-        # passes nothing and reads args[0] itself.
-        return bool(_index_copy_kv_eligible(value_node, input_node=cache_input))
+        # passes nothing and reads args[0] itself. The index is read here too, before
+        # constant folding and partitioning hide how it was built; the partitioner
+        # reads the result from the _trt_kv_alias mark lift_mutated_buffers records.
+        return bool(
+            _index_copy_kv_eligible(
+                value_node,
+                input_node=cache_input,
+                index_is_run=len(args) > 2 and _index_is_consecutive_run(args[2]),
+            )
+        )
 
     if value_node.target is torch.ops.aten.slice_scatter.default:
         from torch_tensorrt.dynamo.conversion.impl.slice_scatter import (
@@ -572,7 +581,8 @@ def lift_mutated_buffers(
     memory itself, the example's device does not matter.
 
     The partitioners keep a subgraph holding a write classified in place in an
-    engine whatever its size.
+    engine whatever its size, and the ``index_copy`` converter needs that mark
+    before it writes several tokens from one start.
 
     The markers go on the write *nodes* while the classification is per *buffer*, so
     one value node written back into two buffers would put the two in conflict.

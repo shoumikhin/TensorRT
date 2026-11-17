@@ -10,8 +10,11 @@ are two registered converters for the same op:
 * ``aten_ops_index_copy_kv`` — HIGH priority, validator-gated. Fires only
   when the input is a 4-D static floating-point cache, ``dim=2``, and the
   source has ``shape[2] == 1`` (single-position write, the common
-  streaming-decoder pattern). Emits ``IKVCacheUpdateLayer`` whose output
-  is aliased to the cache input.
+  streaming-decoder pattern) or, for a module buffer that
+  ``lift_mutated_buffers`` classified in place, is written at consecutive
+  positions ``start + arange(n)`` (a prefill chunk, ``n`` possibly
+  dynamic). Emits ``IKVCacheUpdateLayer`` whose output is aliased to the
+  cache input.
 
 * ``aten_ops_index_copy_fallback`` — STANDARD priority, always fires.
   Implements the general semantics via scatter (equivalent to what the
@@ -37,6 +40,7 @@ from torch_tensorrt.dynamo.conversion._ConversionContext import ConversionContex
 from torch_tensorrt.dynamo.conversion.converter_utils import (
     cast_trt_tensor,
     get_positive_dim,
+    set_layer_name,
 )
 from torch_tensorrt.dynamo.conversion.impl import select
 from torch_tensorrt.dynamo.conversion.impl.shuffle import reshape
@@ -59,13 +63,16 @@ def index_copy_kv(
 ) -> TRTTensor:
     """KV-cache fast path. Caller (the validator) has already verified
     that this case is KV-eligible — 4-D static cache, dim=2, source
-    rank=4 with seq dim of size 1.
+    rank=4 whose seq dim is either 1 or written at consecutive positions.
 
-    ``index`` is the position tensor: shape ``[s_update]``. For the
-    eligible case (s_update == 1) this is a single value that we use
-    directly as the write start. KVCacheUpdate's ``writeIndices`` arg
-    expects shape ``[batch]``, so we broadcast/repeat the single index
-    value across the batch dimension.
+    ``index`` is the position tensor: shape ``[s_update]``. A single
+    position is used directly as the write start. For several,
+    ``lift_mutated_buffers`` proved they are consecutive and ascending, so the
+    first one is the start. Positions are not checked against the cache:
+    TensorRT ignores the updates that fall outside it, without an error.
+    KVCacheUpdate's ``writeIndices`` arg expects shape
+    ``[batch]``, so we broadcast/repeat the single index value across the
+    batch dimension.
     """
     cache_shape = tuple(input.shape)
     batch = cache_shape[0]
@@ -80,8 +87,12 @@ def index_copy_kv(
     # of shape [batch] filled with the single index value at runtime via
     # a gather/expand pattern. The validator's job is to allow only cases
     # where this is well-defined; for now we restrict to batch == 1 (see
-    # the validator).
+    # the validator). A run of several positions is written from its first.
     write_indices = index
+    if src.shape[2] != 1:
+        start_layer = ctx.net.add_slice(index, start=(0,), shape=(1,), stride=(1,))
+        set_layer_name(start_layer, target, name + "_write_start", source_ir)
+        write_indices = start_layer.get_output(0)
 
     # When batch > 1, we'd need to broadcast `index` (shape [1]) to
     # [batch]. The validator currently keeps us in the batch==1 case.

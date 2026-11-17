@@ -294,6 +294,11 @@ def refit_module_weights(
     # The output check runs the model as written, with its buffers.
     reference_gm = new_weight_module.module()
     new_gm = new_weight_module.module()
+    from torch_tensorrt.dynamo._compiler import _mark_index_copies_engines_cannot_size
+
+    _mark_index_copies_engines_cannot_size(
+        new_gm, new_weight_module.range_constraints, settings
+    )
 
     logger.debug("Input graph: " + str(new_gm.graph))
     # Its buffer writes are classified, and so partitioned, as compile() did.

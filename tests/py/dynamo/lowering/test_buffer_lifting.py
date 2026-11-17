@@ -400,6 +400,138 @@ class TestCopyBackClassification(TestCase):
         self.assertEqual(len(lifted), 1)
         self.assertEqual(new_gm.meta["_copyback_mutation_buffers"], [])
 
+    @_needs_cuda
+    def test_kv_index_copy_consecutive_positions_no_copyback(self):
+        """A multi-position ``index_copy`` write at ``start + arange(n)`` is one
+        consecutive run, which ``IKVCacheUpdateLayer`` writes from its start, so it
+        is aliased rather than copied back. The write is marked for the converter,
+        which can no longer see the ``arange`` once constant folding has run."""
+
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("cache", torch.zeros(1, 4, 16, 8))
+
+            def forward(self, x, input_pos):
+                idx = input_pos + torch.arange(x.shape[2], device=x.device)
+                self.cache.index_copy_(2, idx, x)
+                return self.cache.sum()
+
+        gm = _ep_module_on_cuda(M(), (torch.ones(1, 4, 4, 8), torch.tensor([2])))
+        new_gm, lifted = lift_mutated_buffers(gm)
+        self.assertEqual(len(lifted), 1)
+        self.assertEqual(new_gm.meta["_copyback_mutation_buffers"], [])
+        self.assertEqual(new_gm.meta["_predicted_kv_bindings"], ["buf_cache"])
+        (write,) = [
+            n
+            for n in new_gm.graph.nodes
+            if n.target is torch.ops.aten.index_copy.default
+        ]
+        self.assertTrue(write.meta.get("_trt_kv_alias"))
+
+    @_needs_cuda
+    def test_index_copy_not_known_to_be_consecutive_is_copyback(self):
+        """``IKVCacheUpdateLayer`` takes only a start, so several positions are
+        copied back unless the graph builds them as one run of int32 or int64
+        values: not a constant, not an index the caller passes in, not one held in
+        a buffer the model updates, not an int8 ``arange``, which wraps, not an
+        ``arange`` with step 2, and not one added to several positions."""
+
+        class Constant(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("cache", torch.zeros(1, 4, 16, 8))
+
+            def forward(self, x):
+                self.cache.index_copy_(2, torch.tensor([5, 6, 7], device=x.device), x)
+                return self.cache.sum()
+
+        class FromInput(Constant):
+            def forward(self, x, idx):
+                self.cache.index_copy_(2, idx, x)
+                return self.cache.sum()
+
+        class FromMutatedBuffer(Constant):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("positions", torch.tensor([3, 4, 5]))
+
+            def forward(self, x, next_positions):
+                self.cache.index_copy_(2, self.positions, x)
+                self.positions.copy_(next_positions)
+                return self.cache.sum()
+
+        class Int8Arange(Constant):
+            def forward(self, x, input_pos):
+                idx = input_pos + torch.arange(
+                    x.shape[2], dtype=torch.int8, device=x.device
+                )
+                self.cache.index_copy_(2, idx, x)
+                return self.cache.sum()
+
+        class StepTwo(Constant):
+            def forward(self, x, input_pos):
+                idx = input_pos + torch.arange(0, 6, 2, device=x.device)
+                self.cache.index_copy_(2, idx, x)
+                return self.cache.sum()
+
+        class PositionVector(Constant):
+            def forward(self, x, positions):
+                idx = positions + torch.arange(3, device=x.device)
+                self.cache.index_copy_(2, idx, x)
+                return self.cache.sum()
+
+        x = torch.ones(1, 4, 3, 8)
+        positions = torch.tensor([3, 4, 5])
+        for model, args in (
+            (Constant(), (x,)),
+            (FromInput(), (x, positions)),
+            (FromMutatedBuffer(), (x, positions)),
+            (Int8Arange(), (x, torch.tensor([2]))),
+            (StepTwo(), (x, torch.tensor([2]))),
+            (PositionVector(), (x, torch.tensor([2, 5, 9]))),
+        ):
+            with self.subTest(model=type(model).__name__):
+                gm = _ep_module_on_cuda(model, args)
+                new_gm, _ = lift_mutated_buffers(gm)
+                self.assertIn("cache", new_gm.meta["_copyback_mutation_buffers"])
+                self.assertEqual(new_gm.meta["_predicted_kv_bindings"], [])
+
+    @_needs_cuda
+    def test_write_with_another_reader_is_copyback(self):
+        """A write of one token or several whose buffer has another reader of the
+        old cache is copied back, also when the write is computed from that
+        reader, since the engine can run the reader after the write."""
+
+        class M(torch.nn.Module):
+            def __init__(self, reader):
+                super().__init__()
+                self.reader = reader
+                self.register_buffer("cache", torch.zeros(1, 4, 16, 8))
+
+            def forward(self, x, input_pos):
+                if self.reader == "position":
+                    input_pos = (self.cache[0, 0, :, 0] != 0).sum().reshape(1)
+                old = self.cache[:, :, 0:8].sum() if self.reader == "other" else 0
+                idx = input_pos + torch.arange(x.shape[2], device=x.device)
+                self.cache.index_copy_(2, idx, x)
+                return old + self.cache.sum()
+
+        for reader, t in (("other", 4), ("other", 1), ("position", 4)):
+            with self.subTest(reader=reader, tokens=t):
+                gm = _ep_module_on_cuda(
+                    M(reader), (torch.ones(1, 4, t, 8), torch.tensor([2]))
+                )
+                new_gm, _ = lift_mutated_buffers(gm)
+                (write,) = [
+                    n
+                    for n in new_gm.graph.nodes
+                    if n.target is torch.ops.aten.index_copy.default
+                ]
+                self.assertEqual(new_gm.meta["_copyback_mutation_buffers"], ["cache"])
+                self.assertEqual(new_gm.meta["_predicted_kv_bindings"], [])
+                self.assertFalse(write.meta.get("_trt_kv_alias"))
+
     def test_non_kv_mutation_recorded_for_copyback(self):
         """A non-KV in-place mutation is recorded for copy-back by buffer name."""
 

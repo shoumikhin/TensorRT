@@ -7,8 +7,9 @@
 Two converters are registered for ``aten.index_copy.default``:
 
 * ``aten_ops_index_copy_kv`` — HIGH priority, validator-gated. Fires for
-  the narrow KV-eligible case (4-D static cache, dim=2, source seq dim
-  size 1, batch=1) and emits ``IKVCacheUpdateLayer`` with aliased I/O.
+  the narrow KV-eligible case (4-D static cache, dim=2, batch=1, source seq
+  dim size 1, or a module buffer written at ``start + arange(n)``) and emits
+  ``IKVCacheUpdateLayer`` with aliased I/O.
 
 * ``aten_ops_index_copy_fallback`` — STANDARD priority. Fires for
   everything else; produces correct results via the scatter path. No
@@ -27,8 +28,9 @@ from unittest import mock
 
 import torch
 import torch_tensorrt
-from torch.export import export
+from torch.export import Dim, export
 from torch.testing._internal.common_utils import TestCase, run_tests
+from torch_tensorrt.dynamo import refit_module_weights
 
 
 def _compile(model, args, **kwargs):
@@ -104,6 +106,960 @@ class TestIndexCopyKVFastPath(TestCase):
         eager_out = torch.ops.aten.index_copy.default(cache, 2, index, update)
         self.assertTrue(torch.allclose(out_val, eager_out))
         self.assertTrue(torch.equal(cache_run, cache))
+
+
+class _ChunkCache(torch.nn.Module):
+    """A module-held cache written at ``input_pos + arange(T)``, as a prefill chunk
+    or a decode step writes it, then read back."""
+
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("cache", torch.zeros(1, 4, 16, 8))
+
+    def forward(self, x, input_pos):
+        idx = input_pos + torch.arange(x.shape[2], device=x.device)
+        self.cache.index_copy_(2, idx, x)
+        return self.cache.sum(2)
+
+
+class _DoubledChunkCache(_ChunkCache):
+    """Writes every token twice, so the number of positions is computed: ``2 * T``."""
+
+    def forward(self, x, input_pos):
+        return super().forward(torch.cat((x, x), dim=2), input_pos)
+
+
+def _engines(compiled):
+    return [n.target for n in compiled.graph.nodes if n.op == "call_module"]
+
+
+def _check_calls(compiled, eager, calls):
+    """Run each argument tuple through both modules in turn and compare every result
+    and the whole cache, so a write that lands in the wrong place or never reaches
+    the buffer shows on the call that reads it back."""
+    for args in calls:
+        want = eager(*args)
+        got = compiled(*args)
+        want = want if isinstance(want, tuple) else (want,)
+        got = tuple(got) if isinstance(got, (tuple, list)) else (got,)
+        assert len(got) == len(want), (len(got), len(want))
+        for g, w in zip(got, want):
+            torch.testing.assert_close(g, w)
+        torch.testing.assert_close(compiled.cache, eager.cache)
+
+
+def _chunk(t, pos):
+    return (torch.randn(1, 4, t, 8, device="cuda"), torch.tensor([pos], device="cuda"))
+
+
+_POSITIONS_IN_PYTORCH = {
+    "torch.ops.aten.arange.default",
+    "torch.ops.aten.arange.start",
+    "torch.ops.aten.arange.start_step",
+    "torch.ops.aten.add.Tensor",
+    "torch.ops.aten.sym_size.int",
+}
+
+
+@torch.library.custom_op("torchtrt_kv_test::positive_rows", mutates_args=())
+def _positive_rows(x: torch.Tensor) -> torch.Tensor:
+    return x[x[:, 0] > 0].clone()
+
+
+@_positive_rows.register_fake
+def _positive_rows_fake(x: torch.Tensor) -> torch.Tensor:
+    rows = torch.library.get_ctx().new_dynamic_size(min=0, max=x.shape[0])
+    return x.new_empty(rows, x.shape[1])
+
+
+class TestIndexCopyKVBufferWrites(TestCase):
+    """A module buffer written at consecutive positions is updated in place, for any
+    number of tokens, so one engine serves both prefill and decode."""
+
+    def test_consecutive_positions_write_in_place(self):
+        model = _ChunkCache().cuda()
+        eager = copy.deepcopy(model)
+        compiled = _compile(model, _chunk(4, 0))
+
+        aliased = _aliased_io(compiled)
+        self.assertEqual(len(aliased), 1)
+        _, kind = next(iter(aliased.values()))
+        self.assertEqual(kind, "kv_cache_update")
+        self.assertEqual(compiled.meta.get("_copyback_mutation_buffers", []), [])
+        # Overlapping positions, so each call reads back what the one before wrote.
+        _check_calls(compiled, eager, [_chunk(4, p) for p in (0, 2, 9, 12)])
+
+    def test_small_graph_writes_in_place_at_the_default_min_block_size(self):
+        """The write's subgraph is smaller than the default ``min_block_size``, but
+        its ``copy_`` is gone, so the partitioner keeps it in an engine."""
+        model = _ChunkCache().cuda()
+        eager = copy.deepcopy(model)
+        ep = export(model, _chunk(4, 0))
+        compiled = torch_tensorrt.compile(
+            ep, ir="dynamo", inputs=list(_chunk(4, 0)), use_python_runtime=False
+        )
+        self.assertEqual(len(_aliased_io(compiled)), 1)
+        _check_calls(compiled, eager, [_chunk(4, p) for p in (0, 2, 9)])
+
+    def test_reader_the_write_depends_on_is_copied_back(self):
+        """A position or a source computed from the cache reads the old cache. The
+        engine can run that read after the write, so the write is copied back and
+        every call matches eager PyTorch."""
+
+        class FromCache(_ChunkCache):
+            def __init__(self, source):
+                super().__init__()
+                self.source = source
+
+            def forward(self, x, input_pos):
+                if self.source == "position":
+                    start = (self.cache[0, 0, :, 0] != 0).sum().reshape(1)
+                    return super().forward(x, start)
+                return super().forward(x + self.cache.mean(2, keepdim=True), input_pos)
+
+        for source in ("position", "source"):
+            for t in (1, 4):
+                with self.subTest(source=source, tokens=t):
+                    model = FromCache(source).cuda()
+                    eager = copy.deepcopy(model)
+                    compiled = _compile(model, _chunk(t, 0))
+                    self.assertEqual(_aliased_io(compiled), {})
+                    _check_calls(
+                        compiled, eager, [_chunk(t, p) for p in (0, t, 1, 3 * t)]
+                    )
+
+    def test_one_position_write_with_a_reader_of_its_slot_is_copied_back(self):
+        """Another op reads the slot the write fills, and nothing orders it first,
+        so even a one-position write is copied back."""
+
+        class M(_ChunkCache):
+            def forward(self, x, input_pos):
+                before = self.cache[:, :, 2:3].sum(2)
+                return before, super().forward(x, input_pos)
+
+        model = M().cuda()
+        eager = copy.deepcopy(model)
+        compiled = _compile(model, _chunk(1, 2))
+        self.assertEqual(_aliased_io(compiled), {})
+        _check_calls(compiled, eager, [_chunk(1, p) for p in (2, 9, 2)])
+
+    def test_dynamic_length_write_in_place_in_one_engine(self):
+        model = _ChunkCache().cuda()
+        eager = copy.deepcopy(model)
+        x = torch.randn(1, 4, 4, 8, device="cuda")
+        input_pos = torch.tensor([0], device="cuda")
+        ep = export(
+            model, (x, input_pos), dynamic_shapes=({2: Dim("T", min=1, max=8)}, None)
+        )
+        compiled = torch_tensorrt.compile(
+            ep,
+            ir="dynamo",
+            inputs=[
+                torch_tensorrt.Input(
+                    min_shape=(1, 4, 1, 8),
+                    opt_shape=(1, 4, 4, 8),
+                    max_shape=(1, 4, 8, 8),
+                ),
+                torch_tensorrt.Input(shape=(1,), dtype=torch.int64),
+            ],
+            min_block_size=1,
+            use_python_runtime=False,
+        )
+        self.assertEqual(len(_engines(compiled)), 1, _engines(compiled))
+        self.assertEqual(len(_aliased_io(compiled)), 1)
+
+        _check_calls(
+            compiled, eager, [_chunk(t, p) for t, p in ((8, 0), (1, 8), (3, 9), (4, 7))]
+        )
+
+    def _compile_chunk(self, model, x, dim, **kwargs):
+        ep = export(
+            model,
+            (x, torch.tensor([0], device="cuda")),
+            dynamic_shapes=({2: dim}, None),
+        )
+        return torch_tensorrt.dynamo.compile(
+            ep, inputs=[x, torch.tensor([0], device="cuda")], min_block_size=1, **kwargs
+        )
+
+    def test_a_length_with_the_default_minimum_writes_in_place(self):
+        """``Dim`` starts at 0 by default. The input enters the engine anyway, for the
+        size the positions are computed from, so the write stays in it, in place."""
+        model = _ChunkCache().cuda()
+        eager = copy.deepcopy(model)
+        compiled = self._compile_chunk(model, _chunk(3, 0)[0], Dim("T", max=8))
+        self.assertEqual(len(_engines(compiled)), 1, _engines(compiled))
+        self.assertEqual(len(_aliased_io(compiled)), 1)
+        _check_calls(
+            compiled, eager, [_chunk(t, p) for t, p in ((3, 0), (1, 3), (8, 4))]
+        )
+
+    def test_a_length_computed_in_the_engine_writes_in_place(self):
+        """The engine computes ``2 * T`` itself, so its profile never has to hold it."""
+        model = _DoubledChunkCache().cuda()
+        eager = copy.deepcopy(model)
+        compiled = self._compile_chunk(model, _chunk(2, 0)[0], Dim("T", min=1, max=4))
+        self.assertEqual(len(_engines(compiled)), 1, _engines(compiled))
+        self.assertEqual(len(_aliased_io(compiled)), 1)
+        _check_calls(
+            compiled, eager, [_chunk(t, p) for t, p in ((2, 0), (1, 4), (4, 6))]
+        )
+
+    def test_a_length_computed_in_pytorch_writes_in_place(self):
+        """``2 * T`` comes into the engine from PyTorch. Its profile starts at 2, where
+        ``T`` does, so a call with ``T = 1`` runs and the write stays in place."""
+        model = _DoubledChunkCache().cuda()
+        eager = copy.deepcopy(model)
+        compiled = self._compile_chunk(
+            model,
+            _chunk(2, 0)[0],
+            Dim("T", min=1, max=4),
+            torch_executed_ops={"torch.ops.aten.cat.default"},
+        )
+        self.assertEqual(len(_aliased_io(compiled)), 1)
+        _check_calls(
+            compiled, eager, [_chunk(t, p) for t, p in ((2, 0), (1, 4), (4, 6))]
+        )
+
+    def test_a_length_exported_as_t_plus_1_takes_its_smallest_value(self):
+        """Export records the chunk's size as ``T + 1`` with its own range ``[1, 9]``,
+        from ``T``'s ``[0, 8]``, while the shape system starts ``T`` itself at 2."""
+        model = _ChunkCache().cuda()
+        eager = copy.deepcopy(model)
+        T = Dim("T", min=0, max=8)
+        ep = export(model, _chunk(5, 0), dynamic_shapes=({2: T + 1}, None))
+        compiled = torch_tensorrt.dynamo.compile(
+            ep, inputs=list(_chunk(5, 0)), min_block_size=1
+        )
+        _check_calls(
+            compiled, eager, [_chunk(t, p) for t, p in ((5, 0), (1, 5), (9, 6))]
+        )
+
+    def test_a_length_that_can_be_zero_stays_in_pytorch(self):
+        """The KV layer writes one position or more, and an engine profile for a
+        ``Dim`` starts at 1. Here the sizes and positions are computed in PyTorch, so
+        only the write would bring the source into an engine. It stays in PyTorch and
+        is copied back, and a call that writes nothing works. When an engine reads the
+        source for anything else, it fails on an empty input whatever the write does."""
+        model = _ChunkCache().cuda()
+        eager = copy.deepcopy(model)
+        x, input_pos = _chunk(3, 0)
+        ep = export(
+            model, (x, input_pos), dynamic_shapes=({2: Dim("T", min=0, max=8)}, None)
+        )
+        compiled = torch_tensorrt.dynamo.compile(
+            ep,
+            inputs=[x, input_pos],
+            min_block_size=1,
+            torch_executed_ops={
+                "torch.ops.aten.arange.default",
+                "torch.ops.aten.arange.start",
+                "torch.ops.aten.arange.start_step",
+                "torch.ops.aten.add.Tensor",
+                "torch.ops.aten.sym_size.int",
+            },
+        )
+        self.assertEqual(_aliased_io(compiled), {})
+        _check_calls(
+            compiled, eager, [_chunk(t, p) for t, p in ((3, 0), (0, 3), (1, 3), (4, 5))]
+        )
+
+    def test_a_length_an_engine_takes_first_writes_in_place(self):
+        """The engine that computes the source takes the tokens itself, so a call
+        with ``T = 0`` fails there whatever the write does, and the write stays in
+        that engine, in place."""
+        sources = {
+            "relu": (lambda model, h: torch.relu(h), (1, 4, 3, 8), 2),
+            "projection": (
+                lambda model, h: model.k(h).view(1, h.shape[1], 4, 8).transpose(1, 2),
+                (1, 3, 32),
+                1,
+            ),
+        }
+        for name, (source, shape, dim) in sources.items():
+            with self.subTest(source=name):
+
+                class M(_ChunkCache):
+                    def __init__(self):
+                        super().__init__()
+                        self.k = torch.nn.Linear(32, 32)
+
+                    def forward(self, h, input_pos):
+                        return super().forward(source(self, h), input_pos)
+
+                def call(t, pos):
+                    size = list(shape)
+                    size[dim] = t
+                    return (
+                        torch.randn(*size, device="cuda"),
+                        torch.tensor([pos], device="cuda"),
+                    )
+
+                model = M().cuda()
+                eager = copy.deepcopy(model)
+                ep = export(
+                    model, call(3, 0), dynamic_shapes=({dim: Dim("T", max=8)}, None)
+                )
+                compiled = torch_tensorrt.dynamo.compile(
+                    ep, inputs=list(call(3, 0)), min_block_size=1, disable_tf32=True
+                )
+                self.assertEqual(len(_engines(compiled)), 1, _engines(compiled))
+                self.assertEqual(len(_aliased_io(compiled)), 1)
+                _check_calls(
+                    compiled, eager, [call(t, p) for t, p in ((3, 0), (1, 3), (8, 4))]
+                )
+
+    def test_an_engine_input_of_another_length_leaves_the_write_in_pytorch(self):
+        """The engine takes ``U``, which a call with ``T = 0`` leaves at 3, so the
+        write of ``T`` tokens stays in PyTorch and that call works."""
+
+        class M(_ChunkCache):
+            def forward(self, x, input_pos, y):
+                return super().forward(x.clone(), input_pos), torch.relu(y)
+
+        def call(t, pos):
+            return (*_chunk(t, pos), torch.randn(3, 4, device="cuda"))
+
+        model = M().cuda()
+        eager = copy.deepcopy(model)
+        ep = export(
+            model,
+            call(3, 0),
+            dynamic_shapes=({2: Dim("T", max=8)}, None, {0: Dim("U", max=8)}),
+        )
+        compiled = torch_tensorrt.dynamo.compile(
+            ep,
+            inputs=list(call(3, 0)),
+            min_block_size=1,
+            torch_executed_ops=_POSITIONS_IN_PYTORCH | {"torch.ops.aten.clone.default"},
+        )
+        self.assertEqual(_aliased_io(compiled), {})
+        _check_calls(compiled, eager, [call(t, p) for t, p in ((3, 0), (0, 3), (1, 3))])
+
+    def test_a_data_dependent_length_stays_in_pytorch(self):
+        """A data-dependent size gets a profile from 0, so the engine that takes it
+        runs a call of size 0, while the write's converter cannot. The write stays in
+        PyTorch and that call works."""
+
+        class M(_ChunkCache):
+            def forward(self, x, input_pos):
+                rows = torch.ops.torchtrt_kv_test.positive_rows(x)
+                source = (rows * 2).view(1, 1, rows.shape[0], 8).expand(1, 4, -1, 8)
+                return super().forward(source, input_pos), (rows.abs() * 3 + 1).sum(0)
+
+        def call(rows, pos):
+            x = -torch.ones(6, 8, device="cuda")
+            x[:rows] = torch.rand(rows, 8, device="cuda") + 1
+            return x, torch.tensor([pos], device="cuda")
+
+        model = M().cuda()
+        eager = copy.deepcopy(model)
+        ep = export(model, call(3, 0))
+        compiled = torch_tensorrt.dynamo.compile(
+            ep,
+            inputs=list(call(3, 0)),
+            min_block_size=1,
+            torch_executed_ops=_POSITIONS_IN_PYTORCH,
+        )
+        self.assertEqual(_aliased_io(compiled), {})
+        _check_calls(
+            compiled, eager, [call(r, p) for r, p in ((3, 0), (0, 3), (1, 3), (2, 4))]
+        )
+
+    def test_a_source_folding_leaves_too_small_for_an_engine(self):
+        """Before constant folding ``x * w.sin().cos()`` is an engine of its own that
+        takes the tokens. Folding leaves ``x * c``, smaller than ``min_block_size``,
+        so it runs in PyTorch and the write of its empty result does too."""
+
+        class M(_ChunkCache):
+            def __init__(self):
+                super().__init__()
+                self.w = torch.nn.Parameter(torch.ones(1, 4, 1, 8))
+
+            def forward(self, x, input_pos):
+                return super().forward(x * self.w.sin().cos(), input_pos)
+
+        model = M().cuda()
+        eager = copy.deepcopy(model)
+        x, input_pos = _chunk(3, 0)
+        ep = export(model, (x, input_pos), dynamic_shapes=({2: Dim("T", max=8)}, None))
+        compiled = torch_tensorrt.dynamo.compile(
+            ep, inputs=[x, input_pos], min_block_size=5
+        )
+        _check_calls(
+            compiled, eager, [_chunk(t, p) for t, p in ((3, 0), (0, 3), (1, 3))]
+        )
+
+    def test_operands_that_only_pytorch_can_compute(self):
+        """No converter takes ``sort`` of a dynamic length or ``bessel_j0``, so their
+        results enter the write's engine, if it has one, from PyTorch."""
+
+        class M(torch.nn.Module):
+            def forward(self, cache, index, values):
+                index = torch.sort(index).values
+                return torch.index_copy(
+                    cache, 2, index, torch.special.bessel_j0(values)
+                )
+
+        def call(t):
+            return (
+                torch.zeros(1, 4, 16, 8, device="cuda"),
+                torch.arange(2, 2 + t, device="cuda"),
+                torch.randn(1, 4, t, 8, device="cuda"),
+            )
+
+        T = Dim("T", min=0, max=4)
+        ep = export(M(), call(3), dynamic_shapes=(None, {0: T}, {2: T}))
+        compiled = torch_tensorrt.dynamo.compile(
+            ep, inputs=list(call(3)), min_block_size=1
+        )
+        for t in (3, 1, 0):
+            args = call(t)
+            torch.testing.assert_close(compiled(*args), M()(*args))
+
+    def test_a_reader_no_converter_takes(self):
+        """``sort`` has a converter, but not for a dynamic length, and a cast to
+        float64 has one only with ``truncate_double``. Both run in PyTorch, so they
+        do not take the empty source into an engine, and the write stays in PyTorch
+        too."""
+        readers = {
+            "sort": lambda source: torch.sort(source, dim=2).values,
+            "float64": lambda source: source.double(),
+        }
+        for name, reader in readers.items():
+            with self.subTest(reader=name):
+
+                class M(torch.nn.Module):
+                    def __init__(self):
+                        super().__init__()
+                        self.register_buffer("cache", torch.zeros(1, 4, 16, 8))
+
+                    def forward(self, x, input_pos):
+                        idx = input_pos + torch.arange(x.shape[2], device=x.device)
+                        self.cache.index_copy_(2, idx, x)
+                        return self.cache.sum(2), reader(x)
+
+                model = M().cuda()
+                eager = copy.deepcopy(model)
+                compiled = self._compile_chunk(
+                    model,
+                    _chunk(3, 0)[0],
+                    Dim("T", min=0, max=8),
+                    torch_executed_ops={
+                        "torch.ops.aten.arange.default",
+                        "torch.ops.aten.arange.start",
+                        "torch.ops.aten.arange.start_step",
+                        "torch.ops.aten.add.Tensor",
+                        "torch.ops.aten.sym_size.int",
+                    },
+                )
+                _check_calls(
+                    compiled, eager, [_chunk(t, p) for t, p in ((3, 0), (0, 3), (1, 3))]
+                )
+
+    def test_a_source_too_small_for_an_engine_of_its_own(self):
+        """``x * 2`` and ``x.clone()`` have converters, but alone they are smaller
+        than the default engine, so they run in PyTorch, and the write of their empty
+        result does too."""
+        sources = {"mul": lambda x: x * 2, "clone": lambda x: x.clone()}
+        for name, source in sources.items():
+            with self.subTest(source=name):
+
+                class M(torch.nn.Module):
+                    def __init__(self):
+                        super().__init__()
+                        self.register_buffer("cache", torch.zeros(1, 4, 16, 8))
+
+                    def forward(self, x, input_pos):
+                        idx = input_pos + torch.arange(x.shape[2], device=x.device)
+                        self.cache.index_copy_(2, idx, source(x))
+                        return self.cache.sum(2)
+
+                model = M().cuda()
+                eager = copy.deepcopy(model)
+                x, input_pos = _chunk(3, 0)
+                ep = export(
+                    model,
+                    (x, input_pos),
+                    dynamic_shapes=({2: Dim("T", min=0, max=8)}, None),
+                )
+                compiled = torch_tensorrt.dynamo.compile(ep, inputs=[x, input_pos])
+                _check_calls(
+                    compiled, eager, [_chunk(t, p) for t, p in ((3, 0), (0, 3), (1, 3))]
+                )
+
+    def test_a_reader_the_partitioner_keeps_out_of_the_engines(self):
+        """``nonzero`` has a converter, but with ``fallback_data_dependent_ops`` the
+        partitioner leaves it to PyTorch, so it takes no empty input into an engine."""
+
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("cache", torch.zeros(1, 4, 16, 8))
+
+            def forward(self, x, input_pos):
+                idx = input_pos + torch.arange(x.shape[2], device=x.device)
+                self.cache.index_copy_(2, idx, x)
+                return self.cache.sum(2), torch.nonzero(x)
+
+        model = M().cuda()
+        eager = copy.deepcopy(model)
+        compiled = self._compile_chunk(
+            model,
+            _chunk(3, 0)[0],
+            Dim("T", min=0, max=8),
+            fallback_data_dependent_ops=True,
+            torch_executed_ops={
+                "torch.ops.aten.arange.default",
+                "torch.ops.aten.arange.start",
+                "torch.ops.aten.arange.start_step",
+                "torch.ops.aten.add.Tensor",
+                "torch.ops.aten.sym_size.int",
+            },
+        )
+        _check_calls(
+            compiled, eager, [_chunk(t, p) for t, p in ((3, 0), (0, 3), (1, 3))]
+        )
+
+    def test_writes_that_share_a_length_that_can_be_zero_stay_in_pytorch(self):
+        """Both writes read the same source, so both stay in PyTorch and a call that
+        writes nothing works."""
+
+        class Shared(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("k", torch.zeros(1, 4, 16, 8))
+                self.register_buffer("v", torch.zeros(1, 4, 16, 8))
+
+            def forward(self, x, input_pos):
+                idx = input_pos + torch.arange(x.shape[2], device=x.device)
+                self.k.index_copy_(2, idx, x)
+                self.v.index_copy_(2, idx, x)
+                return self.k.sum(2) + self.v.sum(2)
+
+        model = Shared().cuda()
+        eager = copy.deepcopy(model)
+        compiled = self._compile_chunk(
+            model,
+            _chunk(3, 0)[0],
+            Dim("T", min=0, max=8),
+            torch_executed_ops={
+                "torch.ops.aten.arange.default",
+                "torch.ops.aten.arange.start",
+                "torch.ops.aten.arange.start_step",
+                "torch.ops.aten.add.Tensor",
+                "torch.ops.aten.sym_size.int",
+            },
+        )
+        for t, p in ((3, 0), (0, 3), (1, 3), (4, 4)):
+            args = _chunk(t, p)
+            got = compiled(*args)
+            got = got[0] if isinstance(got, (tuple, list)) else got
+            torch.testing.assert_close(got, eager(*args))
+            torch.testing.assert_close(compiled.k, eager.k)
+            torch.testing.assert_close(compiled.v, eager.v)
+
+    def test_an_input_spec_does_not_decide_where_the_write_runs(self):
+        """The program allows ``T = 0`` and the ``Input`` spec starts at 1. The
+        program decides, so the write stays in PyTorch, where refit puts it too."""
+        model = _ChunkCache().cuda()
+        eager = copy.deepcopy(model)
+        x, input_pos = _chunk(3, 0)
+        ep = export(
+            model, (x, input_pos), dynamic_shapes=({2: Dim("T", min=0, max=8)}, None)
+        )
+        compiled = torch_tensorrt.dynamo.compile(
+            ep,
+            inputs=[
+                torch_tensorrt.Input(
+                    min_shape=(1, 4, 1, 8),
+                    opt_shape=(1, 4, 3, 8),
+                    max_shape=(1, 4, 8, 8),
+                ),
+                input_pos,
+            ],
+            min_block_size=1,
+            torch_executed_ops={
+                "torch.ops.aten.arange.default",
+                "torch.ops.aten.arange.start",
+                "torch.ops.aten.arange.start_step",
+                "torch.ops.aten.add.Tensor",
+                "torch.ops.aten.sym_size.int",
+            },
+        )
+        self.assertEqual(_aliased_io(compiled), {})
+        _check_calls(
+            compiled, eager, [_chunk(t, p) for t, p in ((3, 0), (1, 3), (8, 4))]
+        )
+
+    def test_refit_splits_the_model_as_compile_did_under_an_input_spec(self):
+        """Refit sees only the new program, not the ``Input`` specs, so compile must
+        not let them move a write into an engine."""
+
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.k = torch.nn.Linear(8, 8)
+                self.out = torch.nn.Linear(8, 8)
+
+            def forward(self, cache, index, x):
+                return self.out(torch.index_copy(cache, 2, index, self.k(x)))
+
+        torch.manual_seed(0)
+        old, new = M().cuda().eval(), M().cuda().eval()
+        cache = torch.zeros(1, 4, 16, 8, device="cuda")
+        args = (
+            cache,
+            torch.tensor([3, 9, 1], device="cuda"),
+            torch.randn(1, 4, 3, 8, device="cuda"),
+        )
+        t = Dim("T", max=8)
+        shapes = (None, {0: t}, {2: t})
+        compiled = torch_tensorrt.dynamo.compile(
+            export(old, args, dynamic_shapes=shapes),
+            inputs=[
+                cache,
+                torch_tensorrt.Input(
+                    min_shape=(1,), opt_shape=(3,), max_shape=(8,), dtype=torch.int64
+                ),
+                torch_tensorrt.Input(
+                    min_shape=(1, 4, 1, 8),
+                    opt_shape=(1, 4, 3, 8),
+                    max_shape=(1, 4, 8, 8),
+                ),
+            ],
+            min_block_size=1,
+            immutable_weights=False,
+        )
+        refitted = refit_module_weights(
+            compiled_module=compiled,
+            new_weight_module=export(new, args, dynamic_shapes=shapes),
+            arg_inputs=args,
+            verify_output=True,
+        )
+        torch.testing.assert_close(refitted(*args), new(*args), atol=1e-3, rtol=1e-3)
+
+    def test_dynamic_length_update_with_heads_unknown_at_build_time(self):
+        """An update made from two inputs that share one dynamic length, then split
+        into heads with ``view(1, T, -1, head_dim)``. TensorRT cannot prove the two
+        lengths equal when it builds, so it does not know the head count, which the
+        KV layer checks against the cache."""
+
+        class M(_ChunkCache):
+            def forward(self, x, y, input_pos):
+                t = x.shape[1]
+                update = torch.where(x > 0, x, y).view(1, t, -1, 8).transpose(1, 2)
+                return super().forward(update, input_pos)
+
+        model = M().cuda()
+        eager = copy.deepcopy(model)
+        x = torch.randn(1, 4, 32, device="cuda")
+        input_pos = torch.tensor([0], device="cuda")
+        T = Dim("T", min=1, max=8)
+        ep = export(
+            model, (x, x.clone(), input_pos), dynamic_shapes=({1: T}, {1: T}, None)
+        )
+        length = torch_tensorrt.Input(
+            min_shape=(1, 1, 32), opt_shape=(1, 4, 32), max_shape=(1, 8, 32)
+        )
+        compiled = torch_tensorrt.compile(
+            ep,
+            ir="dynamo",
+            inputs=[
+                length,
+                length,
+                torch_tensorrt.Input(shape=(1,), dtype=torch.int64),
+            ],
+            min_block_size=1,
+            use_python_runtime=False,
+        )
+        self.assertEqual(len(_aliased_io(compiled)), 1)
+
+        calls = []
+        for t, pos in ((5, 0), (1, 5), (8, 6), (3, 4)):
+            x, y = torch.randn(2, 1, t, 32, device="cuda")
+            calls.append((x, y, torch.tensor([pos], device="cuda")))
+        _check_calls(compiled, eager, calls)
+
+
+class TestProfilesOfComputedSizes(TestCase):
+    """An engine input whose size is computed from a ``Dim``, as ``2 * n`` or
+    ``n + 1``, starts where the program lets it start. Its largest size comes from
+    an ``Input`` spec when the program has none, and without either it is as large
+    as before this change."""
+
+    class _Sum(torch.nn.Module):
+        def forward(self, x, y):
+            return x.sum() + y.sum()
+
+    def test_an_input_spec_sets_the_largest_size(self):
+        sizes = {"2 * n": lambda n: 2 * n, "n + 1": lambda n: n + 1}
+        for name, size in sizes.items():
+            with self.subTest(size=name):
+                n = Dim("n", min=1)
+                ep = export(
+                    self._Sum(),
+                    (torch.ones(4, 8).cuda(), torch.ones(size(4), 8).cuda()),
+                    dynamic_shapes=({0: n}, {0: size(n)}),
+                )
+                compiled = torch_tensorrt.dynamo.compile(
+                    ep,
+                    inputs=[
+                        torch_tensorrt.Input(
+                            min_shape=(1, 8), opt_shape=(4, 8), max_shape=(20000, 8)
+                        ),
+                        torch_tensorrt.Input(
+                            min_shape=(size(1), 8),
+                            opt_shape=(size(4), 8),
+                            max_shape=(size(20000), 8),
+                        ),
+                    ],
+                    min_block_size=1,
+                )
+                # Both sizes reach past the largest one the fallback would give.
+                for k in (1, 4, 20000):
+                    args = (torch.ones(k, 8).cuda(), torch.ones(size(k), 8).cuda())
+                    torch.testing.assert_close(compiled(*args), self._Sum()(*args))
+
+    def test_a_size_made_in_the_graph_starts_at_the_recorded_minimum(self):
+        """``T + 1`` made from a ``Dim(min=0)`` is 1 when ``T`` is 0, so the engine
+        that updates the cache in place takes a single token."""
+
+        class Cache(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("cache", torch.zeros(1, 4, 16, 8))
+
+            def forward(self, x, pos):
+                one = torch.ones((1, 4, 1, 8), dtype=x.dtype, device=x.device)
+                update = torch.cat((x, one), 2)
+                index = pos + torch.arange(update.shape[2], device=x.device)
+                self.cache.index_copy_(2, index, update)
+                return self.cache.sum(2)
+
+        model, eager = Cache().cuda(), Cache().cuda()
+        args = (torch.ones(1, 4, 3, 8).cuda(), torch.tensor([0]).cuda())
+        ep = export(
+            model, args, dynamic_shapes=({2: Dim("tokens", min=0, max=8)}, None)
+        )
+        compiled = torch_tensorrt.dynamo.compile(
+            ep,
+            inputs=list(args),
+            min_block_size=1,
+            torch_executed_ops={
+                "torch.ops.aten.cat.default",
+                "torch.ops.aten.arange.default",
+                "torch.ops.aten.arange.start",
+                "torch.ops.aten.arange.start_step",
+                "torch.ops.aten.add.Tensor",
+                "torch.ops.aten.sym_size.int",
+            },
+            cache_built_engines=False,
+            reuse_cached_engines=False,
+        )
+        self.assertEqual(len(_aliased_io(compiled)), 1)
+        for tokens, pos in ((0, 0), (1, 1), (3, 3)):
+            x, p = torch.randn(1, 4, tokens, 8).cuda(), torch.tensor([pos]).cuda()
+            out = compiled(x, p)
+            out = out[0] if isinstance(out, (tuple, list)) else out
+            torch.testing.assert_close(out, eager(x, p))
+            torch.testing.assert_close(compiled.cache, eager.cache)
+
+    def test_without_any_bound_the_largest_size_stays(self):
+        """Before this change ``2 * n`` started at 4 and so reached 4 * 4096."""
+
+        class Recorded(torch.nn.Module):
+            def forward(self, x, y):
+                return x, y.sum()
+
+        class Computed(torch.nn.Module):
+            def forward(self, x):
+                return torch.cat((x, x)).sum()
+
+        n = Dim("n", min=1)
+        recorded = torch_tensorrt.dynamo.compile(
+            export(
+                Recorded(),
+                (torch.ones(4, 8).cuda(), torch.ones(8, 8).cuda()),
+                dynamic_shapes=({0: n}, {0: 2 * n}),
+            ),
+            inputs=[torch.ones(4, 8).cuda(), torch.ones(8, 8).cuda()],
+            min_block_size=1,
+        )
+        computed = torch_tensorrt.dynamo.compile(
+            export(Computed(), (torch.ones(4, 8).cuda(),), dynamic_shapes=({0: n},)),
+            inputs=[torch.ones(4, 8).cuda()],
+            min_block_size=1,
+            torch_executed_ops={"torch.ops.aten.cat.default"},
+        )
+        for k in (1, 8000):
+            x = torch.ones(k, 8).cuda()
+            torch.testing.assert_close(
+                recorded(x, torch.ones(2 * k, 8).cuda())[1], x.sum() * 2
+            )
+            torch.testing.assert_close(computed(x), x.sum() * 2)
+
+
+class TestIndexCopyKVKeepsEagerSemantics(TestCase):
+    """Writes that look like a KV update but must not be done in place."""
+
+    def test_functional_write_leaves_the_input_alone(self):
+        """A functional ``index_copy`` returns a new tensor; the caller's cache and
+        any other reader of it keep the old values."""
+
+        class M(torch.nn.Module):
+            def forward(self, cache, input_pos, update):
+                idx = input_pos + torch.arange(update.shape[2], device=update.device)
+                return torch.index_copy(cache, 2, idx, update) - cache
+
+        cache = torch.randn(1, 4, 16, 8, device="cuda")
+        input_pos = torch.tensor([3], device="cuda")
+        update = torch.randn(1, 4, 3, 8, device="cuda")
+        compiled = _compile(M().cuda(), (cache.clone(), input_pos, update))
+        self.assertEqual(_aliased_io(compiled), {})
+
+        cache_run = cache.clone()
+        out = compiled(cache_run, input_pos, update)
+        out = out[0] if isinstance(out, tuple) else out
+        torch.testing.assert_close(out, M()(cache, input_pos, update))
+        torch.testing.assert_close(cache_run, cache)
+
+    def test_buffer_read_by_another_node_is_copied_back(self):
+        """The engine does not order an in-place write after a layer that reads the
+        old cache without the write depending on it, so a multi-position write
+        whose buffer has such a reader is copied back instead."""
+
+        class M(_ChunkCache):
+            def forward(self, x, input_pos):
+                old = self.cache[:, :, 0:8].sum(2)
+                return old, super().forward(x, input_pos)
+
+        model = M().cuda()
+        model.cache.fill_(1.0)
+        eager = copy.deepcopy(model)
+        args = _chunk(4, 2)
+        compiled = _compile(model, args)
+        self.assertEqual(_aliased_io(compiled), {})
+        self.assertEqual(compiled.meta.get("_copyback_mutation_buffers"), ["cache"])
+        for got, want in zip(compiled(*args), eager(*args)):
+            torch.testing.assert_close(got, want)
+
+    def test_positions_that_are_not_one_run_are_copied_back(self):
+        """The layer writes one run of slots from a start, so an index with step 2,
+        or a run added to several positions rather than one, is copied back."""
+
+        class StepTwo(_ChunkCache):
+            def forward(self, x, input_pos):
+                idx = input_pos + torch.arange(0, 2 * x.shape[2], 2, device=x.device)
+                self.cache.index_copy_(2, idx, x)
+                return self.cache.sum(2)
+
+        class PositionVector(_ChunkCache):
+            def forward(self, x, positions):
+                idx = positions + torch.arange(x.shape[2], device=x.device)
+                self.cache.index_copy_(2, idx, x)
+                return self.cache.sum(2)
+
+        for model_type, make_pos in (
+            (StepTwo, lambda p: torch.tensor([p], device="cuda")),
+            (PositionVector, lambda p: torch.tensor([p, p + 3, p + 7], device="cuda")),
+        ):
+            with self.subTest(model=model_type.__name__):
+                model = model_type().cuda()
+                eager = copy.deepcopy(model)
+                calls = [
+                    (torch.randn(1, 4, 3, 8, device="cuda"), make_pos(p))
+                    for p in (0, 2, 5)
+                ]
+                compiled = _compile(model, calls[0])
+                self.assertEqual(_aliased_io(compiled), {})
+                _check_calls(compiled, eager, calls)
+
+    def test_index_built_in_pytorch_still_writes_in_place(self):
+        """The index is proven consecutive before partitioning, so the write still
+        happens in place when the ops that build the index run in PyTorch."""
+        model = _ChunkCache().cuda()
+        eager = copy.deepcopy(model)
+        ep = export(model, _chunk(4, 2))
+        compiled = torch_tensorrt.compile(
+            ep,
+            ir="dynamo",
+            inputs=list(_chunk(4, 2)),
+            min_block_size=1,
+            torch_executed_ops={"torch.ops.aten.add.Tensor"},
+            use_python_runtime=False,
+        )
+        self.assertEqual(len(_aliased_io(compiled)), 1)
+        _check_calls(compiled, eager, [_chunk(4, p) for p in (2, 4, 11)])
+
+    def test_positions_from_a_mutated_buffer_use_fallback(self):
+        """Positions held in a buffer the model also updates are not known to be
+        one consecutive run, so the cache is copied back."""
+
+        class M(_ChunkCache):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("positions", torch.tensor([3, 4, 5]))
+
+            def forward(self, x, next_positions):
+                self.cache.index_copy_(2, self.positions, x)
+                self.positions.copy_(next_positions)
+                return self.cache.sum(2)
+
+        model = M().cuda()
+        eager = copy.deepcopy(model)
+
+        def call(positions):
+            x = torch.randn(1, 4, 3, 8, device="cuda")
+            return x, torch.tensor(positions, device="cuda")
+
+        args = call([9, 2, 5])
+        compiled = _compile(model, args)
+        self.assertEqual(_aliased_io(compiled), {})
+        self.assertIn("cache", compiled.meta.get("_copyback_mutation_buffers"))
+        out = compiled(*args)
+        out = out[0] if isinstance(out, tuple) else out
+        torch.testing.assert_close(out, eager(*args))
+
+    def test_engine_cache_keeps_in_place_and_functional_writes_apart(self):
+        """A buffer write done in place and a functional write of a caller's tensor
+        can be the same graph apart from the marks buffer lifting sets. An engine
+        cached for one must not be reused for the other."""
+        import tempfile
+
+        class Functional(torch.nn.Module):
+            def forward(self, x, input_pos, cache):
+                idx = input_pos + torch.arange(x.shape[2], device=x.device)
+                return torch.index_copy(cache, 2, idx, x).sum(2)
+
+        x, input_pos = _chunk(4, 3)
+        with tempfile.TemporaryDirectory() as directory:
+            settings = dict(
+                ir="dynamo",
+                min_block_size=1,
+                immutable_weights=False,
+                cache_built_engines=True,
+                reuse_cached_engines=True,
+                engine_cache_dir=directory,
+                use_python_runtime=False,
+            )
+            model = _ChunkCache().cuda()
+            torch_tensorrt.compile(
+                export(model, (x, input_pos)), inputs=[x, input_pos], **settings
+            )
+
+            cache = torch.randn(1, 4, 16, 8, device="cuda")
+            before = cache.clone()
+            compiled = torch_tensorrt.compile(
+                export(Functional(), (x, input_pos, cache)),
+                inputs=[x, input_pos, cache],
+                **settings,
+            )
+            self.assertEqual(_aliased_io(compiled), {})
+            out = compiled(x, input_pos, cache)
+            out = out[0] if isinstance(out, tuple) else out
+            torch.testing.assert_close(out, Functional()(x, input_pos, before))
+            torch.testing.assert_close(cache, before)
 
 
 class TestIndexCopyFallback(TestCase):
@@ -1271,6 +2227,42 @@ class TestDecoderCachesStayInPlace(TestCase):
                 "torch.ops.aten._scaled_dot_product_flash_attention.default",
             },
         )
+
+
+class TestFullCachePrefillStaysInPlace(TestCase):
+    """A prefill that fills the whole cache, then attends over it, is updated in
+    place: attention reads only the updated cache, even though its output has the
+    cache's shape."""
+
+    def test_a_full_capacity_prefill(self):
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("k", torch.zeros(1, 4, 16, 8))
+                self.register_buffer("v", torch.zeros(1, 4, 16, 8))
+
+            def forward(self, q, k, v, pos):
+                index = pos + torch.arange(k.shape[2], device=k.device)
+                self.k.index_copy_(2, index, k)
+                self.v.index_copy_(2, index, v)
+                return torch.softmax(q @ self.k.transpose(-1, -2), -1) @ self.v
+
+        torch.manual_seed(0)
+        model = M().cuda()
+        eager = copy.deepcopy(model)
+        args = [torch.randn(1, 4, 16, 8, device="cuda") for _ in range(3)]
+        args.append(torch.tensor([0], device="cuda"))
+        compiled = _compile(model, args, disable_tf32=True)
+        aliased = sorted(
+            buffer
+            for _, mod in compiled.named_modules()
+            for buffer, _ in (getattr(mod, "aliased_io", None) or {}).values()
+        )
+        self.assertEqual(aliased, ["buf_k", "buf_v"])
+        out = compiled(*args)
+        out = out[0] if isinstance(out, (tuple, list)) else out
+        torch.testing.assert_close(out, eager(*args), rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(compiled.k, eager.k)
 
 
 class TestHostTracedBuffer(TestCase):
