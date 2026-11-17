@@ -14,6 +14,7 @@ import torch_tensorrt.logging as torchtrt_logging
 from torch._dynamo.backends.common import aot_autograd
 from torch._dynamo.utils import detect_fake_mode
 from torch._functorch.aot_autograd import aot_export_joint_simple
+from torch._subclasses.functional_tensor import FunctionalTensor
 from torch_tensorrt._utils import is_tegra_platform
 from torch_tensorrt.dynamo import CompilationSettings
 from torch_tensorrt.dynamo._compiler import compile_module
@@ -24,6 +25,11 @@ from torch_tensorrt.dynamo.lowering import (
     remove_detach,
     remove_sym_nodes,
     repair_input_aliasing,
+)
+from torch_tensorrt.dynamo.lowering._buffer_lifting import (
+    aliased_input_bindings,
+    assert_predicted_kv_aliased,
+    lift_mutated_buffers,
 )
 from torch_tensorrt.dynamo.lowering.passes.fold_get_attr_item_calls import (
     fold_get_attr_item_calls,
@@ -267,6 +273,80 @@ def _graph_has_higher_order_ops(gm: torch.fx.GraphModule) -> bool:
     return False
 
 
+def _input_alias_fixing_clones(
+    gm: torch.fx.GraphModule,
+) -> list[tuple[int, torch.fx.Node]]:
+    """The clone ``repair_input_aliasing`` put ahead of each tensor input, with the
+    input's position among the placeholders. Every use of the input goes through it,
+    so an in-place write into the input writes the clone."""
+    placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
+    return [
+        (i, next(iter(node.users)))
+        for i, node in enumerate(placeholders)
+        if len(node.users) == 1
+        and next(iter(node.users)).target is torch.ops.aten.clone.default
+    ]
+
+
+def _run_returning_final_inputs(
+    gm: torch.fx.GraphModule,
+    clones: list[tuple[int, torch.fx.Node]],
+    written: list[tuple[int, torch.fx.Node]],
+) -> Callable[..., Any]:
+    """Run ``gm`` and also return the final value of each clone the model writes in
+    place, so the traced graph shows the final contents of every input it writes.
+    ``written`` is set to those clones.
+
+    The functionalized program records every write of a clone, also one through a
+    view or through ``.data``, which leaves the version counter alone. A clone nobody
+    writes is not returned: AOT refuses an output that is a view of another output,
+    as the clone and a returned ``reshape`` of the input would be.
+    """
+
+    def is_written(value: Any) -> bool:
+        return isinstance(
+            value, FunctionalTensor
+        ) and torch._functionalize_has_data_mutation(value.elem)
+
+    class _Run(torch.fx.Interpreter):  # type: ignore[misc]
+        def run(self, *args: Any, **kwargs: Any) -> Any:
+            out = super().run(*args, **kwargs)
+            written[:] = [c for c in clones if is_written(self.env[c[1]])]
+            return type(out)([*out, *(self.env[clone] for _, clone in written)])
+
+    return _Run(gm, garbage_collect_values=False).run
+
+
+def _write_back_mutated_inputs(
+    gm: torch.fx.GraphModule, clones: list[tuple[int, torch.fx.Node]]
+) -> None:
+    """Turn the final contents returned for ``clones`` back into the write-back
+    ``copy_(input, value)`` that ``ExportedProgram.module()`` gives an input the
+    model writes, so buffer lifting classifies it the same way.
+
+    Each such input's clone is replaced by the input itself, as
+    ``remove_input_alias_fixing_clones`` would do, and the write-back goes last.
+    """
+    output = next(n for n in gm.graph.nodes if n.op == "output")
+    outputs = list(output.args[0])
+    finals = outputs[len(outputs) - len(clones) :]
+    del outputs[len(outputs) - len(clones) :]
+    output.args = (type(output.args[0])(outputs),)
+    placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
+    for (i, _), final in zip(clones, finals):
+        node = placeholders[i]
+        clone = next(
+            (u for u in node.users if u.target is torch.ops.aten.clone.default), None
+        )
+        if clone is not None:
+            clone.replace_all_uses_with(node)
+            gm.graph.erase_node(clone)
+        with gm.graph.inserting_before(output):
+            gm.graph.call_function(torch.ops.aten.copy_.default, (node, final))
+    gm.graph.eliminate_dead_code()
+    gm.recompile()
+
+
 def _pretraced_backend(
     gm: torch.fx.GraphModule,
     sample_inputs: Sequence[Any],
@@ -324,13 +404,15 @@ def _pretraced_backend(
             # can handle dynamic shapes natively (mirroring how torch
             # inductor lets aot_autograd resolve them).
             if not settings.use_distributed_mode_trace:
+                input_clones = _input_alias_fixing_clones(gm)
+                written_clones: list[tuple[int, torch.fx.Node]] = []
                 # Executing the generated forward loses node provenance during
                 # retracing. The interpreter preserves each source node's
                 # module stack on its decomposed ATen operations, so explicit
                 # module exclusions still apply after AOTAutograd.
                 with torch.fx.traceback.preserve_node_meta():
                     gm = aot_export_joint_simple(
-                        torch.fx.Interpreter(gm).run,
+                        _run_returning_final_inputs(gm, input_clones, written_clones),
                         sample_inputs,
                         trace_joint=False,
                         decompositions=filter_decomposition_table(
@@ -343,10 +425,16 @@ def _pretraced_backend(
                             gm,
                         ),
                     )
+                _write_back_mutated_inputs(gm, written_clones)
 
             # Remove sym_int placeholders and inputs *after* AOT tracing
             # so we don't inject sym_size nodes that confuse the tracer.
             remove_sym_nodes(gm, sample_inputs, settings)
+
+            # The engine updates a written input in place when it can; otherwise the
+            # write-back copy_ stores the write after the engines run.
+            gm, _ = lift_mutated_buffers(gm, settings, lift_buffers=False)
+            predicted_kv_bindings = gm.meta.get("_predicted_kv_bindings", [])
 
             torch_inputs = [
                 input for input in sample_inputs if isinstance(input, torch.Tensor)
@@ -382,6 +470,15 @@ def _pretraced_backend(
                 torchtrt_inputs,
                 settings=settings,
                 engine_cache=engine_cache,
+            )
+            assert_predicted_kv_aliased(
+                aliased_input_bindings(
+                    getattr(sub, "aliased_io", None)
+                    for _name, sub in trt_compiled.named_children()
+                ),
+                predicted_kv_bindings,
+                settings,
+                engines_built=not settings.dryrun,
             )
             # Strip TRT-only SDPA kwargs from any nodes that were not captured
             # into a TRT engine (e.g. because a subgraph fell back to PyTorch

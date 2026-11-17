@@ -326,6 +326,8 @@ struct TRTEngine : torch::CustomClassHolder {
     // here so the per-call input-setup loop avoids an aliased_input_binding_names
     // lookup on every input, every execution.
     bool is_aliased_input;
+    // True when TensorRT updates this input in place as a KV cache.
+    bool is_kv_cache_input;
   };
   std::vector<InputBindingInfo> input_binding_infos = {};
   std::vector<at::Tensor> active_input_tensors = {};

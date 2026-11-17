@@ -12,6 +12,7 @@ same compiled graph can run on either the C++ or Python runtime transparently.
 from __future__ import annotations
 
 import base64
+import bisect
 import copy
 import logging
 import pickle
@@ -88,6 +89,8 @@ class _InputBindingInfo(NamedTuple):
     # so the per-call input-setup loop avoids an aliased_input_binding_names lookup
     # on every input, every execution.
     is_aliased_input: bool
+    # True when TensorRT updates this input in place as a KV cache.
+    is_kv_cache_input: bool
 
 
 class _InputShapeRefusedError(RuntimeError):
@@ -667,12 +670,18 @@ class TRTEngine(OpaqueBase):  # type: ignore[misc]
             dtype._from(self.cuda_engine.get_tensor_dtype(input_name)).to(torch.dtype)
             for input_name in self.in_binding_names
         ]
+        kv_cache_inputs = {
+            in_name
+            for in_name, kind in self.aliased_io.values()
+            if kind == "kv_cache_update"
+        }
         self._input_binding_infos = [
             _InputBindingInfo(
                 input_name,
                 self.input_dtypes[idx],
                 self.cuda_engine.is_shape_inference_io(input_name),
                 input_name in self.aliased_input_binding_names,
+                input_name in kv_cache_inputs,
             )
             for idx, input_name in enumerate(self.in_binding_names)
         ]
@@ -1245,6 +1254,59 @@ class TRTEngine(OpaqueBase):  # type: ignore[misc]
                 )
                 self._bound_inputs_by_name[input_name] = tensor_to_bind
 
+    def _copy_inputs_that_read_a_kv_cache(
+        self, contiguous_inputs: List[torch.Tensor], cudagraphs_enabled: bool
+    ) -> None:
+        """TensorRT updates a KV cache in place while the engine reads its other
+        inputs. An input in a cache's memory is bound to a copy taken before the
+        call, so it reads the old contents. An input the engine also updates in place
+        cannot be copied, because its update would go to the copy, so a call where it
+        shares memory with a cache is refused, as is one where two caches share
+        memory. Under CUDA graphs an input TensorRT does not alias is bound through a
+        private copy anyway."""
+
+        def bound_as_is(binding: _InputBindingInfo, tensor: torch.Tensor) -> bool:
+            return (
+                not binding.is_shape_tensor
+                and tensor.is_cuda
+                and tensor.numel() > 0
+                and (binding.is_aliased_input or not cudagraphs_enabled)
+            )
+
+        caches = sorted(
+            (t.device.index, t.data_ptr(), t.data_ptr() + t.nbytes, b.name)
+            for b, t in zip(self._input_binding_infos, contiguous_inputs)
+            if b.is_kv_cache_input and bound_as_is(b, t)
+        )
+        if not caches:
+            return
+        for (device, _, hi, name), (next_device, next_lo, _, next_name) in zip(
+            caches, caches[1:]
+        ):
+            if device == next_device and next_lo < hi:
+                raise RuntimeError(
+                    f"KV caches '{name}' and '{next_name}' of engine {self.name} share "
+                    "memory, and the engine updates both in place. Pass separate tensors."
+                )
+        starts = [(device, lo) for device, lo, _, _ in caches]
+        for i, (binding, tensor) in enumerate(
+            zip(self._input_binding_infos, contiguous_inputs)
+        ):
+            if binding.is_kv_cache_input or not bound_as_is(binding, tensor):
+                continue
+            device, lo = tensor.device.index, tensor.data_ptr()
+            # The caches do not overlap, so only the last one that starts before
+            # this input ends can reach into it.
+            k = bisect.bisect_left(starts, (device, lo + tensor.nbytes)) - 1
+            if k >= 0 and caches[k][0] == device and caches[k][2] > lo:
+                if binding.is_aliased_input:
+                    raise RuntimeError(
+                        f"Input '{binding.name}' and KV cache '{caches[k][3]}' of engine "
+                        f"{self.name} share memory, and the engine updates both in "
+                        "place. Pass separate tensors."
+                    )
+                contiguous_inputs[i] = tensor.clone()
+
     def _profile_section(self, label: str) -> ContextManager[None]:
         if self._profile_execution:
             return cast(
@@ -1327,6 +1389,7 @@ class TRTEngine(OpaqueBase):  # type: ignore[misc]
         # internally so the manual ``torch.cuda.CUDAGraph`` machinery is
         # skipped.
         effective_cudagraphs = cudagraphs_enabled and not self._rtx_native_cudagraphs
+        self._copy_inputs_that_read_a_kv_cache(contiguous_inputs, effective_cudagraphs)
 
         # Pick the engine stream BEFORE set_runtime_states so that any
         # stream-identity change observed this call flips

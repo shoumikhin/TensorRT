@@ -27,23 +27,31 @@ _IDENTITY_FUNCTIONS = frozenset(
 )
 
 
-def _remove_identity_ops(gm: torch.fx.GraphModule) -> bool:
-    """Replace identity op nodes with their single input, in-place.
+def _is_identity(node: torch.fx.Node) -> bool:
+    return (
+        (node.op == "call_method" and node.target in _IDENTITY_METHODS)
+        or (node.op == "call_function" and node.target in _IDENTITY_FUNCTIONS)
+    ) and bool(node.args and isinstance(node.args[0], torch.fx.Node))
 
-    Returns True if any nodes were removed.
+
+def _remove_identity_ops(gm: torch.fx.GraphModule) -> bool:
+    """Point each ``.item()`` past the identity ops in front of its input, in-place.
+
+    Only ``.item()`` inputs skip them: anywhere else a ``clone`` is a real copy that
+    the model may write. Returns True if any nodes were removed.
     """
     modified = False
     for node in list(gm.graph.nodes):
-        is_identity = (
-            node.op == "call_method" and node.target in _IDENTITY_METHODS
-        ) or (node.op == "call_function" and node.target in _IDENTITY_FUNCTIONS)
-        if not is_identity:
+        if node.op != "call_method" or node.target != "item" or len(node.args) != 1:
             continue
-        if len(node.args) < 1 or not isinstance(node.args[0], torch.fx.Node):
-            continue
-        node.replace_all_uses_with(node.args[0])
-        gm.graph.erase_node(node)
-        modified = True
+        identity = node.args[0]
+        while isinstance(identity, torch.fx.Node) and _is_identity(identity):
+            source = identity.args[0]
+            node.replace_input_with(identity, source)
+            if not identity.users:
+                gm.graph.erase_node(identity)
+                modified = True
+            identity = source
     return modified
 
 

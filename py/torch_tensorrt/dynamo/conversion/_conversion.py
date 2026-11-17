@@ -7,6 +7,7 @@ import logging
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
+from torch._inductor.codecache import sha256_hash
 from torch_tensorrt._enums import dtype
 from torch_tensorrt._features import ENABLED_FEATURES
 from torch_tensorrt._Input import Input
@@ -310,6 +311,13 @@ def _interpret_module_to_result_impl(
         and (settings.cache_built_engines or settings.reuse_cached_engines)
         else None
     )
+    # The engine carries the binding names a caller sets, and the KV alias check reads
+    # them, so an engine built under other names is not a hit.
+    if hash_val is not None and (input_binding_names or output_binding_names):
+        names = repr(
+            (list(input_binding_names or ()), list(output_binding_names or ()))
+        )
+        hash_val += sha256_hash(names.encode())
 
     if settings.reuse_cached_engines:
         if engine_cache is None:

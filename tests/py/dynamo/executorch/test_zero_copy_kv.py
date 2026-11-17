@@ -2472,6 +2472,44 @@ def test_aliased_buffer_mark_survives_real_lowering(generate_etrecord):
     assert marked == {"k_cache", "v_cache"}
 
 
+def test_a_host_traced_model_keeps_its_caches_written_in_place():
+    """ExecuTorch exports a model traced on the host, with host example inputs, so
+    every buffer is a host tensor when Torch-TensorRT compiles it. The engine must
+    still update both caches in place, and the finalized program must pass
+    ``check_zero_copy_kv``.
+    """
+    _require_real_engine()
+    with torch.no_grad():
+        torch.manual_seed(0)
+        model = _KVDecodeStep().eval()
+        tokens = torch.zeros(1, 1, dtype=torch.long)
+        input_pos = torch.tensor([0], dtype=torch.long)
+
+        exported_program = torch.export.export(model, (tokens, input_pos))
+        trt_gm = torch_tensorrt.dynamo.compile(
+            exported_program,
+            arg_inputs=(tokens, input_pos),
+            min_block_size=1,
+            truncate_double=True,
+        )
+        edge = torch_tensorrt.executorch.export(
+            trt_gm,
+            arg_inputs=(tokens, input_pos),
+            retrace=False,
+            zero_copy_kv=True,
+        )
+
+    ep = edge.exported_program()
+    marked = {
+        ep.graph_signature.inputs_to_buffers[node.name]
+        for node in ep.graph_module.graph.nodes
+        if node.op == "placeholder" and node.meta.get("_torch_tensorrt_aliased_buffer")
+    }
+    assert marked == {"k_cache", "v_cache"}
+    program = edge.to_executorch(torch_tensorrt.executorch.zero_copy_backend_config())
+    torch_tensorrt.executorch.check_zero_copy_kv(program)
+
+
 def test_finalizing_a_real_export_with_executorch_defaults_is_caught_only_by_the_check():
     """The documented two-call path, with the second call left as the default.
 

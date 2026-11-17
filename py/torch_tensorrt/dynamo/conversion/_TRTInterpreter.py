@@ -31,7 +31,10 @@ from torch_tensorrt._Input import Input
 from torch_tensorrt._utils import is_tensorrt_version_supported
 from torch_tensorrt.dynamo._engine_cache import BaseEngineCache
 from torch_tensorrt.dynamo._settings import CompilationSettings
-from torch_tensorrt.dynamo.conversion._ConversionContext import ConversionContext
+from torch_tensorrt.dynamo.conversion._ConversionContext import (
+    AliasKind,
+    ConversionContext,
+)
 from torch_tensorrt.dynamo.conversion._ConverterRegistry import (
     DYNAMO_CONVERTERS as CONVERTERS,
 )
@@ -1013,8 +1016,30 @@ class TRTInterpreter(torch.fx.Interpreter):  # type: ignore[misc]
         # Aliased outputs (e.g. IKVCacheUpdateLayer) must be marked as network
         # outputs even if the user's source did not return them. We APPEND
         # them after the user outputs and carry the explicit number of user
-        # bindings to the runtime. A user return can itself be aliased.
-        user_output_ids = {id(o) for o in outputs if isinstance(o, trt.ITensor)}
+        # bindings to the runtime. A user return can itself be aliased. A KV cache
+        # update's output is the cache's own memory. Where the compiled module's caller
+        # can receive it, it is a hidden binding and the return gets its own copy below:
+        # the caller must not hold memory that the next call changes.
+        kv_ids = {
+            id(e.output_tensor)
+            for e in self.ctx.aliased_outputs
+            if e.kind is AliasKind.KV_CACHE_UPDATE
+        }
+        fx_outputs = self._cur_node.args[0] if self._cur_node is not None else ()
+        if not isinstance(fx_outputs, (tuple, list)):
+            fx_outputs = (fx_outputs,)
+        kv_returned = {
+            id(o)
+            for o, fx_output in itertools.zip_longest(outputs, fx_outputs)
+            if id(o) in kv_ids
+            and (
+                not isinstance(fx_output, torch.fx.Node)
+                or fx_output.meta.get("_trt_reaches_caller", True)
+            )
+        }
+        user_output_ids = {
+            id(o) for o in outputs if isinstance(o, trt.ITensor)
+        } - kv_returned
         for entry in self.ctx.aliased_outputs:
             aliased_tensor = entry.output_tensor
             if id(aliased_tensor) not in user_output_ids:
@@ -1056,7 +1081,9 @@ class TRTInterpreter(torch.fx.Interpreter):  # type: ignore[misc]
             # The same tensor can sit at several output positions, for example when a
             # converter returns its input as is. Each repeat gets its own copy below.
             repeated = id(output) in marked_outputs_ids
-            marked_outputs_ids.add(id(output))
+            kv_return = i < num_declared_outputs and id(output) in kv_returned
+            if not kv_return:
+                marked_outputs_ids.add(id(output))
 
             # Default policy is "output{i}"; engine-converter API may override
             # via output_binding_names, already validated by the caller to
@@ -1094,7 +1121,9 @@ class TRTInterpreter(torch.fx.Interpreter):  # type: ignore[misc]
             original_id = id(output)
             # If this output was emitted by an aliased layer (e.g.
             # IKVCacheUpdateLayer), it shares storage with its source input.
-            alias_info = None if repeated else aliased_info_by_id.get(original_id)
+            alias_info = (
+                None if repeated or kv_return else aliased_info_by_id.get(original_id)
+            )
 
             # Skip the dtype cast for aliased outputs: a cast inserts a new
             # layer whose output no longer shares storage with the source
@@ -1120,7 +1149,9 @@ class TRTInterpreter(torch.fx.Interpreter):  # type: ignore[misc]
             # TensorRT rejects a network input that is also an output, and a tensor
             # can be marked as an output only once, so mark a copy, unless the cast or
             # reshape above already made a new tensor.
-            if output.is_network_input or (repeated and id(output) == original_id):
+            if output.is_network_input or (
+                (repeated or kv_return) and id(output) == original_id
+            ):
                 layer = self.ctx.net.add_identity(output)
                 layer.name = f"Copy {output.name} to output {name}"
                 output = layer.get_output(0)

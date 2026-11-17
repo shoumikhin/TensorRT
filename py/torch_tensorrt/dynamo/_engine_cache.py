@@ -86,6 +86,7 @@ class BaseEngineCache(ABC):
             canonical_nodes = []
             input_counter = 0
             positions: Dict[torch.fx.Node, int] = {}
+            has_kv_writes = False
 
             for node in graph.nodes:
                 if node.op == "placeholder":
@@ -111,6 +112,22 @@ class BaseEngineCache(ABC):
                         # A refit replaces a weight's values, not its shape or dtype.
                         elif isinstance(attr, torch.Tensor):
                             canonical += f"{tuple(attr.shape)}{attr.dtype}"
+                    # Buffer lifting marks which writes the engine may apply in
+                    # place, and the marks pick the converter. The engine names the
+                    # input it updates, so a renamed buffer needs its own engine.
+                    if node.meta.get("_trt_kv_alias"):
+                        canonical += f"_trt_kv_alias({node.args[0]})"
+                        has_kv_writes = True
+                    # The outputs the caller cannot receive are recorded, KV or not:
+                    # such a KV output keeps the cache's memory instead of getting
+                    # its own copy.
+                    if node.op == "output" and has_kv_writes:
+                        shared = [
+                            positions[n]
+                            for n in node.all_input_nodes
+                            if n.meta.get("_trt_reaches_caller") is False
+                        ]
+                        canonical += f"_trt_not_received{shared}"
                     canonical_nodes.append(canonical)
                 positions[node] = len(positions)
 

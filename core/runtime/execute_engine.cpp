@@ -290,6 +290,63 @@ void create_output_allocator(c10::intrusive_ptr<TRTEngine> compiled_engine) {
   }
 }
 
+// TensorRT updates a KV cache in place while the engine reads its other inputs. An
+// input in a cache's memory is bound to a copy taken before the call, so it reads the
+// old contents. An input the engine also updates in place cannot be copied, because
+// its update would go to the copy, so a call where it shares memory with a cache is
+// refused, as is one where two caches share memory. An input that is not contiguous,
+// and under CUDA graphs any input TensorRT does not alias, is bound through a private
+// copy anyway.
+void copy_inputs_that_read_a_kv_cache(
+    std::vector<at::Tensor>& inputs,
+    const c10::intrusive_ptr<TRTEngine>& compiled_engine,
+    bool cudagraphs_enabled) {
+  const auto& infos = compiled_engine->input_binding_infos;
+  auto bound_as_is = [&](size_t i) {
+    const auto& t = inputs[i];
+    return i < infos.size() && !infos[i].is_shape_tensor && t.defined() && t.is_cuda() && t.is_contiguous() &&
+        t.numel() > 0 && (infos[i].is_aliased_input || !cudagraphs_enabled);
+  };
+  auto range = [&](size_t i) {
+    auto lo = reinterpret_cast<uintptr_t>(inputs[i].data_ptr());
+    return std::make_tuple(inputs[i].get_device(), lo, lo + inputs[i].nbytes(), i);
+  };
+  std::vector<std::tuple<int, uintptr_t, uintptr_t, size_t>> caches;
+  for (size_t i = 0; i < inputs.size(); i++) {
+    if (bound_as_is(i) && infos[i].is_kv_cache_input) {
+      caches.push_back(range(i));
+    }
+  }
+  if (caches.empty()) {
+    return;
+  }
+  std::sort(caches.begin(), caches.end());
+  for (size_t k = 1; k < caches.size(); k++) {
+    const auto& [device, lo, hi, i] = caches[k - 1];
+    const auto& [next_device, next_lo, next_hi, j] = caches[k];
+    TORCHTRT_CHECK(
+        device != next_device || hi <= next_lo,
+        "KV caches '" << infos[i].name << "' and '" << infos[j].name << "' of engine " << compiled_engine->name
+                      << " share memory, and the engine updates both in place. Pass separate tensors.");
+  }
+  for (size_t j = 0; j < inputs.size(); j++) {
+    if (!bound_as_is(j) || infos[j].is_kv_cache_input) {
+      continue;
+    }
+    const auto [device, lo, hi, _] = range(j);
+    // The caches do not overlap, so only the last one that starts before hi can reach past lo.
+    auto next = std::lower_bound(caches.begin(), caches.end(), std::make_tuple(device, hi, uintptr_t(0), size_t(0)));
+    if (next != caches.begin() && std::get<0>(*std::prev(next)) == device && std::get<2>(*std::prev(next)) > lo) {
+      TORCHTRT_CHECK(
+          !infos[j].is_aliased_input,
+          "Input '" << infos[j].name << "' and KV cache '" << infos[std::get<3>(*std::prev(next))].name
+                    << "' of engine " << compiled_engine->name
+                    << " share memory, and the engine updates both in place. Pass separate tensors.");
+      inputs[j] = inputs[j].clone();
+    }
+  }
+}
+
 std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intrusive_ptr<TRTEngine> compiled_engine) {
   // All inputs are expected to be on CUDA. Warn and move any that are not. A host-resident
   // shape-tensor input is an exception: TensorRT reads it from host memory, so it is left where it
@@ -371,6 +428,7 @@ std::vector<at::Tensor> execute_engine(std::vector<at::Tensor> inputs, c10::intr
         compiled_engine->disable_rtx_native_cudagraphs();
       }
     }
+    copy_inputs_that_read_a_kv_cache(inputs, compiled_engine, effective_cudagraphs);
 
     // Resolve the execution stream first so the optimization-profile switch below
     // is issued on the same stream the engine will actually enqueue on. This keeps
