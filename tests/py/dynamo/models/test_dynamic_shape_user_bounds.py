@@ -237,16 +237,20 @@ def test_build_user_symbol_bounds_uses_dynamic_inputs_only():
 
 
 @pytest.mark.unit
-def test_build_user_symbol_bounds_warns_on_01_specialization(caplog):
-    """``user_min=1, exp_min=2`` is the 0/1 specialization artifact -- warn,
-    don't raise."""
+@pytest.mark.parametrize("exported_min, warns", [(1, False), (2, True)])
+def test_compile_warns_only_when_input_min_1_is_below_the_exported_min(
+    caplog, exported_min, warns
+):
+    """``Dim(min=1)`` matches ``Input.min_shape=1`` even though the ShapeEnv
+    reports its lower bound as 2. A program exported with ``Dim(min=2)`` still
+    warns, because the engine accepts a size of 1 it was not exported for."""
 
     model = _SmallLinear().eval().cuda()
-    sample = torch.randn(2, 8, device="cuda")
+    sample = torch.randn(4, 8, device="cuda")
     ep = torch.export.export(
         model,
         (sample,),
-        dynamic_shapes=({0: torch.export.Dim.DYNAMIC},),
+        dynamic_shapes=({0: torch.export.Dim("batch", min=exported_min, max=8)},),
         strict=False,
     )
     input_min1 = Input(
@@ -259,11 +263,415 @@ def test_build_user_symbol_bounds_warns_on_01_specialization(caplog):
     import logging
 
     with caplog.at_level(logging.WARNING, logger="torch_tensorrt.dynamo._compiler"):
-        _build_user_symbol_bounds(ep.module(), [input_min1], {}, ep.graph_signature)
+        trt_module = torchtrt.dynamo.compile(ep, inputs=[input_min1], min_block_size=1)
 
-    msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
-    if msgs:
-        assert "0/1 specialization" in "\n".join(msgs)
+    warned = any(
+        "exported program's min is 2" in rec.message
+        for rec in caplog.records
+        if rec.levelno >= logging.WARNING
+    )
+    assert warned == warns
+    one_row = torch.randn(1, 8, device="cuda")
+    torch.testing.assert_close(
+        trt_module(one_row), model(one_row), rtol=1e-3, atol=1e-3
+    )
+
+
+def _profile_warnings(caplog, model, example, dynamic_shapes, inputs, **kwargs):
+    import logging
+
+    ep = torch.export.export(
+        model, example, dynamic_shapes=dynamic_shapes, strict=False
+    )
+    with caplog.at_level(logging.WARNING, logger="torch_tensorrt.dynamo._compiler"):
+        compiled = torchtrt.dynamo.compile(
+            ep, inputs=inputs, min_block_size=1, **kwargs
+        )
+    warnings = [
+        rec.message
+        for rec in caplog.records
+        if rec.levelno >= logging.WARNING
+        and ("Its profile starts at" in rec.message or "min is 2" in rec.message)
+    ]
+    return warnings, compiled
+
+
+def _assert_runs_or_warns(warnings, compiled, model, smallest):
+    """A call at the smallest size the program allows either runs or was warned
+    about at compile time."""
+    try:
+        torch.testing.assert_close(
+            compiled(*smallest), model(*smallest), rtol=1e-3, atol=1e-3
+        )
+    except RuntimeError:
+        assert any("Its profile starts at" in w for w in warnings), warnings
+
+
+class _Repeat(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(8, 8)
+
+    def forward(self, x, z):
+        return self.linear(x).repeat(2, 1) + z
+
+
+_b = torch.export.Dim("b", min=1, max=8)
+_derived_inputs = [
+    Input(min_shape=(1, 8), opt_shape=(4, 8), max_shape=(8, 8)),
+    Input(min_shape=(2, 8), opt_shape=(8, 8), max_shape=(16, 8)),
+]
+
+
+@pytest.mark.unit
+def test_compile_warns_when_an_engine_input_size_is_computed_from_a_symbol(caplog):
+    """``z`` is ``2 * b``. A profile that came from the ShapeEnv bounds of ``b``,
+    which start at 2 for ``Dim(min=1)``, would leave a call with ``b = 1`` outside."""
+    model = _Repeat().eval().cuda()
+    warnings, compiled = _profile_warnings(
+        caplog,
+        model,
+        (torch.randn(4, 8, device="cuda"), torch.randn(8, 8, device="cuda")),
+        ({0: _b}, {0: 2 * _b}),
+        _derived_inputs,
+    )
+    smallest = (torch.randn(1, 8, device="cuda"), torch.randn(2, 8, device="cuda"))
+    _assert_runs_or_warns(warnings, compiled, model, smallest)
+
+
+@pytest.mark.unit
+def test_compile_warns_for_a_computed_size_made_inside_the_graph(caplog):
+    """No input of the program has the size ``2 * b``, but the engine after the
+    op sent to PyTorch has one."""
+
+    class Inner(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.first = torch.nn.Linear(8, 8)
+            self.second = torch.nn.Linear(8, 8)
+
+        def forward(self, x):
+            return self.second(torch.relu(self.first(x).repeat(2, 1)))
+
+    model = Inner().eval().cuda()
+    warnings, compiled = _profile_warnings(
+        caplog,
+        model,
+        (torch.randn(4, 8, device="cuda"),),
+        ({0: _b},),
+        [Input(min_shape=(1, 8), opt_shape=(4, 8), max_shape=(8, 8))],
+        torch_executed_ops={"torch.ops.aten.relu.default"},
+    )
+    _assert_runs_or_warns(
+        warnings, compiled, model, (torch.randn(1, 8, device="cuda"),)
+    )
+
+
+@pytest.mark.unit
+def test_compile_warns_when_every_size_of_an_input_is_computed(caplog):
+    """No dimension of ``x`` is ``b`` itself, so no ``Input`` spec bounds ``b``.
+    The program's own bounds still give the smallest size."""
+    half = torch.export.Dim("half", min=1, max=8)
+    model = _SmallLinear().eval().cuda()
+    warnings, compiled = _profile_warnings(
+        caplog,
+        model,
+        (torch.randn(8, 8, device="cuda"),),
+        ({0: 2 * half},),
+        [Input(min_shape=(2, 8), opt_shape=(8, 8), max_shape=(16, 8))],
+    )
+    _assert_runs_or_warns(
+        warnings, compiled, model, (torch.randn(2, 8, device="cuda"),)
+    )
+
+
+@pytest.mark.unit
+def test_compile_warns_when_compiled_from_example_tensors(caplog):
+    example = (torch.randn(4, 8, device="cuda"), torch.randn(8, 8, device="cuda"))
+    model = _Repeat().eval().cuda()
+    warnings, compiled = _profile_warnings(
+        caplog, model, example, ({0: _b}, {0: 2 * _b}), list(example)
+    )
+    smallest = (torch.randn(1, 8, device="cuda"), torch.randn(2, 8, device="cuda"))
+    _assert_runs_or_warns(warnings, compiled, model, smallest)
+
+
+@pytest.mark.unit
+def test_compile_does_not_warn_for_a_computed_size_only_pytorch_reads(caplog):
+    class TorchOnly(torch.nn.Module):
+        def forward(self, x, z):
+            return x.relu(), z.sin()
+
+    model = TorchOnly()
+    warnings, _ = _profile_warnings(
+        caplog,
+        model,
+        (torch.randn(4, 8, device="cuda"), torch.randn(8, 8, device="cuda")),
+        ({0: _b}, {0: 2 * _b}),
+        _derived_inputs,
+        torch_executed_ops={"torch.ops.aten.sin.default"},
+    )
+    assert warnings == []
+
+
+@pytest.mark.unit
+def test_compile_does_not_warn_about_sizes_the_input_spec_rules_out(caplog):
+    """``x`` is ``2 * b``, and its ``Input`` spec starts at 8, so ``b`` starts at 4."""
+    b = torch.export.Dim("b", min=1, max=8)
+    model = _SmallLinear().eval().cuda()
+    warnings, compiled = _profile_warnings(
+        caplog,
+        model,
+        (torch.randn(8, 8, device="cuda"),),
+        ({0: 2 * b},),
+        [Input(min_shape=(8, 8), opt_shape=(8, 8), max_shape=(16, 8))],
+    )
+    assert warnings == []
+    x = torch.randn(8, 8, device="cuda")
+    torch.testing.assert_close(compiled(x), model(x), rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.unit
+def test_compile_warns_only_about_a_size_the_program_allows(caplog):
+    """``2 * b`` with ``b`` from 0 is never 1. A size of 0 never enters an engine, so
+    the smallest size that can is 2."""
+    b = torch.export.Dim("b", min=0, max=8)
+    model = _SmallLinear().eval().cuda()
+    example = (torch.randn(8, 8, device="cuda"),)
+    warnings, compiled = _profile_warnings(
+        caplog, model, example, ({0: 2 * b},), list(example)
+    )
+    assert not any("that size is 1," in w for w in warnings), warnings
+    _assert_runs_or_warns(
+        warnings, compiled, model, (torch.randn(2, 8, device="cuda"),)
+    )
+
+
+@torch.library.custom_op("torchtrt_profile_test::positive_rows", mutates_args=())
+def _positive_rows(x: torch.Tensor) -> torch.Tensor:
+    return x[x[:, 0] > 0].clone()
+
+
+@_positive_rows.register_fake
+def _positive_rows_fake(x: torch.Tensor) -> torch.Tensor:
+    rows = torch.library.get_ctx().new_dynamic_size(min=0, max=8)
+    return x.new_empty((rows, x.shape[1]))
+
+
+@pytest.mark.unit
+def test_compile_warns_for_a_size_a_symbol_of_0_makes(caplog):
+    """The linear layer reads ``2 * b + 2 * rows``, where ``rows`` can be 0, so its
+    smallest size is 2, with ``b = 1``."""
+
+    class Joined(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(8, 8)
+
+        def forward(self, x):
+            rows = torch.ops.torchtrt_profile_test.positive_rows(x)
+            return self.linear(torch.cat((x.repeat(2, 1), rows.repeat(2, 1))))
+
+    model = Joined().eval().cuda()
+    warnings, compiled = _profile_warnings(
+        caplog,
+        model,
+        (torch.ones(4, 8, device="cuda"),),
+        ({0: _b},),
+        [Input(min_shape=(1, 8), opt_shape=(4, 8), max_shape=(8, 8))],
+        torch_executed_ops={
+            "torch.ops.aten.repeat.default",
+            "torch.ops.aten.cat.default",
+        },
+    )
+    _assert_runs_or_warns(
+        warnings, compiled, model, (-torch.ones(1, 8, device="cuda"),)
+    )
+
+
+@pytest.mark.unit
+def test_compile_names_the_smallest_size_a_symbol_of_0_makes(caplog):
+    """``b + 1`` with ``b`` from 0 starts at 1, not at the 2 that ``b = 1`` gives."""
+    b = torch.export.Dim("b", min=0, max=8)
+    model = _SmallLinear().eval().cuda()
+    warnings, compiled = _profile_warnings(
+        caplog,
+        model,
+        (torch.randn(5, 8, device="cuda"),),
+        ({0: b + 1},),
+        [Input(min_shape=(1, 8), opt_shape=(5, 8), max_shape=(9, 8))],
+    )
+    assert not any("that size is 2," in w for w in warnings), warnings
+    _assert_runs_or_warns(
+        warnings, compiled, model, (torch.randn(1, 8, device="cuda"),)
+    )
+
+
+@pytest.mark.unit
+def test_compile_does_not_warn_about_a_size_below_its_program_range(caplog):
+    """``a`` is ``2 * b`` and the program starts ``b`` at 2, so ``a`` starts at 4,
+    however far the ``Input`` spec of ``b + 1`` lets ``b`` go down."""
+
+    class Two(torch.nn.Module):
+        def forward(self, a, c):
+            return a.sum() + c.sum()
+
+    b = torch.export.Dim("b", min=2, max=8)
+    example = (torch.randn(8, 8, device="cuda"), torch.randn(5, 8, device="cuda"))
+    warnings, _ = _profile_warnings(
+        caplog,
+        Two(),
+        example,
+        ({0: 2 * b}, {0: b + 1}),
+        [example[0], Input(min_shape=(1, 8), opt_shape=(5, 8), max_shape=(9, 8))],
+    )
+    assert not any("Input a " in w for w in warnings), warnings
+
+
+@pytest.mark.unit
+def test_compile_names_an_even_size_of_two_symbols_from_0(caplog):
+    """``2 * T + 2 * U`` with both from 0 is never 1: its smallest size above 0 is 2."""
+
+    class Joined(torch.nn.Module):
+        def forward(self, x, y):
+            return torch.cat((x.repeat(2, 1), y.repeat(2, 1))).abs() * 2 + 1
+
+    T, U = torch.export.Dim("T", min=0, max=8), torch.export.Dim("U", min=0, max=8)
+    example = (torch.randn(3, 8, device="cuda"), torch.randn(2, 8, device="cuda"))
+    warnings, _ = _profile_warnings(
+        caplog,
+        Joined(),
+        example,
+        ({0: T}, {0: U}),
+        list(example),
+        torch_executed_ops={
+            "torch.ops.aten.repeat.default",
+            "torch.ops.aten.cat.default",
+        },
+    )
+    assert not any("that size is 1," in w for w in warnings), warnings
+
+
+@pytest.mark.unit
+def test_compile_names_the_smallest_size_of_a_product(caplog):
+    """``8 * b * r`` is 0 or at least 8, whichever symbol is raised above 0."""
+
+    class Product(torch.nn.Module):
+        def forward(self, x):
+            flat = x.reshape(-1)
+            return torch.cat((flat, flat)).abs() + 1
+
+    b, r = torch.export.Dim("b", min=0, max=8), torch.export.Dim("r", min=0, max=8)
+    example = (torch.randn(2, 3, 4, device="cuda"),)
+    warnings, _ = _profile_warnings(
+        caplog,
+        Product(),
+        example,
+        ({0: b, 1: r},),
+        list(example),
+        torch_executed_ops={
+            "torch.ops.aten.cat.default",
+            "torch.ops.aten.view.default",
+            "torch.ops.aten.reshape.default",
+        },
+    )
+    assert not any(
+        "that size is 1," in w or "that size is 2," in w for w in warnings
+    ), warnings
+
+
+@pytest.mark.unit
+def test_compile_keeps_a_symbol_in_its_program_range(caplog):
+    """``2 * b + 2`` with ``b`` from 2 starts at 6, though the ``Input`` spec of
+    ``b + 1`` lets ``b`` go to 0."""
+
+    class Repeated(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(8, 8)
+
+        def forward(self, x):
+            return self.linear(x.repeat(2, 1))
+
+    b = torch.export.Dim("b", min=2, max=8)
+    warnings, _ = _profile_warnings(
+        caplog,
+        Repeated().eval().cuda(),
+        (torch.randn(5, 8, device="cuda"),),
+        ({0: b + 1},),
+        [Input(min_shape=(1, 8), opt_shape=(5, 8), max_shape=(9, 8))],
+        torch_executed_ops={"torch.ops.aten.repeat.default"},
+    )
+    assert not any(
+        "that size is 2," in w or "that size is 4," in w for w in warnings
+    ), warnings
+
+
+class _Plain(torch.nn.Module):
+    """``x`` has size ``b`` and ``z`` size ``2 * b``, in either order."""
+
+    def __init__(self, z_first):
+        super().__init__()
+        self.z_first = z_first
+
+    def forward(self, first, second):
+        x, z = (second, first) if self.z_first else (first, second)
+        return x.sum() + z.sum()
+
+
+@pytest.mark.unit
+def test_an_input_for_a_computed_size_does_not_hide_the_plain_one():
+    """An ``Input`` for ``x`` past the exported maximum is refused whichever input
+    comes first. The ``Input`` for ``z``, of size ``2 * b``, bounds ``b`` for the
+    profile warning only, and changes the bounds that build profiles not at all."""
+    b = torch.export.Dim("b", min=1, max=8)
+    for z_first in (False, True):
+
+        def specs(x_max):
+            x = Input(min_shape=(1, 8), opt_shape=(4, 8), max_shape=(x_max, 8))
+            z = Input(min_shape=(2, 8), opt_shape=(8, 8), max_shape=(15, 8))
+            return [z, x] if z_first else [x, z]
+
+        example = (torch.randn(8, 8), torch.randn(4, 8))
+        shapes = ({0: 2 * b}, {0: b})
+        if not z_first:
+            example, shapes = example[::-1], shapes[::-1]
+        ep = torch.export.export(
+            _Plain(z_first), example, dynamic_shapes=shapes, strict=False
+        )
+        with pytest.raises(ValueError, match="Input.max_shape"):
+            _build_user_symbol_bounds(ep.module(), specs(32), {}, ep.graph_signature)
+        computed = {}
+        bounds = _build_user_symbol_bounds(
+            ep.module(),
+            specs(8),
+            {},
+            ep.graph_signature,
+            computed_size_bounds=computed,
+        )
+        assert list(bounds.values()) == [(1, 8)], bounds
+        assert list(computed.values()) == [(1, 7)], computed
+
+
+@pytest.mark.unit
+def test_compile_rejects_input_min_0_for_a_dim_exported_from_0():
+    """``range_constraints`` record ``Dim(min=0)`` as 0, but Torch-TensorRT starts
+    every engine profile at 1 or more, so ``Input.min_shape=0`` is rejected at
+    compile time rather than accepted and then refused by the engine at run time."""
+
+    model = _SmallLinear().eval().cuda()
+    sample = torch.randn(4, 8, device="cuda")
+    ep = torch.export.export(
+        model,
+        (sample,),
+        dynamic_shapes=({0: torch.export.Dim("batch", min=0, max=8)},),
+        strict=False,
+    )
+    input_min0 = Input(
+        min_shape=(0, 8), opt_shape=(4, 8), max_shape=(8, 8), dtype=torch.float32
+    )
+    with pytest.raises(ValueError, match="starts every engine profile at 1"):
+        torchtrt.dynamo.compile(ep, inputs=[input_min0], min_block_size=1)
 
 
 @pytest.mark.unit

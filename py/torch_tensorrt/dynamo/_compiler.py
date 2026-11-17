@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import collections.abc
 import copy
+import itertools
 import logging
 import operator
 import os
@@ -19,7 +20,7 @@ from torch.export.graph_signature import InputKind
 from torch.fx.graph import _PyTreeCodeGen, _PyTreeInfo
 from torch.fx.node import Target
 from torch.utils._sympy.numbers import int_oo
-from torch.utils._sympy.value_ranges import bound_sympy
+from torch.utils._sympy.value_ranges import ValueRanges, bound_sympy
 from torch_tensorrt._Device import Device
 from torch_tensorrt._enums import EngineCapability, dtype
 from torch_tensorrt._features import ENABLED_FEATURES, needs_cross_compile
@@ -1329,11 +1330,34 @@ def _insert_complex_io_adapters(
         partitioned_module.recompile()
 
 
+def _symbol_bounds_of_linear_size(
+    expr: sympy.Expr, low: int, high: int
+) -> Optional[Tuple[sympy.Symbol, int, int]]:
+    """The bounds ``low <= a * s + c <= high`` put on ``s``, for a size written
+    with one symbol, an integer ``a > 0`` and an integer ``c``; otherwise None."""
+    if len(expr.free_symbols) != 1:
+        return None
+    (symbol,) = expr.free_symbols
+    try:
+        poly = sympy.Poly(expr, symbol)
+    except sympy.PolynomialError:
+        return None
+    if poly.degree() != 1:
+        return None
+    a, c = poly.all_coeffs()
+    if not (a.is_Integer and c.is_Integer and a > 0):
+        return None
+    a, c = int(a), int(c)
+    return symbol, -((c - low) // a), (high - c) // a
+
+
 def _build_user_symbol_bounds(
     gm: torch.fx.GraphModule,
     sample_arg_inputs: Sequence[Input],
     sample_kwarg_inputs: dict[Any, Any],
     graph_signature: torch.export.graph_signature.ExportGraphSignature,
+    range_constraints: Optional[Dict[sympy.Symbol, Any]] = None,
+    computed_size_bounds: Optional[Dict[sympy.Symbol, Tuple[int, int]]] = None,
 ) -> Dict[sympy.Symbol, Tuple[int, int]]:
     """Map ``sympy.Symbol -> (min, max)`` from dynamic ``Input``s, used to
     fill ``Dim.DYNAMIC`` upper bounds without mutating ``ShapeEnv``.
@@ -1341,8 +1365,17 @@ def _build_user_symbol_bounds(
     Validates against finite exporter bounds: ``user_max > exp_max`` and
     ``user_min < exp_min`` raise (TRT would reject those shapes at runtime);
     a strict subset narrows the engine profile to the user's bounds (info
-    log only); the ``user_min=1, exp_min=2`` case warns -- it's PyTorch's
-    0/1 specialization artifact, not a user error.
+    log only); the ``user_min=1, exp_min=2`` case warns, because the engine
+    profile still starts at 1. The exporter bounds come from the program's
+    ``range_constraints`` when given. The ``ShapeEnv`` assumes every size is
+    at least 2 (0/1 specialization), so it reports ``Dim(min=1)`` as 2, while
+    ``range_constraints`` keep the 1 the program was exported with. Where the
+    profile of an engine input whose size is computed from a symbol starts above
+    the smallest size a call can give it,
+    :func:`_warn_where_a_profile_starts_above_the_input_min` warns once the
+    engines' inputs are known. For that warning only, an
+    ``Input`` for a size written as ``a * s + c`` bounds ``s`` in
+    ``computed_size_bounds``; it changes no profile.
     """
     # ep.module() strips lifted params/buffers from the graph, so all_placeholders
     # only contains USER_INPUT nodes, but graph_signature.input_specs still lists
@@ -1420,6 +1453,19 @@ def _build_user_symbol_bounds(
                     d,
                     expr,
                 )
+                low, high = int(min_shape[d]), int(max_shape[d])
+                recorded = (range_constraints or {}).get(expr)
+                if recorded is not None:
+                    low = max(low, int(recorded.lower))
+                    if recorded.upper not in (int_oo, sympy.oo):
+                        high = min(high, int(recorded.upper))
+                bounds = _symbol_bounds_of_linear_size(expr, low, high)
+                if computed_size_bounds is not None and bounds is not None:
+                    symbol, low, high = bounds
+                    if symbol in computed_size_bounds:
+                        known_low, known_high = computed_size_bounds[symbol]
+                        low, high = max(low, known_low), min(high, known_high)
+                    computed_size_bounds[symbol] = (low, high)
                 continue
             if expr in user_symbol_bounds:
                 continue
@@ -1441,10 +1487,12 @@ def _build_user_symbol_bounds(
             # Validate the user's Input range against it here -- at compile
             # time -- before they hit that opaque runtime error on a shape
             # they explicitly declared in Input.min_shape / Input.max_shape.
-            shape_env = getattr(dim.node, "shape_env", None)
-            if shape_env is None:
-                continue
-            exp_range = shape_env.var_to_range.get(expr)
+            exp_range = (range_constraints or {}).get(expr)
+            if exp_range is None:
+                shape_env = getattr(dim.node, "shape_env", None)
+                if shape_env is None:
+                    continue
+                exp_range = shape_env.var_to_range.get(expr)
             if exp_range is None:
                 continue
             exp_lower = exp_range.lower
@@ -1454,7 +1502,11 @@ def _build_user_symbol_bounds(
                 # Dim.DYNAMIC: user fills the gap (intended use).
                 continue
             try:
-                exp_min = int(exp_lower)
+                # range_constraints can start at 0, but extract_var_range_info
+                # starts every engine profile at 1 or more, so Input.min_shape=0
+                # is still rejected.
+                exp_lowest = int(exp_lower)
+                exp_min = max(exp_lowest, 1)
                 exp_max = int(exp_upper)
             except (TypeError, ValueError):
                 continue
@@ -1464,7 +1516,7 @@ def _build_user_symbol_bounds(
             mismatch = (
                 f"Dynamic dimension '{expr}': "
                 f"Input range [{user_min}, {user_max}] vs "
-                f"exported program range [{exp_min}, {exp_max}]."
+                f"exported program range [{exp_lowest}, {exp_max}]."
             )
 
             if user_max > exp_max:
@@ -1479,16 +1531,23 @@ def _build_user_symbol_bounds(
                 )
 
             if user_min < exp_min:
-                # 1->2 is the 0/1 specialization artifact, not a user error.
+                # extract_var_range_info starts every profile whose exporter
+                # min is 2 at 1, so the engine runs this size; warn, do not raise.
                 if user_min == 1 and exp_min == 2:
                     logger.warning(
                         "%s Input.min_shape=1 but the exported program's min "
-                        "is 2 (PyTorch 0/1 specialization -- Dim(min=1) is "
-                        "recorded as min=2). The compiled engine's min will "
-                        "be 2.",
+                        "is 2. The compiled engine accepts a size of 1, which "
+                        "the program was not exported for.",
                         mismatch,
                     )
                     continue
+                if exp_lowest <= user_min:
+                    raise ValueError(
+                        f"{mismatch} Input.min_shape ({user_min}) is below 1. "
+                        f"The program accepts it, but Torch-TensorRT starts "
+                        f"every engine profile at 1 or more, so set "
+                        f"Input.min_shape >= 1."
+                    )
                 raise ValueError(
                     f"{mismatch} Input.min_shape ({user_min}) is below the "
                     f"exported program's min ({exp_min}). The program was "
@@ -1537,6 +1596,130 @@ def _placeholders_are_engine_bindings(gm: torch.fx.GraphModule) -> bool:
     return True
 
 
+def _smallest_positive_value(
+    expr: sympy.Expr, ranges: Dict[sympy.Symbol, ValueRanges]
+) -> Optional[int]:
+    """The smallest value above 0 that ``expr`` takes with each symbol in its range,
+    or None when it cannot be told.
+
+    A polynomial with no negative coefficient grows with each symbol, so that value
+    has each symbol at its smallest value or at 1, whichever is larger.
+    """
+    symbols = sorted(expr.free_symbols, key=str)
+    try:
+        coefficients = sympy.Poly(expr, *symbols).coeffs()
+    except sympy.PolynomialError:
+        return None
+    if any(c < 0 for c in coefficients):
+        return None
+    choices = [
+        (
+            {int(ranges[s].lower), max(int(ranges[s].lower), 1)}
+            if ranges[s].upper >= 1
+            else {int(ranges[s].lower)}
+        )
+        for s in symbols
+    ]
+    values = [
+        int(expr.subs(dict(zip(symbols, point))))
+        for point in itertools.product(*choices)
+    ]
+    positive = [v for v in values if v >= 1]
+    return min(positive) if positive else None
+
+
+def _warn_where_a_profile_starts_above_the_input_min(
+    name: str,
+    submodule: torch.fx.GraphModule,
+    submodule_inputs: Sequence[Any],
+    user_symbol_bounds: Dict[sympy.Symbol, Tuple[int, int]],
+    range_constraints: Optional[Dict[sympy.Symbol, Any]],
+    computed_size_bounds: Dict[sympy.Symbol, Tuple[int, int]],
+) -> None:
+    """Warn about each engine input whose profile starts above the smallest size
+    a call can give it.
+
+    A size computed from symbols, such as ``2 * b``, can get a profile that starts above
+    the smallest size the program allows. That size comes from the program's
+    ``range_constraints``: the range they give the size itself, which export records for
+    an input dimension written as ``2 * b`` (or, when that range starts at 0, the
+    smallest size above 0), unless an ``Input`` spec narrows one of its symbols; or else
+    the smallest value above 0 that its symbols' ranges give it, each range narrowed by
+    the ``Input`` specs within the program's, since a size of 0 never enters an engine.
+    When that value cannot be told, as for a size with a negative term, no size is
+    named. So it is known even when every dimension of an input is computed or the
+    program is compiled from example tensors. ``computed_size_bounds``, from ``Input``
+    specs of computed sizes, bound their symbol here like the specs of the symbol
+    itself, within those specs.
+    """
+    ranges = dict(range_constraints or {})
+    # A call has to keep a symbol that is a dimension in its program range, whatever
+    # the specs say. A symbol known only through a computed size, like ``b`` in an
+    # input of size ``b + 1``, can be recorded at the 2 the shape system assumes, so
+    # its spec was bounded by the size's own recorded range instead.
+    for symbol, (low, high) in user_symbol_bounds.items():
+        if symbol in ranges:
+            low = max(low, ranges[symbol].lower)
+            high = min(high, ranges[symbol].upper)
+        if low <= high:
+            ranges[symbol] = ValueRanges(low, high)
+    for symbol, (low, high) in computed_size_bounds.items():
+        if symbol in user_symbol_bounds:
+            low = max(low, ranges[symbol].lower)
+            high = min(high, ranges[symbol].upper)
+        if low <= high:
+            ranges[symbol] = ValueRanges(low, high)
+    narrowed = user_symbol_bounds.keys() | computed_size_bounds.keys()
+    placeholders = [n for n in submodule.graph.nodes if n.op == "placeholder"]
+    for node, inp in zip(placeholders, submodule_inputs):
+        val = node.meta.get("val")
+        if not (isinstance(val, torch.Tensor) and isinstance(inp, Input)):
+            continue
+        if inp.shape_mode != Input._ShapeMode.DYNAMIC:
+            continue
+        for axis, size in enumerate(val.size()):
+            if not isinstance(size, torch.SymInt) or size.node.expr.is_symbol:
+                continue
+            expr = size.node.expr
+            exported = (range_constraints or {}).get(expr)
+            recorded = None if expr.free_symbols & narrowed else exported
+            positive = None
+            if (
+                recorded is not None
+                and recorded.lower < 1
+                and recorded.upper not in (int_oo, sympy.oo)
+            ):
+                # The smallest size above 0, 2 for ``2 * b``.
+                positive = _symbol_bounds_of_linear_size(expr, 1, int(recorded.upper))
+            if recorded is not None and recorded.lower >= 1:
+                lower = recorded.lower
+            elif positive is not None:
+                symbol, low, _ = positive
+                lower = expr.subs(symbol, low)
+            elif expr.free_symbols <= ranges.keys():
+                lower = _smallest_positive_value(
+                    expr, {s: ranges[s] for s in expr.free_symbols}
+                )
+                if lower is None:
+                    continue
+            else:
+                continue
+            # No profile starts below 1, nor below the program's own range.
+            smallest = max(lower, 1, exported.lower if exported is not None else 1)
+            if inp.shape["min_shape"][axis] > smallest:
+                logger.warning(
+                    "Input %s of %s has size %s on dimension %d. Its profile "
+                    "starts at %d, so a call where that size is %s, which the "
+                    "program allows, fails.",
+                    node.name,
+                    name,
+                    expr,
+                    axis,
+                    inp.shape["min_shape"][axis],
+                    smallest,
+                )
+
+
 @fn_supports_debugger  # type: ignore[misc]
 def compile_module(
     gm: torch.fx.GraphModule,
@@ -1581,9 +1764,15 @@ def compile_module(
     # Forwarded to the partitioner to fill Dim.DYNAMIC upper bounds.
     # Read-only w.r.t. ShapeEnv so range_constraints survive save/re-export.
     # graph_signature is None on the torch.compile path, which has no ExportedProgram.
+    computed_size_bounds: Dict[sympy.Symbol, Tuple[int, int]] = {}
     user_symbol_bounds = (
         _build_user_symbol_bounds(
-            gm, sample_arg_inputs, sample_kwarg_inputs, graph_signature
+            gm,
+            sample_arg_inputs,
+            sample_kwarg_inputs,
+            graph_signature,
+            range_constraints,
+            computed_size_bounds,
         )
         if graph_signature is not None
         else {}
@@ -1726,6 +1915,14 @@ def compile_module(
             user_symbol_bounds=user_symbol_bounds,
             example_tensors=False,
             range_constraints=range_constraints,
+        )
+        _warn_where_a_profile_starts_above_the_input_min(
+            "_run_on_acc_0",
+            gm,
+            convert_inputs,
+            user_symbol_bounds,
+            range_constraints,
+            computed_size_bounds,
         )
         read: Set[int] = set()
         if weight_releaser is not None:
@@ -1957,6 +2154,14 @@ def compile_module(
             user_symbol_bounds=user_symbol_bounds,
             example_tensors=False,
             range_constraints=range_constraints,
+        )
+        _warn_where_a_profile_starts_above_the_input_min(
+            name,
+            submodule,
+            submodule_inputs,
+            user_symbol_bounds,
+            range_constraints,
+            computed_size_bounds,
         )
 
         assert submodule_inputs is not None
