@@ -8,20 +8,27 @@ gated by a validator (declared in ``aten_ops_converters.py``) and there
 are two registered converters for the same op:
 
 * ``aten_ops_index_copy_kv`` — HIGH priority, validator-gated. Fires only
-  when the input is a 4-D static floating-point cache, ``dim=2``, and the
-  source has ``shape[2] == 1`` (single-position write, the common
-  streaming-decoder pattern) or, for a module buffer that
-  ``lift_mutated_buffers`` classified in place, is written at consecutive
-  positions ``start + arange(n)`` (a prefill chunk, ``n`` possibly
-  dynamic). Emits ``IKVCacheUpdateLayer`` whose output is aliased to the
-  cache input.
+  for a write that ``lift_mutated_buffers`` marked to update in place, when
+  the input is a 4-D static floating-point cache, ``dim=2``, and the source
+  has ``shape[2] == 1`` (single-position write, the common
+  streaming-decoder pattern) or is written at consecutive positions
+  ``start + arange(n)`` (a prefill chunk, ``n`` possibly dynamic). Emits
+  ``IKVCacheUpdateLayer`` whose output is aliased to the cache input.
 
-* ``aten_ops_index_copy_fallback`` — STANDARD priority, always fires.
-  Implements the general semantics via scatter (equivalent to what the
-  torch decomposition would produce).
+* ``aten_ops_index_copy_fallback``: STANDARD priority. Fires for every
+  other case, static or dynamic. It refuses an int8 write, a float64 write
+  without ``truncate_double``, and a write that ``compile`` marks because
+  it would hand an engine a size of 0, which no engine profile takes.
+  ``compile`` marks it only when no other op that can run in an engine
+  reads its empty operands, for example a number of positions exported as
+  ``Dim("T", max=8)``, whose smallest value is 0 even when an ``Input``
+  spec starts at 1, since refit sees only the program. Export
+  ``Dim("T", min=1, max=8)`` to keep the write in the engine. Implements
+  the general semantics via scatter (equivalent to what the torch
+  decomposition would produce).
 
-Since both converters live in TRT, no graph break is introduced for
-non-KV cases; they just take a less-efficient TRT path.
+Apart from those, no graph break is introduced for non-KV cases; they just
+take a less-efficient TRT path.
 
 The two functions here implement the bodies. Registration with the
 validator lives next to the other aten converters for discoverability.
@@ -36,6 +43,7 @@ import tensorrt as trt
 from tensorrt import ITensor as TRTTensor
 from torch.fx.node import Target
 from torch_tensorrt.dynamo._SourceIR import SourceIR
+from torch_tensorrt.dynamo.conversion import impl
 from torch_tensorrt.dynamo.conversion._ConversionContext import ConversionContext
 from torch_tensorrt.dynamo.conversion.converter_utils import (
     cast_trt_tensor,
@@ -43,10 +51,12 @@ from torch_tensorrt.dynamo.conversion.converter_utils import (
     set_layer_name,
 )
 from torch_tensorrt.dynamo.conversion.impl import select
+from torch_tensorrt.dynamo.conversion.impl.shape import shape as get_shape
 from torch_tensorrt.dynamo.conversion.impl.shuffle import reshape
 from torch_tensorrt.dynamo.conversion.impl.slice_scatter import (
     emit_kv_cache_update_layer,
 )
+from torch_tensorrt.dynamo.utils import DYNAMIC_DIM
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +137,8 @@ def index_copy_fallback(
     positions in ``index`` along ``dim``. Equivalent to the standard
     torch decomposition: build a broadcast index tensor of the same
     shape as ``src`` with ``index`` placed along ``dim`` and call
-    ``scatter``.
+    ``scatter``. Positions are not checked, static or dynamic: a negative position
+    counts from the end and one past the end is dropped, where PyTorch raises.
     """
     rank = len(input.shape)
     # A 0-d input and source are one element each, which scatter takes as they are.
@@ -142,18 +153,10 @@ def index_copy_fallback(
     src_shape = tuple(src.shape)
 
     # Reshape `index` (1-D, length matches src.shape[dim]) so it broadcasts
-    # over the remaining dims of `src`.
+    # over the remaining dims of `src`. A dynamic length stays DYNAMIC_DIM, which
+    # the shuffle resolves from the index itself.
     reshape_to = [1] * rank
-    if isinstance(src_shape[dim], int):
-        reshape_to[dim] = src_shape[dim]
-    else:
-        # Dynamic seq dim — defer to a shape-aware reshape. Build it via
-        # a shape op so the reshape is dynamic-shape-safe.
-        # For now require static; raise instead of silently producing wrong results.
-        raise NotImplementedError(
-            "index_copy fallback with dynamic source shape on dim %d is not "
-            "yet supported." % dim
-        )
+    reshape_to[dim] = src_shape[dim]
 
     shuffle = ctx.net.add_shuffle(index)
     shuffle.reshape_dims = trt.Dims(reshape_to)
@@ -161,7 +164,7 @@ def index_copy_fallback(
 
     # Broadcast/expand to src's shape. ``broadcast_to`` semantics: numpy
     # array first then to TRT.
-    if all(isinstance(s, int) for s in src_shape):
+    if DYNAMIC_DIM not in src_shape:
         # Static case: just expand via a slice with broadcast strides.
         expand_layer = ctx.net.add_slice(
             reshaped_index,
@@ -171,8 +174,23 @@ def index_copy_fallback(
         )
         index_broadcast = expand_layer.get_output(0)
     else:
-        raise NotImplementedError(
-            "index_copy fallback with dynamic shapes is not yet supported."
+        runtime_src_shape = [
+            (
+                get_shape(
+                    ctx, target, source_ir, name + f"_src_shape_{axis}", src, axis
+                )
+                if size == DYNAMIC_DIM
+                else size
+            )
+            for axis, size in enumerate(src_shape)
+        ]
+        index_broadcast = impl.slice.expand(
+            ctx,
+            target,
+            source_ir,
+            name + "_index_expand",
+            reshaped_index,
+            tuple(runtime_src_shape),
         )
 
     return select.scatter(

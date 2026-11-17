@@ -1733,9 +1733,39 @@ def aten_ops_index_copy_kv(
     )
 
 
+def _index_copy_fallback_validator(
+    node: Node, settings: Optional[CompilationSettings] = None
+) -> bool:
+    """Keep the ``index_copy`` writes TensorRT's scatter cannot serve in PyTorch.
+
+    TensorRT treats an int8 scatter as quantized and fails the engine build. A
+    float64 write needs ``truncate_double``, as the other converters' validators
+    require, or the engine expects float32 and refuses the caller's tensor. A write
+    that would hand an engine a size its profile cannot hold (``compile`` marks it
+    from the program's ``range_constraints``) stays too.
+    """
+    input_node = node.args[0] if node.args else None
+    input_val = input_node.meta.get("val") if isinstance(input_node, Node) else None
+    if isinstance(input_val, torch.Tensor) and input_val.dtype == torch.int8:
+        _LOGGER.debug("index_copy with an int8 input, falling back")
+        return False
+    if (
+        isinstance(input_val, torch.Tensor)
+        and input_val.dtype == torch.float64
+        and not (settings is not None and settings.truncate_double)
+    ):
+        _LOGGER.debug("index_copy of float64 needs truncate_double, falling back")
+        return False
+    if node.meta.get("_trt_size_outside_profile"):
+        _LOGGER.debug("index_copy with a size an engine cannot take, falling back")
+        return False
+    return True
+
+
 @dynamo_tensorrt_converter(
     torch.ops.aten.index_copy.default,
-    supports_dynamic_shapes=False,
+    capability_validator=_index_copy_fallback_validator,
+    supports_dynamic_shapes=True,
 )
 @enforce_tensor_types({0: (TRTTensor,), 2: (TRTTensor,), 3: (TRTTensor,)})
 def aten_ops_index_copy_fallback(

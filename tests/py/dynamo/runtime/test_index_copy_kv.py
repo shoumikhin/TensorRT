@@ -1084,6 +1084,238 @@ class TestIndexCopyFallback(TestCase):
         eager = torch.ops.aten.index_copy.default(x.clone(), 1, index, update)
         self.assertTrue(torch.allclose(out, eager))
 
+    @staticmethod
+    def _compile_dynamic_length(dtype):
+        class M(torch.nn.Module):
+            def forward(self, cache, index, update):
+                return torch.ops.aten.index_copy.default(cache, 2, index, update)
+
+        cache = torch.zeros(1, 4, 16, 8, dtype=dtype, device="cuda")
+        index = torch.tensor([9, 2, 5, 0], dtype=torch.int64, device="cuda")
+        update = torch.randn(1, 4, 4, 8, device="cuda").mul(10).to(dtype)
+        t = Dim("T", min=1, max=8)
+        ep = export(
+            M().cuda(),
+            (cache, index, update),
+            dynamic_shapes=(None, {0: t}, {2: t}),
+        )
+        compiled = torch_tensorrt.compile(
+            ep,
+            ir="dynamo",
+            inputs=[
+                torch_tensorrt.Input(shape=(1, 4, 16, 8), dtype=dtype),
+                torch_tensorrt.Input(
+                    min_shape=(1,), opt_shape=(4,), max_shape=(8,), dtype=torch.int64
+                ),
+                torch_tensorrt.Input(
+                    min_shape=(1, 4, 1, 8),
+                    opt_shape=(1, 4, 4, 8),
+                    max_shape=(1, 4, 8, 8),
+                    dtype=dtype,
+                ),
+            ],
+            min_block_size=1,
+            use_python_runtime=False,
+        )
+        for positions in ([3], [9, 2, 5, 0, 7]):
+            index = torch.tensor(positions, dtype=torch.int64, device="cuda")
+            update = (
+                torch.randn(1, 4, len(positions), 8, device="cuda").mul(10).to(dtype)
+            )
+            out = compiled(cache.clone(), index, update)
+            torch.testing.assert_close(out, M()(cache.clone(), index, update))
+        return [n.target for n in compiled.graph.nodes if n.op == "call_module"]
+
+    def test_dynamic_length_fallback_stays_in_one_engine(self):
+        """A dynamic number of positions the caller passes in takes the
+        fallback inside TensorRT rather than leaving the engine."""
+        engines = self._compile_dynamic_length(torch.float32)
+        self.assertEqual(len(engines), 1, engines)
+        self.assertTrue(engines[0].startswith("_run_on_acc"), engines)
+
+    def test_a_write_of_no_positions_stays_in_pytorch(self):
+        """Exported with Dim(min=0), the write can have no positions, which an
+        engine profile starting at 1 rejects, so it runs in PyTorch."""
+
+        class M(torch.nn.Module):
+            def forward(self, cache, index, update):
+                return torch.index_copy(cache, 2, index, update) * 1.0
+
+        cache = torch.zeros(1, 4, 16, 8, device="cuda")
+        t = Dim("T", min=0, max=8)
+        args = (
+            cache,
+            torch.arange(3, device="cuda"),
+            torch.randn(1, 4, 3, 8, device="cuda"),
+        )
+        ep = export(M(), args, dynamic_shapes=(None, {0: t}, {2: t}))
+        compiled = torch_tensorrt.compile(
+            ep, ir="dynamo", inputs=list(args), min_block_size=1
+        )
+        for n in (0, 1, 3):
+            args = (
+                cache,
+                torch.arange(n, device="cuda"),
+                torch.randn(1, 4, n, 8, device="cuda"),
+            )
+            torch.testing.assert_close(compiled(*args), M()(*args))
+
+    def test_a_size_that_can_be_zero_on_any_axis_stays_in_pytorch(self):
+        """Not only the number of positions: a batch, head or embedding size that can
+        be 0 would enter the engine too, so the write runs in PyTorch."""
+
+        class M(torch.nn.Module):
+            def forward(self, cache, index, update):
+                return torch.index_copy(cache, 2, index, update)
+
+        for axis in (0, 1, 3):
+
+            def call(n):
+                cache_shape, update_shape = [1, 4, 16, 8], [1, 4, 2, 8]
+                cache_shape[axis] = update_shape[axis] = n
+                return (
+                    torch.randn(cache_shape, device="cuda"),
+                    torch.tensor([3, 9], device="cuda"),
+                    torch.randn(update_shape, device="cuda"),
+                )
+
+            with self.subTest(axis=axis):
+                size = Dim("size", min=0, max=6)
+                ep = export(
+                    M(), call(3), dynamic_shapes=({axis: size}, None, {axis: size})
+                )
+                compiled = torch_tensorrt.dynamo.compile(
+                    ep, inputs=list(call(3)), min_block_size=1
+                )
+                for n in (3, 1, 0):
+                    args = call(n)
+                    torch.testing.assert_close(compiled(*args), M()(*args))
+
+    def test_float64_without_truncate_double_stays_in_pytorch(self):
+        """An engine would expect float32 and refuse the caller's float64 tensor."""
+        engines = self._compile_dynamic_length(torch.float64)
+        self.assertFalse(any(e.startswith("_run_on_acc") for e in engines), engines)
+
+    def test_a_length_computed_from_sizes_runs_at_its_smallest_value(self):
+        """Written at ``2 * s`` positions from the caller. The engine profile starts
+        at the smallest size export records, so a call with ``s = 1`` runs; with
+        ``min=0`` the values can be empty, so the write runs in PyTorch."""
+
+        class M(torch.nn.Module):
+            def forward(self, cache, a, b, update):
+                return torch.index_copy(cache, 2, torch.cat([a, b]), update) * 1.0
+
+        cache = torch.zeros(1, 4, 16, 8, device="cuda")
+
+        def call(n):
+            return (
+                cache,
+                torch.arange(n, device="cuda"),
+                torch.arange(8, 8 + n, device="cuda"),
+                torch.randn(1, 4, 2 * n, 8, device="cuda"),
+            )
+
+        for low in (0, 1):
+            with self.subTest(min=low):
+                s = Dim("s", min=low, max=4)
+                ep = export(
+                    M(), call(2), dynamic_shapes=(None, {0: s}, {0: s}, {2: 2 * s})
+                )
+                compiled = torch_tensorrt.compile(
+                    ep, ir="dynamo", inputs=list(call(2)), min_block_size=1
+                )
+                for n in (2, 1):
+                    args = call(n)
+                    torch.testing.assert_close(compiled(*args), M()(*args))
+
+    def test_a_length_computed_in_the_engine_stays_in_it(self):
+        """The engine computes the ``2 * s`` positions and values itself, so no input
+        brings it that size, and the write stays in the one engine."""
+
+        class M(torch.nn.Module):
+            def forward(self, cache, a, b, update):
+                values = torch.cat([update, update * 2], 2)
+                return torch.index_copy(cache, 2, torch.cat([a, b]), values) * 1.0
+
+        cache = torch.zeros(1, 4, 16, 8, device="cuda")
+
+        def call(n):
+            return (
+                cache,
+                torch.arange(n, device="cuda"),
+                torch.arange(8, 8 + n, device="cuda"),
+                torch.randn(1, 4, n, 8, device="cuda"),
+            )
+
+        s = Dim("s", min=1, max=4)
+        ep = export(M(), call(2), dynamic_shapes=(None, {0: s}, {0: s}, {2: s}))
+        compiled = torch_tensorrt.compile(
+            ep, ir="dynamo", inputs=list(call(2)), min_block_size=1
+        )
+        engines = [n.target for n in compiled.graph.nodes if n.op == "call_module"]
+        self.assertEqual(len(engines), 1, engines)
+        for n in (2, 1, 4):
+            args = call(n)
+            torch.testing.assert_close(compiled(*args), M()(*args))
+
+    def test_refit_of_a_write_of_no_positions(self):
+        """Refit partitions the new model as compile did, so it finds the same
+        engines."""
+        from torch_tensorrt.dynamo import refit_module_weights
+
+        class M(torch.nn.Module):
+            def __init__(self, weight):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor(weight, device="cuda"))
+
+            def forward(self, cache, index, update):
+                return torch.index_copy(cache, 2, index, update) * self.weight
+
+        def call(n):
+            return (
+                torch.ones(1, 2, 16, 4, device="cuda"),
+                torch.arange(n, device="cuda"),
+                torch.full((1, 2, n, 4), 2.0, device="cuda"),
+            )
+
+        t = Dim("T", min=0, max=8)
+        dynamic = (None, {0: t}, {2: t})
+        compiled = torch_tensorrt.compile(
+            export(M(2.0), call(3), dynamic_shapes=dynamic),
+            ir="dynamo",
+            inputs=list(call(3)),
+            min_block_size=1,
+            immutable_weights=False,
+        )
+        refitted = refit_module_weights(
+            compiled,
+            export(M(4.0), call(3), dynamic_shapes=dynamic),
+            arg_inputs=list(call(3)),
+            in_place=True,
+        )
+        for n in (0, 1, 3):
+            out = refitted(*call(n))
+            out = out[0] if isinstance(out, (tuple, list)) else out
+            torch.testing.assert_close(out, M(4.0)(*call(n)))
+
+    def test_int8_fallback_stays_in_pytorch(self):
+        """TensorRT treats an int8 scatter as quantized and fails the engine build,
+        so the write runs in PyTorch, whatever its shapes."""
+        engines = self._compile_dynamic_length(torch.int8)
+        self.assertFalse(any(e.startswith("_run_on_acc") for e in engines), engines)
+
+        class M(torch.nn.Module):
+            def forward(self, cache, index, update):
+                return torch.ops.aten.index_copy.default(cache, 2, index, update)
+
+        cache = torch.zeros(1, 4, 16, 8, dtype=torch.int8, device="cuda")
+        index = torch.tensor([9, 2], device="cuda")
+        update = torch.full((1, 4, 2, 8), 3, dtype=torch.int8, device="cuda")
+        compiled = _compile(M().cuda(), (cache, index, update))
+        torch.testing.assert_close(
+            compiled(cache.clone(), index, update), M()(cache.clone(), index, update)
+        )
+
     def test_dim_other_than_two_uses_fallback(self):
         class M(torch.nn.Module):
             def forward(self, cache, index, update):
