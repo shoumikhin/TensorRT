@@ -26,6 +26,7 @@ from torch_tensorrt.dynamo.conversion._ConverterRegistry import (
 from torch_tensorrt.dynamo.conversion.converter_utils import makes_uint8_tensor
 from torch_tensorrt.dynamo.partitioning.common import (
     get_node_module_types,
+    is_in_place_buffer_write,
     node_in_torch_executed_module,
 )
 from torch_tensorrt.dynamo.utils import COMPLEX_DTYPES, to_torch_device
@@ -120,11 +121,15 @@ class TRTPartitioner(CapabilityBasedPartitioner):  # type: ignore[misc]
 
             compute_node_count = 0
             for node in partition.nodes:
-                # Partitions are exempted from min_block_size if they contain an allowed single-node op
+                # Partitions are exempted from min_block_size if they contain an allowed
+                # single-node op or a buffer write left to the engine to apply in place
                 if node.op == "call_function" and (
-                    self.allowed_single_node_partition_ops is not None
-                    and ConverterRegistry.qualified_name_or_str(node.target)
-                    in self.allowed_single_node_partition_ops
+                    (
+                        self.allowed_single_node_partition_ops is not None
+                        and ConverterRegistry.qualified_name_or_str(node.target)
+                        in self.allowed_single_node_partition_ops
+                    )
+                    or is_in_place_buffer_write(node)
                 ):
                     exempted_partition = True
                     break

@@ -1489,9 +1489,12 @@ def compile_module(
             "for the most thorough analysis"
         )
 
-    # If the number of supported operations is 0 or less than the block size, skip the subgraph
+    # If the number of supported operations is 0 or less than the block size, skip the
+    # subgraph, unless it holds a buffer write left to an engine, as the partitioners do
     if num_supported_ops == 0 or (
-        num_supported_ops < settings.min_block_size and not settings.dryrun
+        num_supported_ops < settings.min_block_size
+        and not settings.dryrun
+        and not any(partitioning.is_in_place_buffer_write(n) for n in gm.graph.nodes)
     ):
         # Only refuse when an operator genuinely has no converter. A graph whose every
         # operator converts is fully supported however few of them there are, and all

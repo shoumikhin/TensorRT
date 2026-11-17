@@ -33,6 +33,7 @@ from torch_tensorrt.dynamo.partitioning._global_partitioner import (
 )
 from torch_tensorrt.dynamo.partitioning.common import (
     get_node_module_types,
+    is_in_place_buffer_write,
     node_in_torch_executed_module,
 )
 from torch_tensorrt.dynamo.utils import to_torch_device
@@ -310,6 +311,7 @@ class TRTPartitioner(_SplitterBase):  # type: ignore
                             for node in subgraph.nodes
                         )
                     )
+                    or any(is_in_place_buffer_write(node) for node in subgraph.nodes)
                 ):
                     result.append(subgraph)
                 else:

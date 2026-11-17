@@ -1784,13 +1784,99 @@ class TestCompileSeam(TestCase):
 
     def test_compile_raises_when_a_predicted_kv_write_is_not_aliased(self):
         """The cross-check is load-bearing, not decorative: a write predicted to alias
-        whose node the partitioner then leaves out of every engine (here via the
-        default ``min_block_size``) fails the compile instead of returning a module
-        whose buffer never updates."""
+        whose node the partitioner then leaves out of every engine fails the compile
+        instead of returning a module whose buffer never updates. The partitioner is
+        made to drop it here by switching off the rule that keeps such a write's
+        subgraph, so the default ``min_block_size`` rejects it."""
+        from torch_tensorrt.dynamo.partitioning import _adjacency_partitioner
+
         model, args = self._kv_model(2)
 
-        with self.assertRaisesRegex(RuntimeError, "did not alias them"):
+        with (
+            mock.patch.object(
+                _adjacency_partitioner, "is_in_place_buffer_write", return_value=False
+            ),
+            self.assertRaisesRegex(RuntimeError, "did not alias them"),
+        ):
             self._compile(model, args, min_block_size=5)
+
+    def _check_small_in_place_write_keeps_its_engine(self, **kwargs):
+        model, args = self._kv_model(1)
+        with torch.no_grad():
+            trt_gm = self._compile(model, args, min_block_size=5, **kwargs)
+            eager = self._kv_model(1)[0]
+            for step in range(3):
+                x = torch.full_like(args[0], float(step + 1))
+                (out,) = trt_gm(x)
+                torch.testing.assert_close(out, eager(x))
+                torch.testing.assert_close(trt_gm.cache, eager.cache)
+        aliased = aliased_input_bindings(
+            getattr(sub, "aliased_io", None) for _name, sub in trt_gm.named_children()
+        )
+        self.assertEqual(aliased, {"buf_cache"})
+
+    def test_small_in_place_write_keeps_its_engine(self):
+        """A write classified in place has had its ``copy_`` dropped, so it has to land
+        in an engine. The partitioner keeps its subgraph even when that subgraph is
+        smaller than ``min_block_size``, and the buffer updates on every call."""
+        self._check_small_in_place_write_keeps_its_engine()
+
+    def test_small_in_place_write_keeps_its_engine_in_the_global_partitioner(self):
+        self._check_small_in_place_write_keeps_its_engine(use_fast_partitioner=False)
+
+    @staticmethod
+    def _scaled_cache_model():
+        class M(torch.nn.Module):
+            def __init__(self, scale):
+                super().__init__()
+                self.register_buffer("cache", torch.zeros(1, 4, 16, 8).cuda())
+                self.scale = torch.nn.Parameter(torch.tensor(scale).cuda())
+
+            def forward(self, x, pos):
+                self.cache.index_copy_(2, pos, x * self.scale)
+                return self.cache.sum(2)
+
+        def step(i):
+            return torch.full((1, 4, 1, 8), i + 1.0).cuda(), torch.tensor([i]).cuda()
+
+        return M, step
+
+    def test_refit_keeps_the_small_in_place_write_in_its_engine(self):
+        """Refit partitions the new model as compile did, so it finds the same
+        engine, refits it, and the cache keeps updating."""
+        from torch_tensorrt.dynamo import refit_module_weights
+
+        M, step = self._scaled_cache_model()
+        trt_gm = self._compile(M(1.0), step(0), immutable_weights=False)
+        new = torch.export.export(M(3.0), step(0), strict=False)
+        refitted = refit_module_weights(
+            trt_gm, new, arg_inputs=list(step(0)), in_place=True
+        )
+        self.assertIs(refitted, trt_gm)
+        eager = M(3.0)
+        with torch.no_grad():
+            for i in range(3):
+                (out,) = refitted(*step(i))
+                torch.testing.assert_close(out, eager(*step(i)))
+                torch.testing.assert_close(refitted.cache, eager.cache)
+
+    def test_refit_output_check_leaves_the_new_program_alone(self):
+        """The output check runs the new program as well as the refitted module.
+        Neither may come out of the check a call ahead, and the new program's cache,
+        written from a parameter that needs a gradient, gets no autograd history."""
+        from torch_tensorrt.dynamo import refit_module_weights
+
+        M, step = self._scaled_cache_model()
+        trt_gm = self._compile(M(1.0), step(0), immutable_weights=False)
+        new = torch.export.export(M(3.0), step(0), strict=False)
+        refit_module_weights(
+            trt_gm, new, arg_inputs=list(step(0)), in_place=True, verify_output=True
+        )
+        zeros = torch.zeros(1, 4, 16, 8).cuda()
+        cache = new.state_dict["cache"]
+        torch.testing.assert_close(cache, zeros)
+        self.assertEqual((cache.requires_grad, cache.is_leaf), (False, True))
+        torch.testing.assert_close(trt_gm.cache, zeros)
 
     def test_compile_writes_the_copyback_value_into_the_buffer(self):
         """A copy-back value is carried on the graph output for the exporters. Called

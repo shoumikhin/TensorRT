@@ -37,6 +37,7 @@ from torch_tensorrt.dynamo.lowering import (
 from torch_tensorrt.dynamo.lowering._buffer_lifting import (
     buffers_restored,
     copy_into_lifted_buffers,
+    lift_mutated_buffers,
 )
 from torch_tensorrt.dynamo.runtime._serialized_engine_layout import (
     ENGINE_IDX,
@@ -290,9 +291,13 @@ def refit_module_weights(
         )
     )
     new_weight_module = remove_alias_from_exported_program(new_weight_module)
+    # The output check runs the model as written, with its buffers.
+    reference_gm = new_weight_module.module()
     new_gm = new_weight_module.module()
 
     logger.debug("Input graph: " + str(new_gm.graph))
+    # Its buffer writes are classified, and so partitioned, as compile() did.
+    new_gm, _ = lift_mutated_buffers(new_gm, settings)
     # Apply lowering on the graph module
 
     new_gm = post_lowering(new_gm, settings)
@@ -308,7 +313,11 @@ def refit_module_weights(
     )
 
     if num_supported_ops == 0 or (
-        num_supported_ops < settings.min_block_size and not settings.dryrun
+        num_supported_ops < settings.min_block_size
+        and not settings.dryrun
+        and not any(
+            partitioning.is_in_place_buffer_write(n) for n in new_gm.graph.nodes
+        )
     ):
         logger.warning(
             f"{num_supported_ops} supported operations detected in subgraph containing {total_ops} computational nodes. "
@@ -498,18 +507,25 @@ def refit_module_weights(
                 value.copy_(new_value)
 
     if verify_output and arg_inputs is not None:
-        new_gm.to(to_torch_device(settings.device))  # move to device for inference
-        _restore_complex_io(new_gm)
-        # The check calls the module, which must keep the buffers it had before. A
-        # model's outputs depend on its buffers, so both start from the new model's.
-        with buffers_restored(compiled_module):
+        reference_gm.to(
+            to_torch_device(settings.device)
+        )  # move to device for inference
+        # The check calls both modules, which must keep the buffers they had before.
+        # The new model shares its buffers with the caller's program, so the check
+        # also records no autograd history on them. A model's outputs depend on its
+        # buffers, so both start from the new model's.
+        with (
+            torch.no_grad(),
+            buffers_restored(compiled_module),
+            buffers_restored(reference_gm),
+        ):
             copy_into_lifted_buffers(
                 compiled_module,
                 {**new_weight_module.state_dict, **new_weight_module.constants},
                 new_weight_module.graph_signature.buffers_to_mutate.values(),
             )
             outputs_match = check_module_output(
-                new_module=new_gm,
+                new_module=reference_gm,
                 refitted_module=compiled_module,
                 arg_inputs=torch_inputs,
                 kwarg_inputs=torch_kwarg_inputs,
@@ -522,42 +538,6 @@ def refit_module_weights(
         logger.info("Refitting Completed! Output verification skipped.")
 
     return compiled_module
-
-
-def _restore_complex_io(gm: torch.fx.GraphModule) -> None:
-    """Make the lowered reference module take and return complex tensors, as the
-    compiled module does, so the output check can compare the two.
-
-    The legacy complex rewriter replaces a complex input with a real
-    "<name>_unpacked_complex" one, and both complex lowerings return a complex
-    output as a real tensor with a trailing dimension of 2.
-    """
-    graph = gm.graph
-    unpacked = {f"{n}_unpacked_complex" for n in gm.meta.get("complex_input_names", [])}
-    for node in list(graph.nodes):
-        if node.op == "placeholder" and node.name in unpacked:
-            with graph.inserting_after(node):
-                real = graph.call_function(torch.ops.aten.view_as_real.default, (node,))
-            node.replace_all_uses_with(real)
-            real.args = (node,)
-    output_node = list(graph.nodes)[-1]
-    output_arg = output_node.args[0]
-    outputs = (
-        list(output_arg) if isinstance(output_arg, (list, tuple)) else [output_arg]
-    )
-    for idx in gm.meta.get("complex_output_indices", []):
-        with graph.inserting_before(output_node):
-            outputs[idx] = graph.call_function(
-                torch.ops.aten.view_as_complex.default, (outputs[idx],)
-            )
-    output_node.args = (
-        (
-            type(output_arg)(outputs)
-            if isinstance(output_arg, (list, tuple))
-            else outputs[0]
-        ),
-    )
-    gm.recompile()
 
 
 # Util functions -----------

@@ -111,6 +111,16 @@ def get_node_module_types(node: torch.fx.Node) -> Set[str]:
     }
 
 
+def is_in_place_buffer_write(node: torch.fx.Node) -> bool:
+    """Whether ``lift_mutated_buffers`` dropped this buffer write's ``copy_`` and left
+    the write to an engine to apply in place.
+
+    Run in PyTorch, such a write is computed and discarded, so a partition holding one
+    is kept whatever its size.
+    """
+    return bool(node.meta.get("_trt_kv_alias"))
+
+
 def node_in_torch_executed_module(
     node: torch.fx.Node, torch_executed_modules: Collection[str]
 ) -> bool:

@@ -127,11 +127,10 @@ def _effective_cache_input(cache_node: torch.fx.Node) -> Optional[torch.fx.Node]
     nothing aliases.
 
     Predicting the peel is not free. A cloned cache write is classified KV, so if no
-    engine goes on to claim it -- at the *default* ``min_block_size=5`` a small
-    model's subgraph often does not -- ``assert_predicted_kv_aliased`` fails the
-    compile rather than leaving the buffer at its compile-time value. A loud failure
-    beats a silently stale buffer, and this failure is reachable at the default
-    ``min_block_size``, not only at ``min_block_size=1``.
+    engine goes on to claim it, ``assert_predicted_kv_aliased`` fails the compile
+    rather than leaving the buffer at its compile-time value. ``min_block_size`` is
+    not one of the ways that happens: the partitioners keep any subgraph holding a
+    write classified KV, however small.
     """
     if cache_node.op == "placeholder":
         return cache_node
@@ -571,6 +570,9 @@ def lift_mutated_buffers(
     tensor traced on the host is not written in place. With
     ``host_inputs_copied=False``, for a serialized engine whose caller binds the
     memory itself, the example's device does not matter.
+
+    The partitioners keep a subgraph holding a write classified in place in an
+    engine whatever its size.
 
     The markers go on the write *nodes* while the classification is per *buffer*, so
     one value node written back into two buffers would put the two in conflict.
