@@ -71,7 +71,7 @@ std::shared_mutex& cuda_graph_capture_mutex();
 ::executorch::runtime::Error enqueue_plain(nvinfer1::IExecutionContext& context, cudaStream_t stream);
 
 // Records a TensorRT enqueue into a CUDA graph and replays it: on the caller's buffers while they
-// stay put, and on buffers of its own for the ones that keep moving.
+// stay put, and on buffers of its own for the ones that keep moving, except an aliased output and its input.
 class ExecutionGraph {
  public:
   ExecutionGraph() = default;
@@ -130,13 +130,15 @@ class ExecutionGraph {
   uint64_t shape_epoch_ = 0;
   cudaGraphExec_t graph_exec_ = nullptr;
   int failed_captures_ = 0;
-  // Times the caller's address of each binding moved away from a recording on it, across shapes and profiles.
+  // Times the caller's address of each binding moved away from a recording on it, across shapes and profiles. For
+  // an aliased output and its input, a move at a growth of the shared scratch counts too.
   std::vector<int> moves_;
   // The bindings the graph records on buffers_, which every call copies in or out. The others stay on the
   // caller's addresses, so an input that stays put, such as a weight, is not copied while an output that moves on
   // every call is. A binding goes on buffers_ once its address moved away from a recording on it twice, which
   // lasts across changes of shapes and profile, or while staged_until_repeat_ holds it. A recording for a call
-  // from another regular context puts every binding on buffers_.
+  // from another regular context puts every binding on buffers_. An aliased output and its input never go on
+  // buffers_: their calls run plainly while that would be needed.
   std::vector<bool> staged_;
   bool warmed_up_ = false;
   bool capture_failed_ = false;
