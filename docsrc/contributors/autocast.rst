@@ -78,8 +78,11 @@ following rules fire:
 * It reads a floating point weight or a number such as the ``1e6`` of ``x / 1e6``,
   with a finite value that becomes ``inf`` in the low precision type, such as a
   BatchNorm running variance of ``1e6`` in fp16. ``NaN`` and ``inf`` constants
-  stay as they are, so they do not count.
-  A mask tensor does not count when an op only places it in its
+  stay as they are, so they do not count. A value that the graph computes from
+  constants alone, with an input or a number above the float16 range, is a
+  constant too, such as the ``(running_var + eps).rsqrt()`` of a frozen
+  BatchNorm, and so is ``torch.full_like(x, 1e6)``, which reads only the shape
+  of ``x``. A mask tensor does not count when an op only places it in its
   output, as ``torch.where``, ``masked_fill`` and ``index_put`` without
   ``accumulate=True`` do, or when ``scaled_dot_product_attention`` adds it to
   its scores as ``attn_mask``: the next op reads it as ``-inf`` either way. A
@@ -91,9 +94,11 @@ following rules fire:
   cast would make an in-place op write into a copy. So this rule does not keep
   an op that a ``torch.no_grad()`` block or a list writer such as
   ``_foreach_add_`` writes into, even when a constant it reads becomes ``inf``.
-  Not covered yet: a view of an op that another rule keeps in fp32, and a large
-  placed value that a later op reads, such as
-  ``torch.where(x > 0, weight, x) / 1e6``.
+  Not covered yet: a value computed from a chunk of a constant, such as
+  ``(var + eps).rsqrt()`` after ``mean, var = stats.unbind(0)``, or from a fill
+  of a dynamic shape, such as ``torch.full_like(x, 1e6) + 1``; a view of an op
+  that another rule keeps in fp32; and a large placed value that a later op
+  reads, such as ``torch.where(x > 0, weight, x) / 1e6``.
 * It is an ``operator.getitem`` node (output unpacking).
 
 All other nodes are assigned the ``low_precision_type``.
