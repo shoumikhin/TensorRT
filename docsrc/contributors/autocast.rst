@@ -75,6 +75,25 @@ following rules fire:
 * It performs a reduction over a large domain (``max_depth_of_reduction`` heuristic).
 * The maximum data value flowing through it exceeds ``data_max`` (guards against
   overflow in fp16).
+* It reads a floating point weight or a number such as the ``1e6`` of ``x / 1e6``,
+  with a finite value that becomes ``inf`` in the low precision type, such as a
+  BatchNorm running variance of ``1e6`` in fp16. ``NaN`` and ``inf`` constants
+  stay as they are, so they do not count.
+  A mask tensor does not count when an op only places it in its
+  output, as ``torch.where``, ``masked_fill`` and ``index_put`` without
+  ``accumulate=True`` do, or when ``scaled_dot_product_attention`` adds it to
+  its scores as ``attn_mask``: the next op reads it as ``-inf`` either way. A
+  number given to ``masked_fill`` still counts: in fp16,
+  ``masked_fill(mask, -1e9)`` does not compile otherwise. An additive mask, as
+  in ``scores + mask``, also counts, so the add runs in fp32 and the scores
+  are cast twice; pass the mask as ``attn_mask`` to avoid that. A view or an
+  in-place op runs in the type of the tensor whose memory it shares, since a
+  cast would make an in-place op write into a copy. So this rule does not keep
+  an op that a ``torch.no_grad()`` block or a list writer such as
+  ``_foreach_add_`` writes into, even when a constant it reads becomes ``inf``.
+  Not covered yet: a view of an op that another rule keeps in fp32, and a large
+  placed value that a later op reads, such as
+  ``torch.where(x > 0, weight, x) / 1e6``.
 * It is an ``operator.getitem`` node (output unpacking).
 
 All other nodes are assigned the ``low_precision_type``.
