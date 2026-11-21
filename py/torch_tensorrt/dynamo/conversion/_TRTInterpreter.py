@@ -83,6 +83,10 @@ class UnsupportedOperatorException(RuntimeError):
     pass
 
 
+class EngineBuildError(RuntimeError):
+    """No TensorRT engine was built for a network that converted."""
+
+
 class TRTInterpreterResult(NamedTuple):
     engine: trt.ICudaEngine
     input_names: List[str]
@@ -632,7 +636,7 @@ class TRTInterpreter(torch.fx.Interpreter):  # type: ignore[misc]
                     self.ctx.net, builder_config
                 )
         if cuda_engine is None:
-            raise RuntimeError(
+            raise EngineBuildError(
                 "TensorRT could not build the engine"
                 + (": " + " | ".join(build_errors) if build_errors else ".")
             )

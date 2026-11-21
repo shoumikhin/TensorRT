@@ -144,6 +144,18 @@ def _example_kwargs(example_tensors: bool, is_shape_tensor: bool) -> Dict[str, A
     return {} if example_tensors or is_shape_tensor else {"torch_tensor": None}
 
 
+class InvalidProfileError(ValueError):
+    """An input's optimization profile does not meet min <= opt <= max."""
+
+
+def without_user_opts(
+    user_symbol_bounds: Dict[sympy.Symbol, Tuple[int, int, Optional[int]]],
+) -> Dict[sympy.Symbol, Tuple[int, int, Optional[int]]]:
+    """Copy of ``user_symbol_bounds`` whose opts are all None, so every dim
+    takes its opt from the export example."""
+    return {sym: (lo, hi, None) for sym, (lo, hi, _) in user_symbol_bounds.items()}
+
+
 def construct_dynamic_input(
     input_shape: torch.Size,
     input_dtype: torch.dtype,
@@ -151,7 +163,9 @@ def construct_dynamic_input(
     is_shape_tensor: bool = False,
     profile_source_bounds: Optional[ProfileSourceBounds] = None,
     num_profiles: int = 0,
-    user_symbol_bounds: Optional[Dict[sympy.Symbol, Tuple[int, int]]] = None,
+    user_symbol_bounds: Optional[
+        Dict[sympy.Symbol, Tuple[int, int, Optional[int]]]
+    ] = None,
     example_tensors: bool = True,
 ) -> Input:
     """
@@ -162,8 +176,8 @@ def construct_dynamic_input(
             propagate optimization profiles to this (intermediate) input.
         num_profiles: Number of profiles to emit when ``profile_source_bounds``
             is provided.
-        user_symbol_bounds: Optional ``{sym: (min, max)}`` map; forwarded to
-            :func:`extract_var_range_info` to fill unbounded exporter uppers.
+        user_symbol_bounds: Optional ``{sym: (min, max, opt)}`` map; forwarded to
+            :func:`extract_var_range_info` to bound dynamic dims and set opt.
         example_tensors: Whether the Input carries a random example tensor (see
             :func:`construct_submodule_inputs`).
     Returns:
@@ -224,7 +238,7 @@ def construct_dynamic_input(
         zip(min_shape, opt_shape, max_shape)
     ):
         if not min_dim <= opt_dim <= max_dim:
-            raise ValueError(
+            raise InvalidProfileError(
                 f"Invalid optimization profile for input {name!r} at dimension {d}: "
                 "expected min <= opt <= max, but got "
                 f"min={min_dim}, opt={opt_dim}, max={max_dim}."
@@ -277,7 +291,9 @@ def get_input(
     is_shape_tensor: bool = False,
     profile_source_bounds: Optional[ProfileSourceBounds] = None,
     num_profiles: int = 0,
-    user_symbol_bounds: Optional[Dict[sympy.Symbol, Tuple[int, int]]] = None,
+    user_symbol_bounds: Optional[
+        Dict[sympy.Symbol, Tuple[int, int, Optional[int]]]
+    ] = None,
     example_tensors: bool = True,
 ) -> Input:
     """
@@ -322,7 +338,9 @@ def construct_submodule_inputs(
     module: torch.fx.GraphModule,
     profile_source_bounds: Optional[ProfileSourceBounds] = None,
     num_profiles: int = 0,
-    user_symbol_bounds: Optional[Dict[sympy.Symbol, Tuple[int, int]]] = None,
+    user_symbol_bounds: Optional[
+        Dict[sympy.Symbol, Tuple[int, int, Optional[int]]]
+    ] = None,
     example_tensors: bool = True,
 ) -> Sequence[Input]:
     """
@@ -336,8 +354,11 @@ def construct_submodule_inputs(
             symbolic shape.
         num_profiles: Number of profiles corresponding to
             ``profile_source_bounds``.
-        user_symbol_bounds: Optional ``{sym: (min, max)}`` map; forwarded to
-            :func:`get_input` to fill unbounded exporter uppers.
+        user_symbol_bounds: Optional ``{sym: (min, max, opt)}`` map; forwarded to
+            :func:`get_input` to bound dynamic dims and set opt. If the inputs
+            cannot be built with the user opts, for example because one does
+            not fit an input's range, every input keeps the export example's
+            opt instead.
         example_tensors: Whether each Input carries a random example tensor in
             ``torch_tensor``, as Input does by default. Building an engine reads
             only shapes and dtypes (with tuning on, the sweeper makes its own
@@ -348,6 +369,36 @@ def construct_submodule_inputs(
     Returns:
         Sequence of torch_tensorrt.Input's representing inputs to given module
     """
+    try:
+        return _construct_submodule_inputs(
+            module,
+            profile_source_bounds,
+            num_profiles,
+            user_symbol_bounds,
+            example_tensors,
+        )
+    except InvalidProfileError as e:
+        example_bounds = without_user_opts(user_symbol_bounds or {})
+        if example_bounds == (user_symbol_bounds or {}):
+            raise
+        # Dropping only some user opts could give a mix of user and example
+        # opts that breaks a shape guard, so drop every user opt.
+        logger.warning(
+            f"Input.opt_shape does not fit a TensorRT engine input ({e}), so the "
+            "engine uses the export example's opt instead."
+        )
+        return _construct_submodule_inputs(
+            module, profile_source_bounds, num_profiles, example_bounds, example_tensors
+        )
+
+
+def _construct_submodule_inputs(
+    module: torch.fx.GraphModule,
+    profile_source_bounds: Optional[ProfileSourceBounds],
+    num_profiles: int,
+    user_symbol_bounds: Optional[Dict[sympy.Symbol, Tuple[int, int, Optional[int]]]],
+    example_tensors: bool,
+) -> Sequence[Input]:
     with unset_fake_temporarily():
         torchtrt_inputs = []
         module_inputs = [

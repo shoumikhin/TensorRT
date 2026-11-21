@@ -45,6 +45,35 @@ Please take a look at ``_tracer.py`` file to understand how this works under the
 
 In the conversion to TensorRT, the graph already has the dynamic shape information in the node's metadata which will be used during engine building phase.
 
+How ``opt_shape`` is used
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+TensorRT tunes the engine for the ``opt_shape`` of each ``torch_tensorrt.Input``. For example, a model exported with
+512 rows that mostly runs with 1 row can ask for opt 1:
+
+.. code-block:: python
+
+    rows = torch.export.Dim("rows", min=1, max=1024)
+    ep = torch.export.export(model, (torch.randn(512, 64),), dynamic_shapes=({0: rows},))
+    inputs = [torch_tensorrt.Input(min_shape=(1, 64), opt_shape=(1, 64), max_shape=(1024, 64))]
+    trt_gm = torch_tensorrt.dynamo.compile(ep, inputs=inputs)
+
+A dimension that is an expression of dynamic dimensions, such as ``2*b``, takes its opt from ``b``: from the
+``opt_shape`` of an input dimension that is exactly ``b``, or from the export example if there is none.
+
+When an opt cannot be used, the size of the export example is used for opt instead, with a warning:
+
+- An opt outside ``min_shape`` and ``max_shape`` is ignored for that dimension only.
+- An opt that breaks a shape guard of the exported program, or at which a guard cannot be checked, is ignored for
+  every dimension the guard names. A guard that holds once each opt of 1 is replaced by 2, and by 3, such as
+  ``batch != 1``, is not checked, because PyTorch adds such guards when it traces sizes as if they were never 1.
+- If an opt does not fit the range of a TensorRT engine input, or TensorRT cannot build the engine with the opts,
+  that engine uses the export example's opt for all its inputs.
+
+The range of a derived dimension comes from the exported program, not from ``min_shape`` and ``max_shape``. For
+example, with ``Dim("b")`` the range of ``2*b`` starts at 4, so opt 1 for ``b`` does not fit it. When any input
+uses ``profiles``, each profile uses its own opts, and the ``opt_shape`` of the other inputs is not used.
+
 Custom Dynamic Shape Constraints
 ---------------------------------
 

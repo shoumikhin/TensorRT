@@ -540,6 +540,47 @@ class TestSweepReliability(unittest.TestCase):
             ),
         )
 
+    def test_sweep_without_an_engine_raises_engine_build_error(self) -> None:
+        # compile builds the engine again with the export example's opts
+        # only on this error, as when a build without tuning fails.
+        from torch_tensorrt.dynamo.conversion._TRTInterpreter import EngineBuildError
+        from torch_tensorrt.dynamo.tuning.sweeper import (
+            _empty_trial_result,
+            tune_subgraph,
+        )
+
+        patches = self._patch_sweep(
+            lambda **kwargs: _empty_trial_result(crashed=True, error_message="kOPT")
+        )
+        with patches[0], patches[1], patches[2], patches[3]:
+            with self.assertRaises(EngineBuildError):
+                tune_subgraph(
+                    self.module,
+                    self.inputs,
+                    CompilationSettings(tune_build_routes="-slice_fusion=[on|off]"),
+                )
+
+    def test_failed_accuracy_reference_raises_engine_build_error(self) -> None:
+        from torch_tensorrt.dynamo.conversion._TRTInterpreter import EngineBuildError
+        from torch_tensorrt.dynamo.tuning import sweeper
+
+        patches = self._patch_sweep(lambda **kwargs: _successful_trial(1.0))
+        reference = mock.patch.object(
+            sweeper,
+            "_compute_reference_outputs",
+            side_effect=RuntimeError("selected index k out of range"),
+        )
+        with patches[0], patches[1], patches[2], patches[3], reference:
+            with self.assertRaises(EngineBuildError):
+                sweeper.tune_subgraph(
+                    self.module,
+                    self.inputs,
+                    CompilationSettings(
+                        tune_build_routes="-slice_fusion=[on|off]",
+                        accuracy_threshold=1.0,
+                    ),
+                )
+
     def _write_resume_cache(
         self,
         base_path,

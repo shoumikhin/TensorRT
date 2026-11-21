@@ -24,6 +24,7 @@ from torch_tensorrt._Input import Input
 from torch_tensorrt.dynamo._engine_cache import BaseEngineCache
 from torch_tensorrt.dynamo._settings import CompilationSettings
 from torch_tensorrt.dynamo.conversion._conversion import SerializedInterpreterResult
+from torch_tensorrt.dynamo.conversion._TRTInterpreter import EngineBuildError
 from torch_tensorrt.dynamo.tuning import cache as tuning_cache
 from torch_tensorrt.dynamo.tuning._capability import (
     get_all_build_routes_raw,
@@ -666,7 +667,17 @@ def tune_subgraph(
         device = torch.device(f"cuda:{gpu_id}" if gpu_id is not None else "cuda")
         if gpu_id is not None:
             torch.cuda.set_device(gpu_id)
-        reference_outputs = _compute_reference_outputs(module, sample_tensors, device)
+        try:
+            reference_outputs = _compute_reference_outputs(
+                module, sample_tensors, device
+            )
+        except Exception as e:
+            # No engine can pass the accuracy check at these shapes, for
+            # example topk with k=2 at an opt of 1 row.
+            raise EngineBuildError(
+                "Global Performance Tuning could not compute the PyTorch "
+                f"reference outputs for the accuracy check: {e}"
+            ) from e
 
     best_result: Optional[SerializedInterpreterResult] = None
     best_time: Optional[float] = None
@@ -920,7 +931,7 @@ def tune_subgraph(
         }
 
     if best_result is None:
-        raise RuntimeError(
+        raise EngineBuildError(
             "Global Performance Tuning sweep completed without a valid engine "
             "(all routes crashed or failed accuracy checks)."
         )
