@@ -184,7 +184,14 @@ numerically sensitive. Enable it with ``enable_autocast=True``.
    * - ``enable_autocast``
      - ``False``
      - Enable graph-aware automatic mixed precision. Analyses op outputs and reduction
-       depths to assign each node to FP32 or low precision.
+       depths to assign each node to FP32 or low precision. An op that reads a floating
+       point weight or a number that becomes ``inf`` in the low precision type, such as
+       a BatchNorm running variance of ``1e6`` in ``torch.float16``, stays in FP32.
+       This needs no calibration data. In-place ops on a low precision tensor, such
+       as ``h /= 1e6``, are not covered yet. Refit cannot change these precisions,
+       so it raises a ``RuntimeError`` when new weights need more ops in FP32;
+       compile the model again then. Refit does not check this for an engine saved
+       by an earlier release.
    * - ``autocast_low_precision_type``
      - ``None``
      - The reduced precision to cast down to. Supported: ``torch.float16``,
