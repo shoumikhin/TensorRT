@@ -151,6 +151,12 @@ def cond(
 
     outputs: list[TRTTensor] = []
     for i, (t_out, f_out) in enumerate(zip(true_outs, false_outs)):
+        # The branches can hold one PyTorch dtype in two TensorRT dtypes, such as an int64
+        # sum and an int32 argmax, and the conditional output needs one.
+        if t_out.dtype != f_out.dtype:
+            t_out, f_out = promote_trt_tensors_to_same_dtype(
+                ctx, t_out, f_out, f"{name}_out_{i}_"
+            )
         layer = conditional.add_output(t_out, f_out)
         set_layer_name(layer, target, f"{name}_out_{i}", source_ir)
         outputs.append(layer.get_output(0))

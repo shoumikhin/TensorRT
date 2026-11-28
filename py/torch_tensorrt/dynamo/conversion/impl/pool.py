@@ -12,6 +12,7 @@ from torch.fx.node import Target
 from torch_tensorrt.dynamo._SourceIR import SourceIR
 from torch_tensorrt.dynamo.conversion._ConversionContext import ConversionContext
 from torch_tensorrt.dynamo.conversion.converter_utils import (
+    cast_trt_tensor,
     extend_attr_to_tuple,
     get_positive_dim,
     get_trt_tensor,
@@ -50,19 +51,54 @@ def avg_poolNd(
 
     padding = extend_attr_to_tuple(padding, dim)
 
-    # add average pooling layer
-    pool_layer = ctx.net.add_pooling_nd(
-        input=input,
-        type=trt.PoolingType.AVERAGE,
-        window_size=kernel_size,
+    def average(value: TRTTensor, excludes_padding: bool, layer_name: str) -> TRTTensor:
+        pool_layer = ctx.net.add_pooling_nd(
+            input=value,
+            type=trt.PoolingType.AVERAGE,
+            window_size=kernel_size,
+        )
+        pool_layer.stride_nd = stride
+        pool_layer.padding_nd = padding
+        pool_layer.average_count_excludes_padding = excludes_padding
+        set_layer_name(pool_layer, target, layer_name, source_ir)
+        return pool_layer.get_output(0)
+
+    if input.dtype not in (trt.int32, trt.int64):
+        return average(input, not count_include_pad, name)
+
+    # TensorRT pooling takes no int32 or int64, and a float32 mean can land just under a
+    # whole number. So the window sum and the count are taken back from float32 means and
+    # divided as integers, which truncates toward zero like PyTorch. This is exact while
+    # the absolute values in a window add up to less than 2**21.
+    window = math.prod(kernel_size)
+
+    def times_window(value: TRTTensor, layer_name: str) -> TRTTensor:
+        mean = average(value, False, f"{layer_name}_mean")
+        scaled = impl.elementwise.mul(
+            ctx, target, source_ir, f"{layer_name}_scaled", mean, float(window)
+        )
+        rounded = impl.unary.round(
+            ctx, target, source_ir, f"{layer_name}_round", scaled
+        )
+        return cast_trt_tensor(ctx, rounded, trt.int64, f"{layer_name}_int64")
+
+    values = cast_trt_tensor(ctx, input, trt.float32, f"{name}_float")
+    total = times_window(values, f"{name}_sum")
+    count: Union[int, TRTTensor] = window
+    if not count_include_pad:
+        ones = impl.elementwise.add(
+            ctx,
+            target,
+            source_ir,
+            f"{name}_ones",
+            impl.elementwise.mul(ctx, target, source_ir, f"{name}_zeros", values, 0.0),
+            1.0,
+        )
+        count = times_window(ones, f"{name}_count")
+    quotient = impl.elementwise.trunc_div(
+        ctx, target, source_ir, f"{name}_div", total, count
     )
-
-    pool_layer.stride_nd = stride
-    pool_layer.padding_nd = padding
-    pool_layer.average_count_excludes_padding = not count_include_pad
-
-    set_layer_name(pool_layer, target, name, source_ir)
-    return pool_layer.get_output(0)
+    return cast_trt_tensor(ctx, quotient, input.dtype, f"{name}_integer")
 
 
 def max_poolNd(
@@ -97,6 +133,12 @@ def max_poolNd(
 
     padding = extend_attr_to_tuple(padding, dim)
 
+    # TensorRT pooling takes no int32 or int64. float32 holds an integer exactly up to
+    # 2**24.
+    integer_dtype = input.dtype if input.dtype in (trt.int32, trt.int64) else None
+    if integer_dtype is not None:
+        input = cast_trt_tensor(ctx, input, trt.float32, f"{name}_float")
+
     # add max pooling layer
     pool_layer = ctx.net.add_pooling_nd(
         input=input,
@@ -108,6 +150,10 @@ def max_poolNd(
     pool_layer.padding_nd = padding
 
     set_layer_name(pool_layer, target, name, source_ir)
+    if integer_dtype is not None:
+        return cast_trt_tensor(
+            ctx, pool_layer.get_output(0), integer_dtype, f"{name}_integer"
+        )
     return pool_layer.get_output(0)
 
 
