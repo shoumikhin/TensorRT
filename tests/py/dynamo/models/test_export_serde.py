@@ -49,7 +49,6 @@ def test_base_full_compile(ir, tmpdir):
                 input.shape, dtype=torch.float, format=torch.contiguous_format
             )
         ],
-        "ir": ir,
         "min_block_size": 1,
         "cache_built_engines": False,
         "reuse_cached_engines": False,
@@ -105,7 +104,6 @@ def test_base_full_compile_multiple_outputs(ir, tmpdir):
                 input.shape, dtype=torch.float, format=torch.contiguous_format
             )
         ],
-        "ir": ir,
         "min_block_size": 1,
         "cache_built_engines": False,
         "reuse_cached_engines": False,
@@ -166,7 +164,6 @@ def test_no_compile(ir, tmpdir):
                 input.shape, dtype=torch.float, format=torch.contiguous_format
             )
         ],
-        "ir": ir,
         "cache_built_engines": False,
         "reuse_cached_engines": False,
     }
@@ -228,7 +225,6 @@ def test_hybrid_relu_fallback(ir, tmpdir):
                 input.shape, dtype=torch.float, format=torch.contiguous_format
             )
         ],
-        "ir": ir,
         "min_block_size": 1,
         "torch_executed_ops": {"torch.ops.aten.relu.default"},
         "cache_built_engines": False,
@@ -279,7 +275,6 @@ def test_resnet18(ir, tmpdir):
                 input.shape, dtype=torch.float, format=torch.contiguous_format
             )
         ],
-        "ir": ir,
         "min_block_size": 1,
         "cache_built_engines": False,
         "reuse_cached_engines": False,
@@ -326,7 +321,6 @@ def test_resnet18_cpu_offload(ir, tmpdir):
                 input.shape, dtype=torch.float, format=torch.contiguous_format
             )
         ],
-        "ir": ir,
         "min_block_size": 1,
         "cache_built_engines": False,
         "reuse_cached_engines": False,
@@ -385,7 +379,6 @@ def test_resnet18_dynamic(ir, tmpdir):
                 name="x",
             )
         ],
-        "ir": ir,
         "min_block_size": 1,
         "cache_built_engines": False,
         "reuse_cached_engines": False,
@@ -420,7 +413,6 @@ def test_resnet18_torch_exec_ops_serde(ir, tmpdir):
 
     compile_spec = {
         "inputs": [input],
-        "ir": ir,
         "min_block_size": 1,
         "cache_built_engines": False,
         "reuse_cached_engines": False,
@@ -471,7 +463,6 @@ def test_hybrid_conv_fallback(ir, tmpdir):
                 input.shape, dtype=torch.float, format=torch.contiguous_format
             )
         ],
-        "ir": ir,
         "min_block_size": 1,
         "torch_executed_ops": {"torch.ops.aten.convolution.default"},
         "cache_built_engines": False,
@@ -534,7 +525,6 @@ def test_hybrid_conv_fallback_cpu_offload(ir, tmpdir):
                 input.shape, dtype=torch.float, format=torch.contiguous_format
             )
         ],
-        "ir": ir,
         "min_block_size": 1,
         "torch_executed_ops": {"torch.ops.aten.convolution.default"},
         "cache_built_engines": False,
@@ -597,7 +587,6 @@ def test_arange_export(ir, tmpdir):
                 input.shape, dtype=torch.float, format=torch.contiguous_format
             )
         ],
-        "ir": ir,
         "min_block_size": 1,
         "cache_built_engines": False,
         "reuse_cached_engines": False,

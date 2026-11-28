@@ -68,7 +68,6 @@ def _compile_spec(inp, torchtrt) -> dict:
         "inputs": [
             torchtrt.Input(inp.shape, dtype=torch.float, format=torch.contiguous_format)
         ],
-        "ir": "dynamo",
         "min_block_size": 1,
         "cache_built_engines": False,
         "reuse_cached_engines": False,

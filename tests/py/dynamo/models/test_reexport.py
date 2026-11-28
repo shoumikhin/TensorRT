@@ -45,7 +45,6 @@ def test_base_full_compile(ir, tmpdir):
                 input.shape, dtype=torch.float, format=torch.contiguous_format
             )
         ],
-        "ir": ir,
         "min_block_size": 1,
         "cache_built_engines": False,
         "reuse_cached_engines": False,
@@ -107,7 +106,6 @@ def test_base_full_compile_multiple_outputs(ir, tmpdir):
                 input.shape, dtype=torch.float, format=torch.contiguous_format
             )
         ],
-        "ir": ir,
         "min_block_size": 1,
         "cache_built_engines": False,
         "reuse_cached_engines": False,
@@ -171,7 +169,6 @@ def test_no_compile(ir, tmpdir):
                 input.shape, dtype=torch.float, format=torch.contiguous_format
             )
         ],
-        "ir": ir,
         "cache_built_engines": False,
         "reuse_cached_engines": False,
     }
@@ -235,7 +232,6 @@ def test_hybrid_relu_fallback(ir, tmpdir):
                 input.shape, dtype=torch.float, format=torch.contiguous_format
             )
         ],
-        "ir": ir,
         "min_block_size": 1,
         "torch_executed_ops": {"torch.ops.aten.relu.default"},
         "cache_built_engines": False,
@@ -289,7 +285,6 @@ def test_resnet18(ir, tmpdir):
                 input.shape, dtype=torch.float, format=torch.contiguous_format
             )
         ],
-        "ir": ir,
         "min_block_size": 1,
         "cache_built_engines": False,
         "reuse_cached_engines": False,
@@ -349,7 +344,6 @@ def test_hybrid_conv_fallback(ir, tmpdir):
                 input.shape, dtype=torch.float, format=torch.contiguous_format
             )
         ],
-        "ir": ir,
         "min_block_size": 1,
         "torch_executed_ops": {"torch.ops.aten.convolution.default"},
         "cache_built_engines": False,
@@ -412,7 +406,6 @@ def test_arange_export(ir, tmpdir):
                 input.shape, dtype=torch.float, format=torch.contiguous_format
             )
         ],
-        "ir": ir,
         "min_block_size": 1,
         "cache_built_engines": False,
         "reuse_cached_engines": False,
@@ -464,7 +457,6 @@ def test_resnet18_dynamic(ir, tmpdir):
                 name="x",
             )
         ],
-        "ir": ir,
         "min_block_size": 1,
         "cache_built_engines": False,
         "reuse_cached_engines": False,
@@ -544,7 +536,6 @@ def test_resnet18_dynamic_manual_retrace(ir, tmpdir):
                 name="x",
             )
         ],
-        "ir": ir,
         "min_block_size": 1,
         "cache_built_engines": False,
         "reuse_cached_engines": False,
@@ -619,7 +610,6 @@ def test_resnet18_dynamic_fallback(ir, tmpdir):
                 name="x",
             )
         ],
-        "ir": ir,
         "torch_executed_ops": {"torch.ops.aten.convolution.default"},
         "min_block_size": 1,
         "cache_built_engines": False,
@@ -698,7 +688,6 @@ def test_bitwise_and_dynamic_fallback(ir, tmpdir):
     model = bitwise_and()
     compile_spec = {
         "inputs": torchtrt_inputs,
-        "ir": ir,
         "min_block_size": 1,
         "cache_built_engines": False,
         "reuse_cached_engines": False,
@@ -781,7 +770,6 @@ def test_bitwise_and_dynamic_fallback_manual_reexport(ir, tmpdir):
     model = bitwise_and()
     compile_spec = {
         "inputs": torchtrt_inputs,
-        "ir": ir,
         "min_block_size": 1,
         "cache_built_engines": False,
         "reuse_cached_engines": False,
@@ -874,7 +862,6 @@ def test_random_dynamic_fallback(ir, tmpdir):
     torch_inputs_bs50 = (torch.randn((50, 784), dtype=torch.float32).cuda(),)
     compile_spec = {
         "inputs": inputs,
-        "ir": ir,
         "min_block_size": 1,
         "cache_built_engines": False,
         "reuse_cached_engines": False,
@@ -956,7 +943,6 @@ def test_save_with_dynamic_shapes_api(ir, tmpdir):
                 name="x",
             )
         ],
-        "ir": ir,
         "min_block_size": 1,
         "cache_built_engines": False,
         "reuse_cached_engines": False,
@@ -1347,7 +1333,6 @@ def test_save_with_kwarg_inputs_dynamic(ir, tmpdir):
 
     compile_spec = {
         "inputs": compile_inputs,
-        "ir": ir,
         "min_block_size": 1,
         "cache_built_engines": False,
         "reuse_cached_engines": False,
@@ -1424,7 +1409,6 @@ def test_explicit_dynamic_shapes_takes_precedence(ir, tmpdir):
 
     compile_spec = {
         "inputs": compile_inputs,
-        "ir": ir,
         "min_block_size": 1,
         "cache_built_engines": False,
         "reuse_cached_engines": False,

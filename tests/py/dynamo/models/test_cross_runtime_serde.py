@@ -54,7 +54,6 @@ def _compile_and_save(
         "inputs": [
             torchtrt.Input(inp.shape, dtype=torch.float, format=torch.contiguous_format)
         ],
-        "ir": "dynamo",
         "min_block_size": 1,
         "cache_built_engines": False,
         "reuse_cached_engines": False,

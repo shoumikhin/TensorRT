@@ -81,7 +81,6 @@ def test_custom_model(tmpdir):
         "pass_through_build_failures": True,
         "optimization_level": 1,
         "min_block_size": 1,
-        "ir": "dynamo",
         "cache_built_engines": False,
         "reuse_cached_engines": False,
     }
@@ -142,7 +141,6 @@ def test_custom_model_with_dynamo_trace(tmpdir):
         "pass_through_build_failures": True,
         "optimization_level": 1,
         "min_block_size": 1,
-        "ir": "dynamo",
         "cache_built_engines": False,
         "reuse_cached_engines": False,
     }
@@ -212,7 +210,6 @@ def test_custom_model_with_dynamo_trace_dynamic(tmpdir):
         "pass_through_build_failures": True,
         "optimization_level": 1,
         "min_block_size": 1,
-        "ir": "dynamo",
         "cache_built_engines": False,
         "reuse_cached_engines": False,
     }
@@ -295,7 +292,6 @@ def test_custom_model_with_dynamo_trace_kwarg_dynamic(tmpdir):
         "pass_through_build_failures": True,
         "optimization_level": 1,
         "min_block_size": 1,
-        "ir": "dynamo",
         "cache_built_engines": False,
         "reuse_cached_engines": False,
     }
@@ -384,7 +380,6 @@ def test_custom_model_with_dynamo_trace_kwarg_dynamic(tmpdir):
         "pass_through_build_failures": True,
         "optimization_level": 1,
         "min_block_size": 1,
-        "ir": "dynamo",
         "cache_built_engines": False,
         "reuse_cached_engines": False,
     }
@@ -470,7 +465,6 @@ def test_custom_model_with_dynamo_trace_kwarg_list_dynamic():
         "pass_through_build_failures": True,
         "optimization_level": 1,
         "min_block_size": 1,
-        "ir": "dynamo",
         "cache_built_engines": False,
         "reuse_cached_engines": False,
     }
@@ -533,7 +527,6 @@ def test_custom_model_compile_engine():
         "pass_through_build_failures": True,
         "optimization_level": 1,
         "min_block_size": 1,
-        "ir": "dynamo",
         "cache_built_engines": False,
         "reuse_cached_engines": False,
     }
@@ -571,7 +564,6 @@ def test_save_load_pure_kwarg_inputs_retrace_false(tmpdir):
         "kwarg_inputs": kwargs,
         "device": torchtrt.Device("cuda:0"),
         "min_block_size": 1,
-        "ir": "dynamo",
         "cache_built_engines": False,
         "reuse_cached_engines": False,
     }
@@ -628,7 +620,6 @@ def test_save_load_pure_kwarg_inputs_retrace_true(tmpdir):
         "kwarg_inputs": kwargs,
         "device": torchtrt.Device("cuda:0"),
         "min_block_size": 1,
-        "ir": "dynamo",
         "cache_built_engines": False,
         "reuse_cached_engines": False,
     }
@@ -685,7 +676,6 @@ def test_save_load_mixed_args_kwargs_retrace_false(tmpdir):
         "kwarg_inputs": kwargs,
         "device": torchtrt.Device("cuda:0"),
         "min_block_size": 1,
-        "ir": "dynamo",
         "cache_built_engines": False,
         "reuse_cached_engines": False,
     }
@@ -738,7 +728,6 @@ def test_save_load_input_objects_retrace_false(tmpdir):
         "inputs": [torchtrt.Input(shape=(4, 10), dtype=torch.float)],
         "device": torchtrt.Device("cuda:0"),
         "min_block_size": 1,
-        "ir": "dynamo",
         "cache_built_engines": False,
         "reuse_cached_engines": False,
     }
@@ -825,7 +814,6 @@ def _compile_simple(model, example):
         "inputs": [torchtrt.Input(shape=(4, 10), dtype=torch.float)],
         "device": torchtrt.Device("cuda:0"),
         "min_block_size": 1,
-        "ir": "dynamo",
         "cache_built_engines": False,
         "reuse_cached_engines": False,
     }
@@ -838,7 +826,6 @@ def _compile_dynamic(model, example, dynamic_shapes, trt_inputs):
         "inputs": trt_inputs,
         "device": torchtrt.Device("cuda:0"),
         "min_block_size": 1,
-        "ir": "dynamo",
         "cache_built_engines": False,
         "reuse_cached_engines": False,
     }
@@ -1128,7 +1115,6 @@ def test_custom_model_compile_engine_with_pure_kwarg_inputs():
         "pass_through_build_failures": True,
         "optimization_level": 1,
         "min_block_size": 1,
-        "ir": "dynamo",
     }
 
     exp_program = torch.export.export(model, args=(), kwargs=kwargs)

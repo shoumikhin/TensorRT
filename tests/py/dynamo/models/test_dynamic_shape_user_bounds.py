@@ -559,7 +559,6 @@ def test_dim_dynamic_save_preserves_range_constraints(tmpdir):
                 dtype=torch.float32,
             )
         ],
-        "ir": "dynamo",
         "min_block_size": 1,
         "cache_built_engines": False,
         "reuse_cached_engines": False,

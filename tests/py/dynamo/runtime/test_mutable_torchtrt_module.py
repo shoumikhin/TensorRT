@@ -525,7 +525,6 @@ def test_custom_model_with_kwarg():
         "pass_through_build_failures": True,
         "optimization_level": 1,
         "min_block_size": 1,
-        "ir": "dynamo",
         "immutable_weights": False,
     }
 
@@ -589,7 +588,6 @@ def test_custom_model_with_inplace_init():
         "pass_through_build_failures": True,
         "optimization_level": 1,
         "min_block_size": 1,
-        "ir": "dynamo",
         "immutable_weights": False,
     }
 
@@ -655,7 +653,6 @@ def test_custom_model_with_init_recompile():
         "pass_through_build_failures": True,
         "optimization_level": 1,
         "min_block_size": 1,
-        "ir": "dynamo",
         "immutable_weights": False,
     }
 
@@ -727,7 +724,6 @@ def test_custom_model_with_kwarg_different_input():
         "pass_through_build_failures": True,
         "optimization_level": 1,
         "min_block_size": 1,
-        "ir": "dynamo",
         "immutable_weights": False,
     }
 
@@ -783,7 +779,6 @@ _PARTIAL_FALLBACK_SPEC = {
     "pass_through_build_failures": True,
     "optimization_level": 1,
     "min_block_size": 1,
-    "ir": "dynamo",
     "immutable_weights": False,
     "torch_executed_ops": {
         "torch.ops.aten.linear.default",

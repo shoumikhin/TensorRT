@@ -325,7 +325,6 @@ class TestWeightStreamingPython(TestCase):
             "device": torchtrt.Device("cuda:0"),
             "pass_through_build_failures": True,
             "min_block_size": 1,
-            "ir": "dynamo",
             "cache_built_engines": False,
             "reuse_cached_engines": False,
             "enable_weight_streaming": True,

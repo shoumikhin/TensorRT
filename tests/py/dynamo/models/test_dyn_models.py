@@ -38,7 +38,6 @@ def test_base_dynamic(ir):
 
     compile_spec = {
         "device": torchtrt.Device("cuda:0"),
-        "ir": ir,
         "pass_through_build_failures": True,
         "min_block_size": 1,
         "cache_built_engines": False,
@@ -93,7 +92,6 @@ def test_base_dynamic_fallback(ir):
 
     compile_spec = {
         "device": torchtrt.Device("cuda:0"),
-        "ir": ir,
         "pass_through_build_failures": True,
         "torch_executed_ops": {"torch.ops.aten.abs.default"},
         "min_block_size": 1,
@@ -195,7 +193,6 @@ def test_resnet_dynamic(ir, dtype):
 
     compile_spec = {
         "device": torchtrt.Device("cuda:0"),
-        "ir": ir,
         "pass_through_build_failures": True,
         "min_block_size": 1,
         "cache_built_engines": False,
@@ -298,7 +295,6 @@ def test_linear(ir):
 
     compile_spec = {
         "device": torchtrt.Device("cuda:0"),
-        "ir": ir,
         "min_block_size": 1,
         "cache_built_engines": False,
         "reuse_cached_engines": False,
@@ -352,7 +348,6 @@ def test_dynamic_with_fallback_shape_tensor_pass_through(ir):
 
     compile_spec = {
         "device": torchtrt.Device("cuda:0"),
-        "ir": ir,
         "pass_through_build_failures": True,
         "min_block_size": 1,
         "torch_executed_ops": {"torch.ops.aten.add.Tensor"},
