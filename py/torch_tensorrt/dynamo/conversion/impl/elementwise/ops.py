@@ -79,24 +79,34 @@ def trunc_div(
     Returns:
         A TensorRT tensor represent the result of trunc divide.
     """
+    # A number the graph computes, such as a dynamic size, comes as a tensor.
+    other_is_number = isinstance(other, (int, float)) or (
+        isinstance(other, TRTTensor)
+        and (other in ctx.python_ints or other in ctx.python_floats)
+    )
     input, other = python_ints_as_0d(ctx, target, source_ir, name, input, other)
-    prod_output = convert_binary_elementwise(
-        ctx,
-        target,
-        source_ir,
-        f"{name}_prod",
-        trt.ElementWiseOperation.PROD,
-        input,
-        other,
-    )
-
-    sign_output = sign(
-        ctx,
-        target,
-        source_ir,
-        name,
-        prod_output,
-    )
+    # PyTorch divides a bool tensor as an integer, so a divisor of 2 must not become a
+    # bool constant below.
+    if isinstance(input, TRTTensor) and input.dtype == trt.bool:
+        input = cast_trt_tensor(ctx, input, trt.int32, f"{name}_input_int32")
+    # PyTorch divides a float16 or bfloat16 tensor by a number in float32 and rounds only
+    # the result, so 3590 / 7 is 512 and not 513.
+    half_dtype = None
+    if (
+        other_is_number
+        and isinstance(input, TRTTensor)
+        and input.dtype in (trt.float16, trt.bfloat16)
+    ):
+        half_dtype = input.dtype
+        input = cast_trt_tensor(ctx, input, trt.float32, f"{name}_input_float32")
+    # PyTorch divides an integer tensor by a float in float32, so the float must not
+    # become an integer constant below.
+    if (
+        isinstance(other, float)
+        and isinstance(input, TRTTensor)
+        and not _enums.dtype._from(input.dtype).to(torch.dtype).is_floating_point
+    ):
+        input = cast_trt_tensor(ctx, input, trt.float32, f"{name}_input_float")
 
     # Convert constant input into ITensor for UnaryOperation. A scalar stays 0-d, so a 0-d
     # tensor does not gain a dim.
@@ -111,42 +121,55 @@ def trunc_div(
             min_rank=0,
         )
 
-    abs_input_output = convert_unary(
+    if not any(
+        _enums.dtype._from(value.dtype).to(torch.dtype).is_floating_point
+        for value in (input, other)
+    ):
+        # TensorRT's DIV truncates integers toward zero, with no ABS to overflow at the
+        # integer minimum.
+        return convert_binary_elementwise(
+            ctx,
+            target,
+            source_ir,
+            f"{name}_output",
+            trt.ElementWiseOperation.DIV,
+            input,
+            other,
+        )
+
+    # Rounding the quotient itself toward zero keeps its sign, also for a quotient that
+    # rounds to -0.0 and for the infinity a 0 divisor gives.
+    quotient = convert_binary_elementwise(
         ctx,
         target,
         source_ir,
-        f"{name}_abs_input",
-        trt.UnaryOperation.ABS,
+        f"{name}_quotient",
+        trt.ElementWiseOperation.DIV,
         input,
-    )
-    abs_other_output = convert_unary(
-        ctx,
-        target,
-        source_ir,
-        f"{name}_abs_other",
-        trt.UnaryOperation.ABS,
         other,
     )
-    abs_floor_output = convert_binary_elementwise(
+    floor = convert_unary(
+        ctx, target, source_ir, f"{name}_floor", trt.UnaryOperation.FLOOR, quotient
+    )
+    ceil = convert_unary(
+        ctx, target, source_ir, f"{name}_ceil", trt.UnaryOperation.CEIL, quotient
+    )
+    negative = convert_binary_elementwise(
         ctx,
         target,
         source_ir,
-        f"{name}_floor_div",
-        trt.ElementWiseOperation.FLOOR_DIV,
-        abs_input_output,
-        abs_other_output,
+        f"{name}_negative",
+        trt.ElementWiseOperation.LESS,
+        quotient,
+        0,
     )
-    output = convert_binary_elementwise(
-        ctx,
-        target,
-        source_ir,
-        f"{name}_output",
-        trt.ElementWiseOperation.PROD,
-        abs_floor_output,
-        sign_output,
-    )
-
-    return output
+    layer = ctx.net.add_select(negative, ceil, floor)
+    set_layer_name(layer, target, f"{name}_output", source_ir)
+    if half_dtype is not None:
+        return cast_trt_tensor(
+            ctx, layer.get_output(0), half_dtype, f"{name}_output_half"
+        )
+    return layer.get_output(0)
 
 
 def rsqrt(
