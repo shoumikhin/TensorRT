@@ -216,12 +216,23 @@ def _ieee_float32() -> Iterator[None]:
     with _TF32_FLAGS_LOCK:
         if hasattr(matmul, "fp32_precision"):
             conv = torch.backends.cudnn.conv
-            saved = conv.fp32_precision, matmul.fp32_precision
+            # A setting that inherits reads back as the value it resolves to, and writing that
+            # back would pin it. Newer PyTorch can save what is stored instead.
+            exact = hasattr(torch.backends, "_get_fp32_precision_state")
+            if exact:
+                saved = torch.backends._get_fp32_precision_state(
+                    "cuda.conv", "cuda.matmul"
+                )
+            else:
+                saved = conv.fp32_precision, matmul.fp32_precision
             conv.fp32_precision = matmul.fp32_precision = "ieee"
             try:
                 yield
             finally:
-                conv.fp32_precision, matmul.fp32_precision = saved
+                if exact:
+                    torch.backends._set_fp32_precision_state(saved)
+                else:
+                    conv.fp32_precision, matmul.fp32_precision = saved
         else:
             # PyTorch before 2.9, as on the JetPack build, has only these flags. The matmul one is
             # kept by name: allow_tf32 reads True for both "high" and "medium".

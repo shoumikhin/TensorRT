@@ -19,6 +19,12 @@ from torch_tensorrt.dynamo.lowering.passes.constant_folding import constant_fold
 
 # PyTorch before 2.9, as on JetPack, has only the older allow_tf32 flags.
 _HAS_FP32_PRECISION = hasattr(torch.backends.cuda.matmul, "fp32_precision")
+if _HAS_FP32_PRECISION:
+    from torch.testing._internal.common_utils import recover_orig_fp32_precision
+else:
+
+    def recover_orig_fp32_precision(fn):
+        return fn
 
 
 class _Permute(torch.nn.Module):
@@ -137,6 +143,7 @@ class TestConstantFolding(TestCase):
         "TF32 needs an Ampere or newer GPU",
     )
     @unittest.skipUnless(_HAS_FP32_PRECISION, "needs the fp32_precision flags")
+    @recover_orig_fp32_precision
     def test_float32_folds_follow_disable_tf32(self):
         class Model(torch.nn.Module):
             def __init__(self):
@@ -159,27 +166,23 @@ class TestConstantFolding(TestCase):
         )
         expected_matmul = model.table.double() @ model.mix.double()
         conv, matmul = torch.backends.cudnn.conv, torch.backends.cuda.matmul
-        saved = conv.fp32_precision, matmul.fp32_precision
         for disable_tf32 in (True, False):
             with self.subTest(disable_tf32=disable_tf32):
                 conv.fp32_precision = matmul.fp32_precision = "tf32"
-                try:
-                    with mock.patch.object(
-                        constant_folding,
-                        "_ieee_float32",
-                        wraps=constant_folding._ieee_float32,
-                    ) as ieee_float32:
-                        gm = constant_fold(
-                            torch.export.export(model, (example_input,)).module(),
-                            CompilationSettings(disable_tf32=disable_tf32),
-                        )
-                    # With TF32 allowed, folding keeps the caller's settings.
-                    self.assertEqual(ieee_float32.called, disable_tf32)
-                    self.assertEqual(
-                        (conv.fp32_precision, matmul.fp32_precision), ("tf32", "tf32")
+                with mock.patch.object(
+                    constant_folding,
+                    "_ieee_float32",
+                    wraps=constant_folding._ieee_float32,
+                ) as ieee_float32:
+                    gm = constant_fold(
+                        torch.export.export(model, (example_input,)).module(),
+                        CompilationSettings(disable_tf32=disable_tf32),
                     )
-                finally:
-                    conv.fp32_precision, matmul.fp32_precision = saved
+                # With TF32 allowed, folding keeps the caller's settings.
+                self.assertEqual(ieee_float32.called, disable_tf32)
+                self.assertEqual(
+                    (conv.fp32_precision, matmul.fp32_precision), ("tf32", "tf32")
+                )
                 if not disable_tf32:
                     continue
                 folded = {
@@ -222,10 +225,20 @@ class TestConstantFolding(TestCase):
                 )
         self.assertEqual((cudnn.allow_tf32, state["matmul"]), (True, "medium"))
 
+    @unittest.skipUnless(
+        hasattr(torch.backends, "_get_fp32_precision_state"),
+        "needs PyTorch that can read the stored fp32 precision settings",
+    )
+    def test_float32_fold_keeps_inheriting_settings(self):
+        before = torch.backends._get_fp32_precision_state()
+        with constant_folding._ieee_float32():
+            pass
+        self.assertEqual(torch.backends._get_fp32_precision_state(), before)
+
     @unittest.skipUnless(_HAS_FP32_PRECISION, "needs the fp32_precision flags")
+    @recover_orig_fp32_precision
     def test_overlapping_float32_folds_wait_for_each_other(self):
         conv, matmul = torch.backends.cudnn.conv, torch.backends.cuda.matmul
-        saved = conv.fp32_precision, matmul.fp32_precision
         inside, release = threading.Event(), threading.Event()
 
         def first():
@@ -254,7 +267,6 @@ class TestConstantFolding(TestCase):
             )
         finally:
             release.set()
-            conv.fp32_precision, matmul.fp32_precision = saved
 
     def test_only_converter_safe_aliased_ops_skip_install(self):
         permute_gm = self._export_and_fold(_Permute(), torch.randn(1, 513, 512))
